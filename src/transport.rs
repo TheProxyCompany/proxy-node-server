@@ -1,9 +1,8 @@
-//! Phase-1 transport seam. Reserved: named and importable so the boundary
-//! exists, but with no implementation. The async runtime (tokio) is added with
-//! the pull loop, not here.
+//! Transport seam. [`PeerId`] and [`Cursor`] are always available; the
+//! [`PullSource`] trait and its HTTP implementation ([`crate::net`]) live behind
+//! the `pull-http` feature, which pulls in the async runtime.
 
 use crate::identity::DeviceId;
-use crate::op::SignedOp;
 
 /// A peer, addressed by its device id.
 pub struct PeerId(pub DeviceId);
@@ -13,11 +12,13 @@ pub struct PeerId(pub DeviceId);
 /// [`OrderKey::MIN`](crate::op::OrderKey::MIN).
 pub type Cursor = crate::op::OrderKey;
 
-/// Phase-1: incremental pull of a peer's op-log. Intentionally unimplemented.
-/// Left synchronous here; the async runtime is added with the pull loop.
+/// Incremental pull of a peer's op-log. Async because the only implementor
+/// ([`crate::net::HttpPullSource`]) is network-backed.
+#[cfg(feature = "pull-http")]
+#[allow(async_fn_in_trait)] // callers are the single-threaded pull loop; no Send bound is needed
 pub trait PullSource {
     type Error: std::error::Error + Send + Sync + 'static;
 
     /// Return the peer's ops strictly after `since`, in HLC order.
-    fn pull(&self, since: Cursor) -> Result<Vec<SignedOp>, Self::Error>;
+    async fn pull(&self, since: Cursor) -> Result<Vec<crate::op::SignedOp>, Self::Error>;
 }

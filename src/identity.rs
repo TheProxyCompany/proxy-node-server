@@ -140,7 +140,7 @@ impl DeviceIdentity {
     }
 }
 
-fn sec1_compressed(key: &VerifyingKey) -> [u8; 33] {
+pub(crate) fn sec1_compressed(key: &VerifyingKey) -> [u8; 33] {
     let point = key.to_encoded_point(true);
     let mut out = [0u8; 33];
     out.copy_from_slice(point.as_bytes());

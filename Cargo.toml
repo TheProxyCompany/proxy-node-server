@@ -17,6 +17,7 @@ required-features = ["daemon"]
 [features]
 default = []
 daemon = ["dep:clap", "dep:serde_json"]
+pull-http = ["daemon", "dep:axum", "dep:tokio", "dep:reqwest"]
 
 [dependencies]
 p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
@@ -26,6 +27,13 @@ serde = { version = "1", features = ["derive"] }
 zeroize = "1"
 rand_core = { version = "0.6", features = ["getrandom"] }
 thiserror = "1"
+uhlc = "0.8"
 
 clap = { version = "4", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
+axum = { version = "0.8", optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "sync"], optional = true }
+reqwest = { version = "0.13", default-features = false, optional = true }
+
+[dev-dependencies]
+tempfile = "3"

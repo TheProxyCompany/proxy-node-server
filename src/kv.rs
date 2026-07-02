@@ -122,10 +122,7 @@ mod tests {
         log.append(seal_kv(
             &id,
             &template,
-            Hlc {
-                wall: 30,
-                counter: 0,
-            },
+            Hlc(30),
             &KvOp::Put {
                 key: "k".into(),
                 value: b"final".to_vec(),
@@ -134,10 +131,7 @@ mod tests {
         log.append(seal_kv(
             &id,
             &template,
-            Hlc {
-                wall: 10,
-                counter: 0,
-            },
+            Hlc(10),
             &KvOp::Put {
                 key: "k".into(),
                 value: b"first".to_vec(),
@@ -146,10 +140,7 @@ mod tests {
         log.append(seal_kv(
             &id,
             &template,
-            Hlc {
-                wall: 20,
-                counter: 0,
-            },
+            Hlc(20),
             &KvOp::Put {
                 key: "k".into(),
                 value: b"middle".to_vec(),
@@ -158,10 +149,7 @@ mod tests {
         log.append(seal_kv(
             &id,
             &template,
-            Hlc {
-                wall: 25,
-                counter: 0,
-            },
+            Hlc(25),
             &KvOp::Put {
                 key: "gone".into(),
                 value: b"x".to_vec(),
@@ -170,10 +158,7 @@ mod tests {
         log.append(seal_kv(
             &id,
             &template,
-            Hlc {
-                wall: 26,
-                counter: 0,
-            },
+            Hlc(26),
             &KvOp::Delete { key: "gone".into() },
         ));
 
@@ -198,10 +183,7 @@ mod tests {
         log.append(seal_kv(
             &a,
             &template,
-            Hlc {
-                wall: 5,
-                counter: 0,
-            },
+            Hlc(5),
             &KvOp::Put {
                 key: "x".into(),
                 value: b"from-a".to_vec(),
@@ -210,10 +192,7 @@ mod tests {
         log.append(seal_kv(
             &b,
             &template,
-            Hlc {
-                wall: 5,
-                counter: 0,
-            },
+            Hlc(5),
             &KvOp::Put {
                 key: "x".into(),
                 value: b"from-b".to_vec(),

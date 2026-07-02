@@ -34,6 +34,13 @@ impl OpLog {
         true
     }
 
+    /// Whether an op with this id is already in the log. Lets a caller order a
+    /// durable write BEFORE the in-memory insert without a failed durable write
+    /// leaving a memory-only op behind.
+    pub fn contains(&self, id: &OpId) -> bool {
+        self.ids.contains(id)
+    }
+
     /// All ops in global total order.
     pub fn iter(&self) -> impl Iterator<Item = &SignedOp> {
         self.ops.values()
@@ -88,10 +95,10 @@ mod tests {
     use crate::identity::DeviceIdentity;
     use crate::op::{ENVELOPE_VERSION, OpBody, StoreId};
 
-    fn op_with(id: &DeviceIdentity, wall: u64, counter: u32, payload: Vec<u8>) -> SignedOp {
+    fn op_with(id: &DeviceIdentity, hlc: u64, payload: Vec<u8>) -> SignedOp {
         let body = OpBody {
             v: ENVELOPE_VERSION,
-            hlc: Hlc { wall, counter },
+            hlc: Hlc(hlc),
             device: id.device_id(),
             store: StoreId::new("kv").unwrap(),
             payload,
@@ -99,15 +106,15 @@ mod tests {
         SignedOp::seal(body, id).unwrap()
     }
 
-    fn op_at(id: &DeviceIdentity, wall: u64, counter: u32) -> SignedOp {
-        op_with(id, wall, counter, vec![wall as u8, counter as u8])
+    fn op_at(id: &DeviceIdentity, hlc: u64) -> SignedOp {
+        op_with(id, hlc, vec![hlc as u8])
     }
 
     #[test]
     fn append_dedups_by_id() {
         let id = DeviceIdentity::generate();
         let mut log = OpLog::new();
-        let op = op_at(&id, 10, 0);
+        let op = op_at(&id, 10);
         assert!(log.append(op.clone()));
         assert!(!log.append(op));
         assert_eq!(log.len(), 1);
@@ -119,8 +126,8 @@ mod tests {
     fn distinct_ops_at_same_hlc_and_device_both_retained() {
         let id = DeviceIdentity::generate();
         let mut log = OpLog::new();
-        let a = op_with(&id, 10, 0, vec![0xaa]);
-        let b = op_with(&id, 10, 0, vec![0xbb]);
+        let a = op_with(&id, 10, vec![0xaa]);
+        let b = op_with(&id, 10, vec![0xbb]);
         assert_ne!(a.id, b.id);
         assert!(log.append(a.clone()));
         assert!(log.append(b.clone()));
@@ -135,33 +142,13 @@ mod tests {
     fn iter_is_ordered_regardless_of_insertion_order() {
         let id = DeviceIdentity::generate();
         let mut log = OpLog::new();
-        log.append(op_at(&id, 30, 0));
-        log.append(op_at(&id, 10, 0));
-        log.append(op_at(&id, 20, 5));
-        log.append(op_at(&id, 20, 1));
+        log.append(op_at(&id, 30));
+        log.append(op_at(&id, 10));
+        log.append(op_at(&id, 25));
+        log.append(op_at(&id, 21));
 
         let order: Vec<Hlc> = log.iter().map(|o| o.body.hlc).collect();
-        assert_eq!(
-            order,
-            vec![
-                Hlc {
-                    wall: 10,
-                    counter: 0
-                },
-                Hlc {
-                    wall: 20,
-                    counter: 1
-                },
-                Hlc {
-                    wall: 20,
-                    counter: 5
-                },
-                Hlc {
-                    wall: 30,
-                    counter: 0
-                },
-            ]
-        );
+        assert_eq!(order, vec![Hlc(10), Hlc(21), Hlc(25), Hlc(30)]);
     }
 
     #[test]
@@ -169,16 +156,13 @@ mod tests {
         let id = DeviceIdentity::generate();
         let mut log = OpLog::new();
         assert_eq!(log.head(), None);
-        let first = op_at(&id, 10, 0);
+        let first = op_at(&id, 10);
         log.append(first.clone());
-        log.append(op_at(&id, 20, 0));
-        log.append(op_at(&id, 30, 0));
+        log.append(op_at(&id, 20));
+        log.append(op_at(&id, 30));
 
-        assert_eq!(log.head().map(|k| k.hlc.wall), Some(30));
-        let after: Vec<u64> = log
-            .since(first.order_key())
-            .map(|o| o.body.hlc.wall)
-            .collect();
+        assert_eq!(log.head().map(|k| k.hlc.0), Some(30));
+        let after: Vec<u64> = log.since(first.order_key()).map(|o| o.body.hlc.0).collect();
         assert_eq!(after, vec![20, 30]);
     }
 
@@ -189,11 +173,11 @@ mod tests {
     fn since_does_not_skip_ops_tying_cursor_hlc() {
         let id = DeviceIdentity::generate();
         let mut log = OpLog::new();
-        let a = op_with(&id, 10, 0, vec![0x01]);
-        let b = op_with(&id, 10, 0, vec![0x02]);
+        let a = op_with(&id, 10, vec![0x01]);
+        let b = op_with(&id, 10, vec![0x02]);
         log.append(a.clone());
         log.append(b.clone());
-        log.append(op_at(&id, 20, 0));
+        log.append(op_at(&id, 20));
 
         // Resume after whichever op sorts first; its same-HLC sibling must still
         // come back.

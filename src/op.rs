@@ -92,6 +92,32 @@ impl OrderKey {
         device: DeviceId::from_bytes([0; 32]),
         op_id: OpId::from_bytes([0; 32]),
     };
+
+    /// Fixed 72-byte wire form: big-endian `Hlc` ‖ device ‖ op id. Big-endian so
+    /// lexicographic byte order matches the numeric `(hlc, device, op_id)` order.
+    /// Shared by the persisted cursor, the `since` query param, and the pull
+    /// response's `next` field.
+    pub fn to_wire(&self) -> [u8; 72] {
+        let mut out = [0u8; 72];
+        out[..8].copy_from_slice(&self.hlc.0.to_be_bytes());
+        out[8..40].copy_from_slice(self.device.as_bytes());
+        out[40..].copy_from_slice(self.op_id.as_bytes());
+        out
+    }
+
+    pub fn from_wire(bytes: &[u8; 72]) -> Self {
+        let mut hlc = [0u8; 8];
+        hlc.copy_from_slice(&bytes[..8]);
+        let mut device = [0u8; 32];
+        device.copy_from_slice(&bytes[8..40]);
+        let mut op_id = [0u8; 32];
+        op_id.copy_from_slice(&bytes[40..]);
+        OrderKey {
+            hlc: Hlc(u64::from_be_bytes(hlc)),
+            device: DeviceId::from_bytes(device),
+            op_id: OpId::from_bytes(op_id),
+        }
+    }
 }
 
 /// The signed portion of an op. Serialized with a versioned canonical
@@ -263,10 +289,7 @@ mod tests {
     fn sample_body(identity: &DeviceIdentity) -> OpBody {
         OpBody {
             v: ENVELOPE_VERSION,
-            hlc: Hlc {
-                wall: 42,
-                counter: 1,
-            },
+            hlc: Hlc(42),
             device: identity.device_id(),
             store: StoreId::new("kv").unwrap(),
             payload: vec![1, 2, 3, 4],
@@ -393,6 +416,35 @@ mod tests {
         let bytes = op.to_bytes().unwrap();
         let err = SignedOp::from_bytes(&bytes).unwrap_err();
         assert!(matches!(err, OpError::UnsupportedVersion(v) if v == ENVELOPE_VERSION + 1));
+    }
+
+    #[test]
+    fn order_key_wire_round_trips() {
+        let id = DeviceIdentity::generate();
+        let op = SignedOp::seal(sample_body(&id), &id).unwrap();
+        let key = op.order_key();
+        assert_eq!(OrderKey::from_wire(&key.to_wire()), key);
+        // MIN maps to all zeros and back.
+        assert_eq!(OrderKey::MIN.to_wire(), [0u8; 72]);
+        assert_eq!(OrderKey::from_wire(&[0u8; 72]), OrderKey::MIN);
+    }
+
+    // Big-endian encoding makes lexicographic byte order match the numeric
+    // `(hlc, device, op_id)` order the log relies on.
+    #[test]
+    fn order_key_wire_preserves_order() {
+        let lo = OrderKey {
+            hlc: Hlc(10),
+            device: DeviceId::from_bytes([0; 32]),
+            op_id: OpId::from_bytes([0; 32]),
+        };
+        let hi = OrderKey {
+            hlc: Hlc(11),
+            device: DeviceId::from_bytes([0; 32]),
+            op_id: OpId::from_bytes([0; 32]),
+        };
+        assert!(lo < hi);
+        assert!(lo.to_wire() < hi.to_wire());
     }
 
     #[test]
