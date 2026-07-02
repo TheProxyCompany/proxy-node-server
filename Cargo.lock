@@ -1937,13 +1937,13 @@ name = "orchard-rs"
 version = "2026.6.2"
 
 [[patch.unused]]
-name = "trellis"
-version = "0.1.0"
-
-[[patch.unused]]
 name = "grand-central"
 version = "0.1.0"
 
 [[patch.unused]]
 name = "pane"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "trellis"
 version = "0.1.0"

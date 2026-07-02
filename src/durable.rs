@@ -9,7 +9,7 @@
 //! proxy.db-backed through its own [`Store`](crate::store::Store) adapter.
 
 use std::fs::{File, OpenOptions};
-use std::io::{BufReader, Read, Write};
+use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use crate::error::DurabilityError;
@@ -32,9 +32,14 @@ pub struct OplogWriter {
 }
 
 impl OplogWriter {
-    /// Open (creating if absent) the durability file for appending.
+    /// Open (creating if absent) the durability file for appending. Write mode
+    /// with an explicit seek-to-end rather than append mode: on Windows,
+    /// append-mode handles get `FILE_APPEND_DATA` without `FILE_WRITE_DATA`,
+    /// which makes the torn-frame rollback's `set_len` fail. This writer is
+    /// the file's only writer, so seek-to-end is equivalent.
     pub fn open(path: &Path) -> Result<Self, DurabilityError> {
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        let mut file = OpenOptions::new().create(true).write(true).open(path)?;
+        file.seek(SeekFrom::End(0))?;
         Ok(Self {
             file,
             poisoned: false,
@@ -82,7 +87,12 @@ impl OplogWriter {
         let bytes = op.to_bytes()?;
         let start = self.file.metadata()?.len();
         if let Err(e) = self.write_frame(&bytes) {
-            if self.file.set_len(start).is_err() {
+            // Roll back to the frame boundary AND reposition the cursor there:
+            // set_len does not move the write position, and writing past a
+            // truncated end would zero-fill the gap into a fresh torn frame.
+            let rolled_back =
+                self.file.set_len(start).is_ok() && self.file.seek(SeekFrom::Start(start)).is_ok();
+            if !rolled_back {
                 self.poisoned = true;
             }
             return Err(e);
