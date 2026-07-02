@@ -26,8 +26,16 @@ pub struct MeshNode {
 }
 
 impl MeshNode {
-    /// Bind a loopback server and start serving this node's log + device book.
+    /// Bind a loopback server on an ephemeral port and start serving.
     pub async fn spawn() -> MeshNode {
+        Self::spawn_on(([127, 0, 0, 1], 0).into()).await
+    }
+
+    /// Bind `addr` and start serving this node's log + device book. `spawn` is
+    /// the loopback-ephemeral case for the in-process tests; the multi-machine
+    /// mesh benchmark binds a real, externally reachable address (e.g.
+    /// `0.0.0.0:51713`). `base_url` reflects the address actually bound.
+    pub async fn spawn_on(addr: std::net::SocketAddr) -> MeshNode {
         let identity = Arc::new(DeviceIdentity::generate());
         let clock = NodeClock::new(&identity.device_id());
         let log = Arc::new(Mutex::new(OpLog::new()));
@@ -42,8 +50,8 @@ impl MeshNode {
             log.clone(),
             registry.clone(),
         ));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+        let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+        let bound = listener.local_addr().unwrap();
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
@@ -54,7 +62,7 @@ impl MeshNode {
             log,
             store,
             registry,
-            base_url: format!("http://{addr}"),
+            base_url: format!("http://{bound}"),
         }
     }
 

@@ -26,7 +26,8 @@ discovery-mdns = ["discovery", "dep:mdns-sd"]
 # Tailnet presence by shelling the local `tailscale` LocalAPI; no embedded node.
 discovery-tailscale = ["discovery", "dep:serde_json", "dep:futures-util", "tokio?/process"]
 # In-process multi-daemon harness for the functional/perf tests and examples.
-harness = ["pull-http"]
+# Pulls in clap for the multi-machine `bench_mesh` example's CLI.
+harness = ["pull-http", "dep:clap"]
 
 [dependencies]
 p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
@@ -64,4 +65,8 @@ required-features = ["harness"]
 
 [[example]]
 name = "mem_over_time"
+required-features = ["harness"]
+
+[[example]]
+name = "bench_mesh"
 required-features = ["harness"]
