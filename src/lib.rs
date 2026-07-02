@@ -17,8 +17,16 @@
 //! The library is the primary artifact; the `pnsd` reference daemon builds under
 //! the `daemon` feature, and networked replication under `pull-http`.
 
+//! - [`discovery`] (feature `discovery`): provider-agnostic presence/transport
+//!   seams, with mDNS and Tailscale providers behind their own features.
+//! - [`harness`] (feature `harness`): in-process multi-daemon test/perf harness.
+
+#[cfg(feature = "discovery")]
+pub mod discovery;
 pub mod durable;
 pub mod error;
+#[cfg(feature = "harness")]
+pub mod harness;
 pub mod hlc;
 pub mod identity;
 pub mod kv;
@@ -34,9 +42,9 @@ pub use error::{DurabilityError, HlcError, IdentityError, OpError, ReplayError};
 pub use hlc::{DEFAULT_MAX_DELTA, Hlc, NodeClock};
 pub use identity::{DeviceId, DeviceIdentity};
 pub use kv::{KvOp, KvStore};
-pub use log::{OpLog, replay};
+pub use log::{LogSource, OpLog, apply_range, replay};
 pub use op::{ENVELOPE_VERSION, MAX_STORE_ID_LEN, OpBody, OpId, OrderKey, SignedOp, StoreId};
-pub use registry::DeviceRegistry;
+pub use registry::{DeviceBook, DeviceRegistry};
 pub use store::{OpContext, Store};
 pub use transport::{Cursor, PeerId};
 
@@ -44,10 +52,14 @@ pub use transport::{Cursor, PeerId};
 pub use error::TransportError;
 #[cfg(feature = "pull-http")]
 pub use net::{
-    DEFAULT_PULL_LIMIT, HttpPullSource, IdentityResp, PullResponse, ServeState, load_cursor,
-    load_peer_keys, register_peer, router, save_cursor, save_peer_keys, sync_once,
+    ApplyMode, DEFAULT_PULL_LIMIT, DeviceEntry, DevicesResp, HttpPullSource, IdentityResp,
+    PullResponse, ServeState, learn_devices, load_cursor, load_peer_keys, register_peer, router,
+    save_cursor, save_peer_keys, sync_once, sync_once_with,
 };
 #[cfg(feature = "pull-http")]
 pub use transport::PullSource;
+
+#[cfg(feature = "discovery")]
+pub use discovery::{HttpTransport, LocalAdvert, PeerInfo, PeerTransport, PresenceProvider};
 
 pub use durable::{OplogWriter, replay_oplog_file};

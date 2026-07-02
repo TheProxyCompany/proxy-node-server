@@ -4,6 +4,7 @@
 //! resolves the key per op from this registry rather than assuming one peer key.
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use p256::ecdsa::VerifyingKey;
 
@@ -47,6 +48,16 @@ impl DeviceRegistry {
             .collect()
     }
 
+    /// Every known device as `(device_id, compressed SEC1 key)` — the set the
+    /// `/devices` route gossips so a puller can verify ops from devices it has
+    /// never contacted directly (D11 transitive key propagation).
+    pub fn entries(&self) -> Vec<(DeviceId, [u8; 33])> {
+        self.keys
+            .iter()
+            .map(|(id, key)| (*id, crate::identity::sec1_compressed(key)))
+            .collect()
+    }
+
     pub fn contains(&self, id: &DeviceId) -> bool {
         self.keys.contains_key(id)
     }
@@ -57,6 +68,22 @@ impl DeviceRegistry {
     /// skip as unknown-device.
     pub fn remove(&mut self, id: &DeviceId) {
         self.keys.remove(id);
+    }
+}
+
+/// Read-only source of the trusted device set for the `/devices` route. The
+/// reference registry serves it behind an `Arc<Mutex<..>>`; Grand Central
+/// implements it over the `devices` proxy.db table so [`crate::net::router`]
+/// gossips keys without owning the storage. `Clone` because it lives in axum
+/// state.
+pub trait DeviceBook: Clone + Send + Sync + 'static {
+    /// Every trusted device as `(device_id, compressed SEC1 key)`.
+    fn known_devices(&self) -> Vec<(DeviceId, [u8; 33])>;
+}
+
+impl DeviceBook for Arc<Mutex<DeviceRegistry>> {
+    fn known_devices(&self) -> Vec<(DeviceId, [u8; 33])> {
+        self.lock().expect("registry mutex poisoned").entries()
     }
 }
 

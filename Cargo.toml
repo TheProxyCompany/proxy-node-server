@@ -18,6 +18,15 @@ required-features = ["daemon"]
 default = []
 daemon = ["dep:clap", "dep:serde_json"]
 pull-http = ["daemon", "dep:axum", "dep:tokio", "dep:reqwest"]
+# Provider-agnostic discovery/transport seams. Lean by construction: the traits
+# and PeerInfo pull in no new deps, only the HTTP transport they build on.
+discovery = ["pull-http"]
+# mDNS/Bonjour LAN presence, behind its own dep so default builds stay clean.
+discovery-mdns = ["discovery", "dep:mdns-sd"]
+# Tailnet presence by shelling the local `tailscale` LocalAPI; no embedded node.
+discovery-tailscale = ["discovery", "dep:serde_json", "dep:futures-util", "tokio?/process"]
+# In-process multi-daemon harness for the functional/perf tests and examples.
+harness = ["pull-http"]
 
 [dependencies]
 p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
@@ -34,6 +43,25 @@ serde_json = { version = "1", optional = true }
 axum = { version = "0.8", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "sync"], optional = true }
 reqwest = { version = "0.13", default-features = false, optional = true }
+mdns-sd = { version = "0.20", optional = true }
+futures-util = { version = "0.3", default-features = false, features = ["alloc"], optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+criterion = { version = "0.7", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "micro_ops"
+harness = false
+
+[[example]]
+name = "bench_sync"
+required-features = ["harness"]
+
+[[example]]
+name = "bench_startup"
+required-features = ["harness"]
+
+[[example]]
+name = "mem_over_time"
+required-features = ["harness"]

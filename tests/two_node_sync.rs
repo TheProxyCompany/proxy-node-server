@@ -13,8 +13,8 @@ use proxy_node_server::{
     router, sync_once,
 };
 
-/// One in-process node: identity, clock, shared log, store, durable file, and a
-/// loopback server serving that log.
+/// One in-process node: identity, clock, shared log, store, durable file, the
+/// device registry it serves over `/devices`, and a loopback server.
 struct Node {
     identity: Arc<DeviceIdentity>,
     clock: NodeClock,
@@ -34,7 +34,11 @@ impl Node {
         let store = Mutex::new(KvStore::new());
         let writer = Mutex::new(OplogWriter::open(&dir.path().join("oplog.bin")).unwrap());
 
-        let app = router(ServeState::new(identity.clone(), log.clone()));
+        let mut reg = DeviceRegistry::new();
+        reg.insert_key(*identity.verifying_key());
+        let registry = Arc::new(Mutex::new(reg));
+
+        let app = router(ServeState::new(identity.clone(), log.clone(), registry));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -87,7 +91,8 @@ impl Node {
         // A peer serves ops from several devices, including ours echoed back, so
         // both keys must be resolvable.
         registry.insert_key(*self.identity.verifying_key());
-        let (advertised, newly_added) = register_peer(&source, &mut registry).await.unwrap();
+        let registry = Mutex::new(registry);
+        let (advertised, newly_added) = register_peer(&source, &registry).await.unwrap();
         assert_eq!(advertised, peer.identity.device_id());
         assert!(newly_added);
 

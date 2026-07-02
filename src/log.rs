@@ -4,6 +4,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::ops::Bound;
+use std::sync::{Arc, Mutex};
 
 use crate::error::ReplayError;
 use crate::op::{OpId, OrderKey, SignedOp};
@@ -71,8 +72,39 @@ impl OpLog {
 
 /// Decode and apply every op targeting `store` in global total order.
 pub fn replay<S: Store>(log: &OpLog, store: &mut S) -> Result<(), ReplayError<S::Error>> {
+    apply_ops(log.iter(), store)
+}
+
+/// Apply just the ops in `(after, through]` — the range a pull batch newly
+/// crossed — to `store`, in total order. The incremental counterpart to
+/// [`replay`]: it touches only the batch's ops, so a large log is never
+/// re-applied on every sync (the G1 seam Grand Central's proxy.db adapter needs;
+/// whole-log [`replay`] is O(history) per pull).
+///
+/// The store must satisfy the [`Store`] idempotency contract and enforce its own
+/// per-row conflict order (e.g. HLC last-write-wins): the range is not re-sorted
+/// against already-applied history, and a retry after a failed durability fsync
+/// can re-present ops the store already saw. The reference [`crate::kv::KvStore`]
+/// resolves by arrival order and so is replayed whole; a store with an internal
+/// version guard uses this path.
+pub fn apply_range<S: Store>(
+    log: &OpLog,
+    store: &mut S,
+    after: OrderKey,
+    through: OrderKey,
+) -> Result<(), ReplayError<S::Error>> {
+    apply_ops(
+        log.since(after).take_while(|op| op.order_key() <= through),
+        store,
+    )
+}
+
+fn apply_ops<'a, S: Store>(
+    ops: impl Iterator<Item = &'a SignedOp>,
+    store: &mut S,
+) -> Result<(), ReplayError<S::Error>> {
     let store_id = store.store_id();
-    for op in log.iter() {
+    for op in ops {
         if op.body.store != store_id {
             continue;
         }
@@ -86,6 +118,39 @@ pub fn replay<S: Store>(log: &OpLog, store: &mut S) -> Result<(), ReplayError<S:
         store.apply(ctx, native).map_err(ReplayError::Store)?;
     }
     Ok(())
+}
+
+/// Read-only view of an op-log the pull server serves from: total-order paging,
+/// the head cursor, and a dedup probe. The reference [`OpLog`] satisfies it
+/// behind an `Arc<Mutex<..>>`; Grand Central implements it over the `oplog`
+/// SQL table (the G2 seam) so [`crate::net::router`] serves either without
+/// knowing which. `Clone` because it is held in axum state.
+pub trait LogSource: Clone + Send + Sync + 'static {
+    /// Ops strictly after `cursor` in total order, capped at `limit`.
+    fn since(&self, cursor: OrderKey, limit: usize) -> Vec<SignedOp>;
+    /// Highest order key held, if any.
+    fn head(&self) -> Option<OrderKey>;
+    /// Whether an op with this id is already present.
+    fn contains(&self, id: &OpId) -> bool;
+}
+
+impl LogSource for Arc<Mutex<OpLog>> {
+    fn since(&self, cursor: OrderKey, limit: usize) -> Vec<SignedOp> {
+        self.lock()
+            .expect("oplog mutex poisoned")
+            .since(cursor)
+            .take(limit)
+            .cloned()
+            .collect()
+    }
+
+    fn head(&self) -> Option<OrderKey> {
+        self.lock().expect("oplog mutex poisoned").head()
+    }
+
+    fn contains(&self, id: &OpId) -> bool {
+        self.lock().expect("oplog mutex poisoned").contains(id)
+    }
 }
 
 #[cfg(test)]
@@ -189,5 +254,50 @@ mod tests {
         let resumed: Vec<OpId> = log.since(lo.order_key()).map(|o| o.id).collect();
         assert!(resumed.contains(&hi.id), "sibling at tied HLC was skipped");
         assert_eq!(resumed.len(), 2);
+    }
+
+    // apply_range applies only the newly-crossed window, in order, so the last
+    // write in that window wins — matching replay over the same range without
+    // re-touching earlier history.
+    #[test]
+    fn apply_range_applies_only_the_crossed_window() {
+        use crate::kv::{KvOp, KvStore};
+
+        let id = DeviceIdentity::generate();
+        let template = KvStore::new();
+        let seal = |hlc: u64, key: &str, val: &[u8]| {
+            let payload = template
+                .encode(&KvOp::Put {
+                    key: key.into(),
+                    value: val.to_vec(),
+                })
+                .unwrap();
+            let body = OpBody {
+                v: ENVELOPE_VERSION,
+                hlc: Hlc(hlc),
+                device: id.device_id(),
+                store: crate::kv::kv_store_id(),
+                payload,
+            };
+            SignedOp::seal(body, &id).unwrap()
+        };
+
+        let mut log = OpLog::new();
+        let o10 = seal(10, "k", b"first");
+        let o20 = seal(20, "k", b"second");
+        let o30 = seal(30, "k", b"third");
+        log.append(o10.clone());
+        log.append(o20.clone());
+        log.append(o30.clone());
+
+        // Apply only (o10, o30]: o20 then o30, so "third" wins; o10 is untouched.
+        let mut store = KvStore::new();
+        apply_range(&log, &mut store, o10.order_key(), o30.order_key()).unwrap();
+        assert_eq!(store.get("k"), Some(&b"third"[..]));
+
+        // Range excludes the head: only o20 is applied.
+        let mut store = KvStore::new();
+        apply_range(&log, &mut store, o10.order_key(), o20.order_key()).unwrap();
+        assert_eq!(store.get("k"), Some(&b"second"[..]));
     }
 }

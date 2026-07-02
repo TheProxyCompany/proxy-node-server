@@ -228,8 +228,8 @@ mod serve {
 
     use proxy_node_server::{
         DeviceIdentity, DeviceRegistry, HttpPullSource, KvStore, NodeClock, OpLog, OplogWriter,
-        ServeState, load_cursor, load_peer_keys, register_peer, replay, replay_oplog_file, router,
-        save_cursor, save_peer_keys, sync_once,
+        ServeState, learn_devices, load_cursor, load_peer_keys, register_peer, replay,
+        replay_oplog_file, router, save_cursor, save_peer_keys, sync_once,
     };
 
     use super::{KEY_FILE, OPLOG_FILE, read_scalar};
@@ -265,21 +265,32 @@ mod serve {
         if known > 0 {
             println!("loaded {known} known peer key(s)");
         }
+        // Shared so the /devices route gossips these keys while the pull loop
+        // both learns new ones and verifies pulled ops against them.
+        let registry = Arc::new(Mutex::new(registry));
 
         let oplog_path = data_dir.join(OPLOG_FILE);
         let log = Arc::new(Mutex::new(OpLog::new()));
         let store = Mutex::new(KvStore::new());
         {
             let mut log = log.lock().expect("oplog mutex poisoned");
-            replay_oplog_file(&oplog_path, &registry, &mut log)
-                .map_err(|e| format!("replay oplog: {e}"))?;
+            replay_oplog_file(
+                &oplog_path,
+                &registry.lock().expect("registry mutex poisoned"),
+                &mut log,
+            )
+            .map_err(|e| format!("replay oplog: {e}"))?;
             let mut store = store.lock().expect("store mutex poisoned");
             replay(&log, &mut *store).map_err(|e| format!("replay store: {e}"))?;
         }
         let writer =
             Mutex::new(OplogWriter::open(&oplog_path).map_err(|e| format!("open oplog: {e}"))?);
 
-        let app = router(ServeState::new(identity.clone(), log.clone()));
+        let app = router(ServeState::new(
+            identity.clone(),
+            log.clone(),
+            registry.clone(),
+        ));
         let listener = tokio::net::TcpListener::bind(listen)
             .await
             .map_err(|e| format!("bind {listen}: {e}"))?;
@@ -294,7 +305,7 @@ mod serve {
         let mut learned_keys = false;
         for base in peers {
             let source = HttpPullSource::new(&base);
-            match register_peer(&source, &mut registry).await {
+            match register_peer(&source, &registry).await {
                 Ok((peer_id, newly_added)) => {
                     // A NEWLY learned key that fails to persist must not
                     // verify ops at all — not for this peer's target, and not
@@ -306,12 +317,37 @@ mod serve {
                     // failed save is atomic and left the old file intact, so
                     // pulling with it is safe.
                     if newly_added {
-                        if let Err(e) = save_peer_keys(&data_dir, &registry) {
-                            registry.remove(&peer_id);
+                        if let Err(e) =
+                            save_peer_keys(&data_dir, &registry.lock().expect("registry poisoned"))
+                        {
+                            registry.lock().expect("registry poisoned").remove(&peer_id);
                             eprintln!("persist peer keys: {e}; skipping peer {base} this run");
                             continue;
                         }
                         learned_keys = true;
+                    }
+                    // Gossip: adopt every device this peer vouches for so ops it
+                    // relays from third parties verify. Same durability rule —
+                    // persist before pulling, roll back exactly what we added on
+                    // a failed save so no un-persisted key ever verifies an op.
+                    match learn_devices(&source, &registry).await {
+                        Ok(added) if !added.is_empty() => {
+                            if let Err(e) = save_peer_keys(
+                                &data_dir,
+                                &registry.lock().expect("registry poisoned"),
+                            ) {
+                                let mut reg = registry.lock().expect("registry poisoned");
+                                for id in &added {
+                                    reg.remove(id);
+                                }
+                                eprintln!("persist gossiped keys from {base}: {e}");
+                            } else {
+                                learned_keys = true;
+                                println!("learned {} device key(s) via {peer_id}", added.len());
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(e) => eprintln!("learn devices {base}: {e}"),
                     }
                     let cursor = load_cursor(&data_dir, &peer_id);
                     println!("peer {peer_id} at {base}");
@@ -327,8 +363,12 @@ mod serve {
         // OpLog::append dedups, so re-replaying is idempotent.
         if learned_keys {
             let mut log = log.lock().expect("oplog mutex poisoned");
-            let recovered = replay_oplog_file(&oplog_path, &registry, &mut log)
-                .map_err(|e| format!("re-replay oplog: {e}"))?;
+            let recovered = replay_oplog_file(
+                &oplog_path,
+                &registry.lock().expect("registry mutex poisoned"),
+                &mut log,
+            )
+            .map_err(|e| format!("re-replay oplog: {e}"))?;
             if recovered > 0 {
                 println!("recovered {recovered} op(s) for newly known peers");
                 let mut store = store.lock().expect("store mutex poisoned");

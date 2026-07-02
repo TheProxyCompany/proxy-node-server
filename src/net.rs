@@ -6,6 +6,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::Router;
 use axum::extract::{Query, State};
@@ -18,14 +19,19 @@ use crate::durable::OplogWriter;
 use crate::error::TransportError;
 use crate::hlc::NodeClock;
 use crate::identity::{DeviceId, DeviceIdentity};
-use crate::log::{OpLog, replay};
+use crate::log::{LogSource, OpLog, apply_range, replay};
 use crate::op::{OrderKey, SignedOp};
-use crate::registry::DeviceRegistry;
+use crate::registry::{DeviceBook, DeviceRegistry};
 use crate::store::Store;
 use crate::transport::{Cursor, PullSource};
 
 /// Default cap on the number of ops returned by one `/ops` page.
 pub const DEFAULT_PULL_LIMIT: u16 = 512;
+
+/// Default per-request timeout for a pull/probe. Bounds a single request so one
+/// blackholed peer (e.g. a stale tailnet IP) can never hang a browse tick or a
+/// pull loop indefinitely; `reqwest::Client` has no timeout by default.
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// `/identity` response: what a puller needs to verify this peer's ops. The key
 /// is a `Vec<u8>` (33-byte compressed SEC1) because serde derives (de)serialize
@@ -46,30 +52,63 @@ pub struct PullResponse {
     pub next: Vec<u8>,
 }
 
+/// One `(device_id, verifying key)` pair the node knows and trusts.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DeviceEntry {
+    pub device_id: [u8; 32],
+    /// 33-byte compressed SEC1 key; `Vec<u8>` for the same serde-array reason
+    /// as [`IdentityResp`]. The length is validated on learn.
+    pub public_key_sec1: Vec<u8>,
+}
+
+/// `/devices` response: every device this node will vouch for, so a puller can
+/// verify transitively-relayed ops from devices it never met directly (D11).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DevicesResp {
+    pub devices: Vec<DeviceEntry>,
+}
+
 // ---------------------------------------------------------------------------
 // Server
 // ---------------------------------------------------------------------------
 
-/// Shared state the pull routes serve from: this node's identity and its log.
-/// The log is the same handle the pull loop appends into.
-#[derive(Clone)]
-pub struct ServeState {
+/// Shared state the pull routes serve from: this node's identity, its op-log
+/// ([`LogSource`]), and the device keys it gossips ([`DeviceBook`]). Both are
+/// generic so the reference in-memory log/registry and Grand Central's
+/// proxy.db-backed log/devices table mount the same routes.
+pub struct ServeState<L: LogSource, D: DeviceBook> {
     identity: Arc<DeviceIdentity>,
-    log: Arc<Mutex<OpLog>>,
+    log: L,
+    devices: D,
 }
 
-impl ServeState {
-    pub fn new(identity: Arc<DeviceIdentity>, log: Arc<Mutex<OpLog>>) -> Self {
-        Self { identity, log }
+impl<L: LogSource, D: DeviceBook> Clone for ServeState<L, D> {
+    fn clone(&self) -> Self {
+        Self {
+            identity: self.identity.clone(),
+            log: self.log.clone(),
+            devices: self.devices.clone(),
+        }
     }
 }
 
-/// Build the `/identity`, `/ops`, and `/head` router for a node.
-pub fn router(state: ServeState) -> Router {
+impl<L: LogSource, D: DeviceBook> ServeState<L, D> {
+    pub fn new(identity: Arc<DeviceIdentity>, log: L, devices: D) -> Self {
+        Self {
+            identity,
+            log,
+            devices,
+        }
+    }
+}
+
+/// Build the `/identity`, `/ops`, `/head`, and `/devices` router for a node.
+pub fn router<L: LogSource, D: DeviceBook>(state: ServeState<L, D>) -> Router {
     Router::new()
-        .route("/identity", get(get_identity))
-        .route("/ops", get(get_ops))
-        .route("/head", get(get_head))
+        .route("/identity", get(get_identity::<L, D>))
+        .route("/ops", get(get_ops::<L, D>))
+        .route("/head", get(get_head::<L, D>))
+        .route("/devices", get(get_devices::<L, D>))
         .with_state(state)
 }
 
@@ -77,7 +116,9 @@ fn octet(bytes: Vec<u8>) -> Response {
     ([(header::CONTENT_TYPE, "application/octet-stream")], bytes).into_response()
 }
 
-async fn get_identity(State(state): State<ServeState>) -> Response {
+async fn get_identity<L: LogSource, D: DeviceBook>(
+    State(state): State<ServeState<L, D>>,
+) -> Response {
     let resp = IdentityResp {
         device_id: *state.identity.device_id().as_bytes(),
         public_key_sec1: state.identity.public_key_sec1().to_vec(),
@@ -94,7 +135,10 @@ struct OpsQuery {
     limit: Option<u16>,
 }
 
-async fn get_ops(State(state): State<ServeState>, Query(q): Query<OpsQuery>) -> Response {
+async fn get_ops<L: LogSource, D: DeviceBook>(
+    State(state): State<ServeState<L, D>>,
+    Query(q): Query<OpsQuery>,
+) -> Response {
     let cursor = match q.since.as_deref() {
         Some(s) if !s.is_empty() => match decode_order_key(s) {
             Some(key) => key,
@@ -106,16 +150,13 @@ async fn get_ops(State(state): State<ServeState>, Query(q): Query<OpsQuery>) -> 
 
     let mut ops = Vec::new();
     let mut next = cursor;
-    {
-        let log = state.log.lock().expect("oplog mutex poisoned");
-        for op in log.since(cursor).take(limit) {
-            match op.to_bytes() {
-                Ok(bytes) => {
-                    ops.push(bytes);
-                    next = op.order_key();
-                }
-                Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    for op in state.log.since(cursor, limit) {
+        match op.to_bytes() {
+            Ok(bytes) => {
+                ops.push(bytes);
+                next = op.order_key();
             }
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         }
     }
     let resp = PullResponse {
@@ -128,14 +169,28 @@ async fn get_ops(State(state): State<ServeState>, Query(q): Query<OpsQuery>) -> 
     }
 }
 
-async fn get_head(State(state): State<ServeState>) -> Response {
-    let head = state
-        .log
-        .lock()
-        .expect("oplog mutex poisoned")
-        .head()
-        .unwrap_or(OrderKey::MIN);
+async fn get_head<L: LogSource, D: DeviceBook>(State(state): State<ServeState<L, D>>) -> Response {
+    let head = state.log.head().unwrap_or(OrderKey::MIN);
     octet(head.to_wire().to_vec())
+}
+
+async fn get_devices<L: LogSource, D: DeviceBook>(
+    State(state): State<ServeState<L, D>>,
+) -> Response {
+    let devices = state
+        .devices
+        .known_devices()
+        .into_iter()
+        .map(|(id, sec1)| DeviceEntry {
+            device_id: *id.as_bytes(),
+            public_key_sec1: sec1.to_vec(),
+        })
+        .collect();
+    let resp = DevicesResp { devices };
+    match postcard::to_allocvec(&resp) {
+        Ok(bytes) => octet(bytes),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -154,13 +209,19 @@ impl HttpPullSource {
         let base_url = base_url.into().trim_end_matches('/').to_string();
         Self {
             base_url,
-            client: reqwest::Client::new(),
+            client: build_client(DEFAULT_REQUEST_TIMEOUT),
             limit: DEFAULT_PULL_LIMIT,
         }
     }
 
     pub fn with_limit(mut self, limit: u16) -> Self {
         self.limit = limit;
+        self
+    }
+
+    /// Override the per-request timeout (default [`DEFAULT_REQUEST_TIMEOUT`]).
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.client = build_client(timeout);
         self
     }
 
@@ -197,6 +258,24 @@ impl HttpPullSource {
             .map_err(|_| TransportError::Wire("head is not 72 bytes".into()))?;
         Ok(OrderKey::from_wire(&arr))
     }
+
+    /// Fetch the peer's trusted device set (D11 transitive key gossip).
+    pub async fn fetch_devices(&self) -> Result<DevicesResp, TransportError> {
+        let bytes = self
+            .get_bytes(&format!("{}/devices", self.base_url))
+            .await?;
+        postcard::from_bytes(&bytes).map_err(|e| TransportError::Wire(e.to_string()))
+    }
+}
+
+/// Build a `reqwest::Client` with a total per-request timeout. `build` only
+/// fails if the TLS backend cannot initialize, which the plain-HTTP transport
+/// never uses — the same infallible-in-practice contract as `Client::new`.
+fn build_client(timeout: Duration) -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .build()
+        .expect("reqwest client build")
 }
 
 impl PullSource for HttpPullSource {
@@ -232,7 +311,7 @@ impl PullSource for HttpPullSource {
 /// to persist the key roll back exactly what this call added and nothing else.
 pub async fn register_peer(
     source: &HttpPullSource,
-    registry: &mut DeviceRegistry,
+    registry: &Mutex<DeviceRegistry>,
 ) -> Result<(DeviceId, bool), TransportError> {
     let resp = source.fetch_identity().await?;
     let advertised = DeviceId::from_bytes(resp.device_id);
@@ -248,15 +327,101 @@ pub async fn register_peer(
             derived: derived.to_hex(),
         });
     }
+    // The network fetch is done; take the lock only for the synchronous insert
+    // so a slow /identity round-trip never blocks the /devices route that reads
+    // the same registry.
+    let mut registry = registry.lock().expect("registry mutex poisoned");
     let newly_added = !registry.contains(&advertised);
     registry.insert_sec1(&sec1)?;
     Ok((advertised, newly_added))
 }
 
+/// Fetch a peer's `/devices` set and register every valid, not-yet-known key.
+/// This is transitive-trust-by-gossip (D11): device C's key reaches puller D
+/// through peer B even though D never contacted C. Each entry is admitted only
+/// if its key derives its advertised id — the exact [`SignedOp::verify`] device
+/// check — so a peer can introduce its own fabricated devices (which can only
+/// sign their own ops) but can never forge a mapping for a device it does not
+/// control. Malformed or mismatched entries are skipped, not fatal, so one bad
+/// row cannot deny learning the rest of an N-node mesh.
+///
+/// Returns the device ids newly added, so a caller that fails to persist the
+/// keys can roll back exactly what this introduced — the same durability
+/// discipline as [`register_peer`]: a key must be durable before it is allowed
+/// to verify an op (or a cursor could advance past ops the next restart cannot
+/// verify).
+pub async fn learn_devices(
+    source: &HttpPullSource,
+    registry: &Mutex<DeviceRegistry>,
+) -> Result<Vec<DeviceId>, TransportError> {
+    let resp = source.fetch_devices().await?;
+    let mut registry = registry.lock().expect("registry mutex poisoned");
+    let mut added = Vec::new();
+    for entry in resp.devices {
+        let advertised = DeviceId::from_bytes(entry.device_id);
+        let Ok(sec1) = <[u8; 33]>::try_from(entry.public_key_sec1.as_slice()) else {
+            continue;
+        };
+        let Ok(derived) = DeviceIdentity::device_id_from_sec1(&sec1) else {
+            continue;
+        };
+        if derived != advertised || registry.contains(&advertised) {
+            continue;
+        }
+        if registry.insert_sec1(&sec1).is_ok() {
+            added.push(advertised);
+        }
+    }
+    Ok(added)
+}
+
+/// How [`sync_once_with`] pushes newly-crossed ops into the store.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApplyMode {
+    /// Re-apply the whole log whenever the cursor moves. Correct for a store
+    /// that resolves conflicts by arrival order (the reference
+    /// [`crate::kv::KvStore`]); O(history) per pull.
+    Replay,
+    /// Apply only the ops the cursor newly crossed (G1). O(batch) per pull, for
+    /// a store with an internal per-row version guard (Grand Central's proxy.db
+    /// adapter) that stays convergent under out-of-order-across-batches arrival.
+    Incremental,
+}
+
+/// One incremental pull from `source`, applying with [`ApplyMode::Replay`].
+/// Backwards-compatible shim over [`sync_once_with`].
+#[allow(clippy::too_many_arguments)]
+pub async fn sync_once<S, P>(
+    source: &P,
+    registry: &Mutex<DeviceRegistry>,
+    clock: &NodeClock,
+    log: &Mutex<OpLog>,
+    store: &Mutex<S>,
+    cursor: &mut OrderKey,
+    durability: Option<&Mutex<OplogWriter>>,
+) -> Result<usize, TransportError>
+where
+    S: Store,
+    P: PullSource<Error = TransportError>,
+{
+    sync_once_with(
+        source,
+        registry,
+        clock,
+        log,
+        store,
+        cursor,
+        durability,
+        ApplyMode::Replay,
+    )
+    .await
+}
+
 /// One incremental pull from `source`. Each returned op is verified against the
 /// device registry (a peer serves ops from several devices, including the
 /// puller's own echoed back), its HLC folded into the local clock, and new ops
-/// appended — persisted when `durability` is set. The store is then replayed.
+/// appended — persisted when `durability` is set. Newly-crossed ops are then
+/// pushed into the store per `mode`.
 ///
 /// `cursor` only advances over ops that were actually verified and applied (or
 /// verified and skipped as genuine duplicates). The first op that fails
@@ -266,14 +431,15 @@ pub async fn register_peer(
 /// cursor and skip later legitimate ops. Returns the number of newly appended
 /// ops on success.
 #[allow(clippy::too_many_arguments)]
-pub async fn sync_once<S, P>(
+pub async fn sync_once_with<S, P>(
     source: &P,
-    registry: &DeviceRegistry,
+    registry: &Mutex<DeviceRegistry>,
     clock: &NodeClock,
     log: &Mutex<OpLog>,
     store: &Mutex<S>,
     cursor: &mut OrderKey,
     durability: Option<&Mutex<OplogWriter>>,
+    mode: ApplyMode,
 ) -> Result<usize, TransportError>
 where
     S: Store,
@@ -288,6 +454,10 @@ where
     // reached, so the cursor never moves past the failure point.
     let mut abort: Option<TransportError> = None;
     {
+        // Lock the registry read-side only for the synchronous verification
+        // loop (the network pull already completed above), keeping the /devices
+        // route responsive while a batch verifies.
+        let registry = registry.lock().expect("registry mutex poisoned");
         let mut log = log.lock().expect("oplog mutex poisoned");
         for op in ops {
             let key = op.order_key();
@@ -352,15 +522,25 @@ where
                 .sync_after_batch()?;
         }
     }
-    // Replay whenever the cursor moves, not only when this batch appended:
-    // after a failed fsync, the retry sees the batch's ops as verified
-    // duplicates (appended == 0) yet still advances the cursor, and the store
-    // must not be left behind the log at that point. Replay is idempotent
-    // whole-log application, so re-running it over duplicates is safe.
+    // Apply whenever the cursor moves, not only when this batch appended: after
+    // a failed fsync, the retry sees the batch's ops as verified duplicates
+    // (appended == 0) yet still advances the cursor, and the store must not be
+    // left behind the log. Both apply paths are idempotent, so re-running over
+    // duplicates is safe. Incremental scopes the work to `(cursor, highest]` —
+    // exactly the ops just crossed, including any a prior aborted fsync left
+    // behind — instead of re-walking the whole log.
     if highest != *cursor {
         let log = log.lock().expect("oplog mutex poisoned");
         let mut store = store.lock().expect("store mutex poisoned");
-        replay(&log, &mut *store).map_err(|e| TransportError::Replay(e.to_string()))?;
+        match mode {
+            ApplyMode::Replay => {
+                replay(&log, &mut *store).map_err(|e| TransportError::Replay(e.to_string()))?;
+            }
+            ApplyMode::Incremental => {
+                apply_range(&log, &mut *store, *cursor, highest)
+                    .map_err(|e| TransportError::Replay(e.to_string()))?;
+            }
+        }
     }
     *cursor = highest;
     match abort {
@@ -640,6 +820,7 @@ mod tests {
 
         let mut registry = DeviceRegistry::new();
         registry.insert_key(*honest.verifying_key());
+        let registry = Mutex::new(registry);
         let clock = NodeClock::new(&honest.device_id());
 
         // Forged op from an unknown device, stamped with the largest possible
@@ -686,6 +867,7 @@ mod tests {
         registry.insert_key(*honest.verifying_key());
         let clock = NodeClock::new(&honest.device_id());
 
+        let registry = Mutex::new(registry);
         let op = seal_kv_op(&honest, clock.now(), "k", b"v");
         let source = ScriptedSource::new(vec![vec![op.clone()], vec![op.clone()]]);
 
@@ -733,8 +915,12 @@ mod tests {
         assert_eq!(store.lock().unwrap().get("k"), Some(&b"v"[..]));
         // The durable file holds exactly the op the memory log holds.
         let mut recovered = OpLog::new();
-        let restored =
-            crate::durable::replay_oplog_file(&oplog_path, &registry, &mut recovered).unwrap();
+        let restored = crate::durable::replay_oplog_file(
+            &oplog_path,
+            &registry.lock().unwrap(),
+            &mut recovered,
+        )
+        .unwrap();
         assert_eq!(restored, 1);
     }
 
@@ -746,6 +932,7 @@ mod tests {
         let honest = DeviceIdentity::generate();
         let mut registry = DeviceRegistry::new();
         registry.insert_key(*honest.verifying_key());
+        let registry = Mutex::new(registry);
         let clock = NodeClock::new(&honest.device_id());
 
         // Signature is valid (the device is known) but the HLC is ~2106,
@@ -764,5 +951,99 @@ mod tests {
         assert_eq!(cursor, OrderKey::MIN);
         assert!(log.lock().unwrap().is_empty());
         assert!(store.lock().unwrap().is_empty());
+    }
+
+    /// A store that counts every `apply` call, to prove incremental mode touches
+    /// only newly-crossed ops rather than re-walking the whole log each pull.
+    #[derive(Default)]
+    struct CountingStore {
+        applies: usize,
+        data: std::collections::BTreeMap<String, Vec<u8>>,
+    }
+
+    impl Store for CountingStore {
+        type Op = KvOp;
+        type Error = crate::kv::KvError;
+
+        fn store_id(&self) -> StoreId {
+            kv_store_id()
+        }
+
+        fn encode(&self, op: &KvOp) -> Result<Vec<u8>, Self::Error> {
+            Ok(postcard::to_allocvec(op)?)
+        }
+
+        fn decode(&self, payload: &[u8]) -> Result<KvOp, Self::Error> {
+            Ok(postcard::from_bytes(payload)?)
+        }
+
+        fn apply(
+            &mut self,
+            _ctx: crate::store::OpContext<'_>,
+            op: KvOp,
+        ) -> Result<(), Self::Error> {
+            self.applies += 1;
+            if let KvOp::Put { key, value } = op {
+                self.data.insert(key, value);
+            }
+            Ok(())
+        }
+    }
+
+    // G1: incremental apply calls `Store::apply` once per newly-crossed op, not
+    // once per op in the whole log. Three ops then one more must be exactly four
+    // applies (whole-log replay would be 3 + 4 = 7).
+    #[tokio::test]
+    async fn incremental_apply_only_touches_new_ops() {
+        let honest = DeviceIdentity::generate();
+        let mut registry = DeviceRegistry::new();
+        registry.insert_key(*honest.verifying_key());
+        let registry = Mutex::new(registry);
+        let clock = NodeClock::new(&honest.device_id());
+
+        let op1 = seal_kv_op(&honest, clock.now(), "a", b"1");
+        let op2 = seal_kv_op(&honest, clock.now(), "b", b"2");
+        let op3 = seal_kv_op(&honest, clock.now(), "c", b"3");
+        let op4 = seal_kv_op(&honest, clock.now(), "d", b"4");
+        let source = ScriptedSource::new(vec![
+            vec![op1.clone(), op2.clone(), op3.clone()],
+            vec![op4.clone()],
+        ]);
+
+        let log = Mutex::new(OpLog::new());
+        let store = Mutex::new(CountingStore::default());
+        let mut cursor = OrderKey::MIN;
+
+        let n = sync_once_with(
+            &source,
+            &registry,
+            &clock,
+            &log,
+            &store,
+            &mut cursor,
+            None,
+            ApplyMode::Incremental,
+        )
+        .await
+        .unwrap();
+        assert_eq!(n, 3);
+        assert_eq!(store.lock().unwrap().applies, 3);
+
+        let n = sync_once_with(
+            &source,
+            &registry,
+            &clock,
+            &log,
+            &store,
+            &mut cursor,
+            None,
+            ApplyMode::Incremental,
+        )
+        .await
+        .unwrap();
+        assert_eq!(n, 1);
+        // 3 from the first batch + 1 from the second, never re-applying history.
+        assert_eq!(store.lock().unwrap().applies, 4);
+        assert_eq!(store.lock().unwrap().data.get("d"), Some(&b"4".to_vec()));
     }
 }
