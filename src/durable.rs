@@ -38,7 +38,11 @@ impl OplogWriter {
     /// which makes the torn-frame rollback's `set_len` fail. This writer is
     /// the file's only writer, so seek-to-end is equivalent.
     pub fn open(path: &Path) -> Result<Self, DurabilityError> {
-        let mut file = OpenOptions::new().create(true).write(true).open(path)?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(path)?;
         file.seek(SeekFrom::End(0))?;
         Ok(Self {
             file,
