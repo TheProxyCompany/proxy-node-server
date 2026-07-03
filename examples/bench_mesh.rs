@@ -62,6 +62,10 @@ struct Args {
     /// RSS sample period in milliseconds.
     #[arg(long, default_value_t = 1000)]
     sample_ms: u64,
+    /// Seconds to keep serving after convergence, so slower peers can finish
+    /// pulling from this node before it disappears.
+    #[arg(long, default_value_t = 30)]
+    linger_secs: u64,
 }
 
 /// One peer this node pulls from, plus the state needed to detect it settling.
@@ -199,18 +203,23 @@ async fn main() {
                 }
             }
 
-            // Track head stability for the settle rule.
+            // Track head stability for the settle rule. A fetch failure does
+            // NOT block settling: a peer that converged first and exited (or
+            // dropped off) after we drained it still counts once its last
+            // observed head has been stable for the window — otherwise the
+            // fastest node's exit strands everyone still watching it.
             if let Ok(head) = peer.source.fetch_head().await {
                 if head != peer.last_head {
                     peer.last_head = head;
                     peer.head_changed_at = Instant::now();
                 }
-                let stable = peer.head_changed_at.elapsed() >= settle;
-                let nonempty = head != OrderKey::MIN;
-                if stable && nonempty && !peer.settled {
-                    peer.settled = true;
-                    peer.settled_ms = Some(start.elapsed().as_secs_f64() * 1e3);
-                }
+            }
+            let stable = peer.head_changed_at.elapsed() >= settle;
+            let nonempty = peer.last_head != OrderKey::MIN;
+            let drained = peer.cursor >= peer.last_head;
+            if stable && nonempty && drained && !peer.settled {
+                peer.settled = true;
+                peer.settled_ms = Some(start.elapsed().as_secs_f64() * 1e3);
             }
         }
 
@@ -282,4 +291,6 @@ async fn main() {
 \"peers\":[{peers_json}],\"rss_mb\":[{rss_json}]}}",
         args.label, self_hex, args.commit
     );
+    // Keep serving so slower peers can drain this node before it disappears.
+    tokio::time::sleep(Duration::from_secs(args.linger_secs)).await;
 }
