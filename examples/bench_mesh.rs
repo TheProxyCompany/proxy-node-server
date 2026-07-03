@@ -44,16 +44,18 @@
 //! effective client-side pull interval and is reported as such.
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::Poll;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, ValueEnum};
 use proxy_node_server::harness::{MeshNode, rss_kib};
 use proxy_node_server::{
-    DeviceId, HttpPullSource, KvOp, KvStore, OpId, OrderKey, Store, learn_devices, register_peer,
-    sync_once,
+    DeviceId, HttpPullSource, KvOp, KvStore, OpId, OrderKey, Store, WATCH_DEFAULT_WAIT,
+    learn_devices, register_peer, sync_once,
 };
 
 /// Leading bytes of every trickle op's value: the commit wall-clock time as
@@ -363,6 +365,55 @@ fn unix_nanos() -> u128 {
         .as_nanos()
 }
 
+/// Block until some peer's `/watch` reports its head moved (push delivery) or
+/// `fallback` elapses, whichever comes first — replacing the fixed 150ms pull
+/// cadence. During active trickle every peer commits continuously, so a watch
+/// resolves in ~1 RTT and drives the next pull immediately; `fallback` only
+/// bounds idle loop wakeups (so the drain-deadline check still runs) and never
+/// dominates while ops are flowing. Dependency-free `select_all` over the peers'
+/// watch futures, each of which already carries its own bounded timeout.
+///
+/// Per-link, mirroring the daemon's pull loop: only a *successful* watch (a head
+/// move or clean hold-window close) resolves the wait. A peer whose watch errors
+/// (e.g. a pre-push 404) is dropped from the race rather than short-circuiting it,
+/// so one errored link cannot busy-spin the loop; if every link errors, the
+/// `fallback` sleep bounds the wait.
+async fn wait_for_push(peers: &[Peer], wait: Duration, fallback: Duration) {
+    if peers.is_empty() {
+        tokio::time::sleep(fallback).await;
+        return;
+    }
+    let mut futures: Vec<_> = peers
+        .iter()
+        .map(|p| Some((p.cursor, Box::pin(p.source.watch_head(p.cursor, wait)))))
+        .collect();
+    let any = std::future::poll_fn(|cx| {
+        for slot in futures.iter_mut() {
+            if let Some((cursor, future)) = slot {
+                match future.as_mut().poll(cx) {
+                    // A head strictly past our cursor is real new data: resolve
+                    // the race so the caller pulls it now.
+                    Poll::Ready(Ok(head)) if head > *cursor => return Poll::Ready(()),
+                    // Ok with no new head (hold-window close, or an over-capacity
+                    // server shedding the park and echoing the current head), or an
+                    // error (a pre-push 404): stop waiting on this peer instead of
+                    // letting an empty reply resolve the race and spin the loop. If
+                    // every link goes quiet, the `fallback` sleep below bounds the
+                    // wait — the shared empty-watch backoff, expressed as this
+                    // benchmark's own fallback window.
+                    Poll::Ready(_) => *slot = None,
+                    Poll::Pending => {}
+                }
+            }
+        }
+        Poll::Pending
+    });
+    tokio::select! {
+        _ = any => {}
+        _ = tokio::time::sleep(fallback) => {}
+    }
+}
+
 /// Nearest-rank percentile over an already-sorted ascending slice. Empty → 0.
 fn percentile(sorted: &[f64], q: f64) -> f64 {
     if sorted.is_empty() {
@@ -420,9 +471,14 @@ async fn run_trickle(
         })
     };
 
+    // Delivery is now push: the pull loop blocks on peers' `/watch` rather than a
+    // fixed cadence, so `pull_loop_ms` reports the watch hold window, not a poll
+    // period, and `delivery` records the mode.
+    let watch_ms = WATCH_DEFAULT_WAIT.as_millis();
     println!(
         "{{\"event\":\"trickle_start\",\"label\":\"{}\",\"n_commits\":{n_commits},\
-\"trickle_ms\":{},\"duration_secs\":{},\"payload_bytes\":{payload_bytes},\"pull_loop_ms\":150}}",
+\"trickle_ms\":{},\"duration_secs\":{},\"payload_bytes\":{payload_bytes},\
+\"delivery\":\"push\",\"pull_loop_ms\":{watch_ms}}}",
         args.label, args.trickle_ms, args.duration_secs
     );
 
@@ -510,7 +566,9 @@ async fn run_trickle(
                 break;
             }
         }
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        // Push delivery: block on peers' `/watch` instead of a 150ms poll. The
+        // fallback bounds idle wakeups so the drain-deadline check keeps running.
+        wait_for_push(peers, WATCH_DEFAULT_WAIT, Duration::from_millis(200)).await;
     }
 
     let _ = committer.await;
@@ -558,7 +616,8 @@ async fn run_trickle(
     println!(
         "{{\"event\":\"summary\",\"mode\":\"trickle\",\"label\":\"{}\",\"device\":\"{}\",\
 \"startup_ms\":{startup_ms:.3},\"peers_ready_ms\":{peers_ready_ms:.3},\
-\"trickle_ms\":{},\"duration_secs\":{},\"payload_bytes\":{payload_bytes},\"pull_loop_ms\":150,\
+\"trickle_ms\":{},\"duration_secs\":{},\"payload_bytes\":{payload_bytes},\
+\"delivery\":\"push\",\"pull_loop_ms\":{watch_ms},\
 \"sent\":{sent_total},\"received\":{received_total},\"never_received\":{never_total},\
 \"latency_p50_ms\":{p50:.3},\"latency_p95_ms\":{p95:.3},\"latency_p99_ms\":{p99:.3},\
 \"latency_max_ms\":{max:.3},\

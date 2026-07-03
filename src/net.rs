@@ -6,7 +6,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::extract::{Query, State};
@@ -14,6 +14,7 @@ use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use serde::{Deserialize, Serialize};
+use tokio::sync::{Semaphore, watch};
 
 use crate::durable::OplogWriter;
 use crate::error::TransportError;
@@ -32,6 +33,37 @@ pub const DEFAULT_PULL_LIMIT: u16 = 512;
 /// blackholed peer (e.g. a stale tailnet IP) can never hang a browse tick or a
 /// pull loop indefinitely; `reqwest::Client` has no timeout by default.
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Default server-hold for a `/watch` long-poll: how long a parked handler waits
+/// for the head to move before returning the unchanged head. The client re-arms
+/// on return, so this is the idle re-poll cadence, not a latency floor.
+pub const WATCH_DEFAULT_WAIT: Duration = Duration::from_millis(25_000);
+
+/// Client-side backoff after a `/watch` that returns `Ok` but *no new data* —
+/// a returned head at or behind the caller's cursor. Two cases produce this: a
+/// clean hold-window close with no append, and — the one this guards — an
+/// over-capacity server that sheds the park and answers immediately with the
+/// current head (see [`ServeState::with_watch_limit`]). A consumer that treats
+/// any `Ok` as a pull trigger re-arms instantly on such a reply, spinning a
+/// tight watch/empty-pull loop under saturation. Sleeping this delay before
+/// re-arming collapses the loop; a genuine head move (head strictly past the
+/// cursor) returns with no backoff, so this only ever bounds *idle* re-arm
+/// latency, never the delivery of real ops. 500ms caps a saturated link at two
+/// re-arms per second — negligible against the multi-second hold window.
+pub const WATCH_EMPTY_BACKOFF: Duration = Duration::from_millis(500);
+
+/// Hard cap on the `/watch` hold. Kept under proxy idle limits (nginx 60s,
+/// Cloudflare 100s) so the *server* always closes the long-poll cleanly and no
+/// intermediary tears it down mid-flight.
+pub const WATCH_MAX_WAIT: Duration = Duration::from_millis(50_000);
+
+/// Default cap on concurrently *parked* `/watch` long-polls. Each parked handler
+/// holds a connection and a task for up to [`WATCH_MAX_WAIT`], so once the route
+/// is proxy-exposed an unbounded park count is a DoS surface. At the cap `/watch`
+/// degrades to an immediate head response (the caller falls back to polling) —
+/// admission control that sheds load instead of accumulating parked tasks.
+/// Overridable per-node via [`ServeState::with_watch_limit`].
+pub const DEFAULT_MAX_PARKED_WATCHES: usize = 64;
 
 /// `/identity` response: what a puller needs to verify this peer's ops. The key
 /// is a `Vec<u8>` (33-byte compressed SEC1) because serde derives (de)serialize
@@ -69,17 +101,147 @@ pub struct DevicesResp {
 }
 
 // ---------------------------------------------------------------------------
+// Push wake-up (`/watch`): a head-change notifier that turns the sleep between
+// pull rounds into a blocking wait resolving the instant the peer's head moves.
+// It is a *wake-up signal only* — it transfers no ops and touches none of the
+// pull invariants; the authoritative path stays the verify-before-advance pull.
+// ---------------------------------------------------------------------------
+
+/// Publisher side of the push wake-up, fed the new head from every op-append
+/// path (local emit + remote pull-apply). Backed by a `tokio::sync::watch` used
+/// as a pure tick: its value is advisory (debug only) — `/watch` correctness
+/// reads the authoritative [`LogSource::head`], never the channel value. One
+/// sender wakes every parked handler, so fanout needs no per-connection
+/// registry, and a burst of appends coalesces into a single wake (the watch
+/// keeps only the newest value), which drives exactly one pull batch, not N.
+pub struct HeadPublisher {
+    tx: watch::Sender<OrderKey>,
+}
+
+impl HeadPublisher {
+    pub fn new(initial: OrderKey) -> Self {
+        let (tx, _rx) = watch::channel(initial);
+        Self { tx }
+    }
+
+    /// A reader parked handlers block on. Cloneable through [`ServeState`].
+    pub fn watch(&self) -> HeadWatch {
+        HeadWatch {
+            rx: Some(self.tx.subscribe()),
+        }
+    }
+
+    /// Signal that the head moved to `head`. A no-op wake when the value is
+    /// unchanged (so a committed write that emitted no ops does not spuriously
+    /// wake watchers), and never errors when there are zero receivers.
+    pub fn publish(&self, head: OrderKey) {
+        self.tx.send_if_modified(|current| {
+            if *current != head {
+                *current = head;
+                true
+            } else {
+                false
+            }
+        });
+    }
+}
+
+/// Reader side of the push wake-up, held in [`ServeState`]. [`HeadWatch::inert`]
+/// is a watch with no publisher wired: `/watch` then degrades to a bounded
+/// long-poll that only ever times out — correct, just no speedup — which is what
+/// any [`LogSource`] gets for free before its emit path publishes.
+#[derive(Clone)]
+pub struct HeadWatch {
+    rx: Option<watch::Receiver<OrderKey>>,
+}
+
+impl HeadWatch {
+    pub fn inert() -> Self {
+        Self { rx: None }
+    }
+
+    /// Block until `log.head() > known` (the peer has ops the caller has not
+    /// pulled) or `wait` elapses, then return the head to report. The comparison
+    /// is *directional*: only a strictly-newer head returns early. A caller whose
+    /// cursor sorts at or ahead of this peer's head (`known >= head` — e.g. a
+    /// cursor that has already crossed this peer's ops, or one carrying a forged
+    /// far-future key) parks out the whole window instead of returning
+    /// immediately, so it can never drive a tight watch/empty-pull loop.
+    ///
+    /// Ordering is the correctness crux: [`watch::Receiver::borrow_and_update`]
+    /// marks the current version seen *before* the head is read, so an append
+    /// landing between the mark and the read is caught by the read (return now),
+    /// and an append landing between the read and the park bumps the version
+    /// after our mark, so [`watch::Receiver::changed`] is already ready → loop →
+    /// re-read → return. No wake is ever lost.
+    pub async fn until_head_changes<L: LogSource>(
+        mut self,
+        log: &L,
+        known: OrderKey,
+        wait: Duration,
+    ) -> OrderKey {
+        let deadline = Instant::now() + wait;
+        loop {
+            if let Some(rx) = self.rx.as_mut() {
+                rx.borrow_and_update();
+            }
+            let cur = log.head().unwrap_or(OrderKey::MIN);
+            if cur > known {
+                return cur;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return cur;
+            }
+            match self.rx.as_mut() {
+                Some(rx) => {
+                    tokio::select! {
+                        changed = rx.changed() => {
+                            if changed.is_err() {
+                                // Every publisher dropped: no further wake can
+                                // arrive. Hold out the remaining window like the
+                                // inert path so a dropped publisher can never
+                                // busy-spin the handler or the client.
+                                tokio::time::sleep(
+                                    deadline.saturating_duration_since(Instant::now()),
+                                )
+                                .await;
+                                return log.head().unwrap_or(OrderKey::MIN);
+                            }
+                            // Version bumped: loop to re-read the head.
+                        }
+                        _ = tokio::time::sleep(remaining) => {
+                            return log.head().unwrap_or(OrderKey::MIN);
+                        }
+                    }
+                }
+                None => {
+                    tokio::time::sleep(remaining).await;
+                    return log.head().unwrap_or(OrderKey::MIN);
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Server
 // ---------------------------------------------------------------------------
 
 /// Shared state the pull routes serve from: this node's identity, its op-log
-/// ([`LogSource`]), and the device keys it gossips ([`DeviceBook`]). Both are
-/// generic so the reference in-memory log/registry and Grand Central's
-/// proxy.db-backed log/devices table mount the same routes.
+/// ([`LogSource`]), the device keys it gossips ([`DeviceBook`]), and the
+/// head-change notifier `/watch` parks on. Both logs are generic so the
+/// reference in-memory log/registry and Grand Central's proxy.db-backed
+/// log/devices table mount the same routes.
 pub struct ServeState<L: LogSource, D: DeviceBook> {
     identity: Arc<DeviceIdentity>,
     log: L,
     devices: D,
+    watch: HeadWatch,
+    /// Admission control for `/watch`: caps the number of handlers parked at once
+    /// so the route cannot be turned into a park-and-hold DoS. Shared across the
+    /// [`Clone`]d per-connection states, so the cap is process-wide per node.
+    watch_limit: Arc<Semaphore>,
 }
 
 impl<L: LogSource, D: DeviceBook> Clone for ServeState<L, D> {
@@ -88,26 +250,50 @@ impl<L: LogSource, D: DeviceBook> Clone for ServeState<L, D> {
             identity: self.identity.clone(),
             log: self.log.clone(),
             devices: self.devices.clone(),
+            watch: self.watch.clone(),
+            watch_limit: self.watch_limit.clone(),
         }
     }
 }
 
 impl<L: LogSource, D: DeviceBook> ServeState<L, D> {
+    /// Build serve state with an inert watch, so every existing caller compiles
+    /// unchanged and its `/watch` is a bounded long-poll until a publisher is
+    /// wired via [`ServeState::with_watch`]. The parked-watch cap defaults to
+    /// [`DEFAULT_MAX_PARKED_WATCHES`]; override with [`ServeState::with_watch_limit`].
     pub fn new(identity: Arc<DeviceIdentity>, log: L, devices: D) -> Self {
         Self {
             identity,
             log,
             devices,
+            watch: HeadWatch::inert(),
+            watch_limit: Arc::new(Semaphore::new(DEFAULT_MAX_PARKED_WATCHES)),
         }
+    }
+
+    /// Opt into push delivery: park `/watch` handlers on `watch`, which a
+    /// [`HeadPublisher`] on the node's append path wakes on every head change.
+    pub fn with_watch(mut self, watch: HeadWatch) -> Self {
+        self.watch = watch;
+        self
+    }
+
+    /// Override the concurrent-parked-`/watch` cap (default
+    /// [`DEFAULT_MAX_PARKED_WATCHES`]). Beyond `max` in-flight parks, `/watch`
+    /// answers immediately with the current head so callers degrade to polling.
+    pub fn with_watch_limit(mut self, max: usize) -> Self {
+        self.watch_limit = Arc::new(Semaphore::new(max));
+        self
     }
 }
 
-/// Build the `/identity`, `/ops`, `/head`, and `/devices` router for a node.
+/// Build the `/identity`, `/ops`, `/head`, `/watch`, and `/devices` router.
 pub fn router<L: LogSource, D: DeviceBook>(state: ServeState<L, D>) -> Router {
     Router::new()
         .route("/identity", get(get_identity::<L, D>))
         .route("/ops", get(get_ops::<L, D>))
         .route("/head", get(get_head::<L, D>))
+        .route("/watch", get(get_watch::<L, D>))
         .route("/devices", get(get_devices::<L, D>))
         .with_state(state)
 }
@@ -171,6 +357,58 @@ async fn get_ops<L: LogSource, D: DeviceBook>(
 
 async fn get_head<L: LogSource, D: DeviceBook>(State(state): State<ServeState<L, D>>) -> Response {
     let head = state.log.head().unwrap_or(OrderKey::MIN);
+    octet(head.to_wire().to_vec())
+}
+
+#[derive(Deserialize)]
+struct WatchQuery {
+    head: Option<String>,
+    wait: Option<u64>,
+}
+
+/// `/watch` — `/head` with a blocking condition. Returns immediately when our
+/// head is *strictly newer* than the caller's `head` (the primary herd guard: a
+/// caller mid-pagination or already behind never parks), else parks until the
+/// head advances past the caller's or `wait` (clamped to [`WATCH_MAX_WAIT`])
+/// elapses. The response is the identical 72-byte [`OrderKey`] wire form `/head`
+/// returns. The caller passes its pull cursor as `head`, and cursor and peer-head
+/// share the `OrderKey` space, so "head > cursor" is exactly "peer has ops I have
+/// not pulled" — valid even across pagination. The comparison is directional on
+/// purpose: a cursor that sorts at or ahead of our head never short-circuits, so
+/// it cannot spin a tight watch/empty-pull loop (see [`HeadWatch::until_head_changes`]).
+///
+/// Parks are admission-controlled: at [`ServeState::with_watch_limit`] concurrent
+/// parked handlers the route stops parking and answers immediately with the
+/// current head, shedding load to polling instead of accumulating parked tasks.
+async fn get_watch<L: LogSource, D: DeviceBook>(
+    State(state): State<ServeState<L, D>>,
+    Query(q): Query<WatchQuery>,
+) -> Response {
+    let known = match q.head.as_deref() {
+        Some(s) if !s.is_empty() => match decode_order_key(s) {
+            Some(key) => key,
+            None => return StatusCode::BAD_REQUEST.into_response(),
+        },
+        _ => OrderKey::MIN,
+    };
+    let wait = q
+        .wait
+        .map(Duration::from_millis)
+        .unwrap_or(WATCH_DEFAULT_WAIT)
+        .min(WATCH_MAX_WAIT);
+    // Take an admission permit for the whole park. At capacity, skip parking and
+    // return the current head so the caller polls — the DoS guard for a
+    // proxy-exposed `/watch`. The permit is released when the handler returns.
+    let head = match state.watch_limit.clone().try_acquire_owned() {
+        Ok(_permit) => {
+            state
+                .watch
+                .clone()
+                .until_head_changes(&state.log, known, wait)
+                .await
+        }
+        Err(_) => state.log.head().unwrap_or(OrderKey::MIN),
+    };
     octet(head.to_wire().to_vec())
 }
 
@@ -256,6 +494,44 @@ impl HttpPullSource {
             .as_slice()
             .try_into()
             .map_err(|_| TransportError::Wire("head is not 72 bytes".into()))?;
+        Ok(OrderKey::from_wire(&arr))
+    }
+
+    /// Long-poll the peer's `/watch`: resolves with the peer head the instant it
+    /// differs from `known`, or when the server's hold window closes (returning
+    /// the unchanged head). The per-request timeout is `wait + DEFAULT_REQUEST_TIMEOUT`,
+    /// so the client never fires before the server replies — the slack absorbs
+    /// RTT and server scheduling past the hold window. An old peer without
+    /// `/watch` answers 404, surfaced here as `Err`, which the pull loop treats
+    /// as "no push; fall back to interval polling" (per-link degradation).
+    pub async fn watch_head(
+        &self,
+        known: OrderKey,
+        wait: Duration,
+    ) -> Result<OrderKey, TransportError> {
+        let url = format!(
+            "{}/watch?head={}&wait={}",
+            self.base_url,
+            encode_order_key(&known),
+            wait.as_millis()
+        );
+        let resp = self
+            .client
+            .get(&url)
+            .timeout(wait + DEFAULT_REQUEST_TIMEOUT)
+            .send()
+            .await
+            .map_err(|e| TransportError::Http(e.to_string()))?;
+        if !resp.status().is_success() {
+            return Err(TransportError::Http(format!("status {}", resp.status())));
+        }
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| TransportError::Http(e.to_string()))?;
+        let arr: [u8; 72] = bytes[..]
+            .try_into()
+            .map_err(|_| TransportError::Wire("watch head is not 72 bytes".into()))?;
         Ok(OrderKey::from_wire(&arr))
     }
 
@@ -1045,5 +1321,231 @@ mod tests {
         // 3 from the first batch + 1 from the second, never re-applying history.
         assert_eq!(store.lock().unwrap().applies, 4);
         assert_eq!(store.lock().unwrap().data.get("d"), Some(&b"4".to_vec()));
+    }
+
+    // ---- push-delivery (`/watch`) ----------------------------------------
+
+    /// Spawn a loopback node serving the full router with a wired
+    /// [`HeadPublisher`] and a `watch_limit`-capped `/watch`, returning the base
+    /// URL (so a test can open several clients against it), the shared log, and
+    /// the publisher so a test can append + signal a head change.
+    async fn spawn_watch_node_with_limit(
+        watch_limit: usize,
+    ) -> (String, Arc<Mutex<OpLog>>, HeadPublisher) {
+        let identity = Arc::new(DeviceIdentity::generate());
+        let log = Arc::new(Mutex::new(OpLog::new()));
+        let mut reg = DeviceRegistry::new();
+        reg.insert_key(*identity.verifying_key());
+        let devices = Arc::new(Mutex::new(reg));
+
+        let head = HeadPublisher::new(OrderKey::MIN);
+        let state = ServeState::new(identity, log.clone(), devices)
+            .with_watch(head.watch())
+            .with_watch_limit(watch_limit);
+        let app = router(state);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}"), log, head)
+    }
+
+    /// The common case: a node with the default parked-watch cap, returning a
+    /// single client.
+    async fn spawn_watch_node() -> (HttpPullSource, Arc<Mutex<OpLog>>, HeadPublisher) {
+        let (base, log, head) = spawn_watch_node_with_limit(DEFAULT_MAX_PARKED_WATCHES).await;
+        (HttpPullSource::new(base), log, head)
+    }
+
+    // A parked `/watch` must return within milliseconds of an append+publish,
+    // not at the hold deadline — the whole point of push delivery.
+    #[tokio::test]
+    async fn watch_returns_promptly_after_append() {
+        let (client, log, head) = spawn_watch_node().await;
+        let author = DeviceIdentity::generate();
+
+        let appender = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            let op = seal_kv_op(&author, Hlc(1_000), "k", b"v");
+            let new_head = op.order_key();
+            log.lock().unwrap().append(op);
+            head.publish(new_head);
+        });
+
+        let start = Instant::now();
+        let observed = client
+            .watch_head(OrderKey::MIN, Duration::from_secs(10))
+            .await
+            .unwrap();
+        let elapsed = start.elapsed();
+        appender.await.unwrap();
+
+        assert_ne!(observed, OrderKey::MIN, "watch returned the unchanged head");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "watch parked to the deadline instead of waking on the append: {elapsed:?}"
+        );
+    }
+
+    // With no append, `/watch` holds for `wait` and then returns the unchanged
+    // head cleanly (a 200, not an error), so the client re-arms without a stall.
+    #[tokio::test]
+    async fn watch_times_out_cleanly_at_the_deadline() {
+        let (client, _log, _head) = spawn_watch_node().await;
+        let start = Instant::now();
+        let observed = client
+            .watch_head(OrderKey::MIN, Duration::from_millis(300))
+            .await
+            .unwrap();
+        let elapsed = start.elapsed();
+        assert_eq!(observed, OrderKey::MIN);
+        assert!(
+            elapsed >= Duration::from_millis(250),
+            "watch returned before its hold window: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "watch overran its hold window: {elapsed:?}"
+        );
+    }
+
+    // An old peer without `/watch` answers 404; `watch_head` surfaces that as an
+    // Err so the pull loop degrades to interval polling on that link.
+    #[tokio::test]
+    async fn watch_head_errs_against_router_without_watch() {
+        // A bare router with no `/watch` route stands in for a pre-push peer.
+        let app: Router = Router::new();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = HttpPullSource::new(format!("http://{addr}"));
+        let err = client
+            .watch_head(OrderKey::MIN, Duration::from_millis(500))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, TransportError::Http(_)), "got {err:?}");
+    }
+
+    // Regression, finding 1: a cursor that sorts strictly AHEAD of the peer's
+    // head must not return immediately (the old `head != known` test that spun a
+    // tight watch/empty-pull loop). It parks the whole window and then reports
+    // the peer's actual — behind — head.
+    #[tokio::test]
+    async fn watch_parks_when_cursor_is_ahead_of_head() {
+        let (base, log, _head) = spawn_watch_node_with_limit(DEFAULT_MAX_PARKED_WATCHES).await;
+        let client = HttpPullSource::new(base);
+        let author = DeviceIdentity::generate();
+
+        // Give the node a real, non-MIN head.
+        let low = seal_kv_op(&author, Hlc(1_000), "k", b"v");
+        let head_key = low.order_key();
+        log.lock().unwrap().append(low);
+
+        // A cursor carrying a far-future HLC sorts strictly ahead of that head.
+        let ahead = seal_kv_op(&author, Hlc(u64::MAX), "future", b"x").order_key();
+        assert!(ahead > head_key, "test cursor must sort ahead of the head");
+
+        let start = Instant::now();
+        let observed = client
+            .watch_head(ahead, Duration::from_millis(300))
+            .await
+            .unwrap();
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed >= Duration::from_millis(250),
+            "watch returned early instead of parking on an ahead-cursor: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "watch overran its hold window: {elapsed:?}"
+        );
+        // It reports the true head, which is behind the caller's cursor.
+        assert_eq!(observed, head_key);
+    }
+
+    // Finding 3: `/watch` admission control. With the cap set to 1, the first
+    // watch parks and holds the only permit; a second concurrent watch is over
+    // capacity and must return immediately with the head (degrade to polling)
+    // rather than park.
+    #[tokio::test]
+    async fn watch_admission_cap_returns_immediately_over_capacity() {
+        let (base, _log, _head) = spawn_watch_node_with_limit(1).await;
+
+        // First watch parks for the full window, holding the single permit.
+        let hold_base = base.clone();
+        let parked = tokio::spawn(async move {
+            HttpPullSource::new(hold_base)
+                .watch_head(OrderKey::MIN, Duration::from_secs(3))
+                .await
+        });
+        // Let the parked watch reach the server and acquire the permit.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Second watch: over the cap, must not park.
+        let start = Instant::now();
+        let observed = HttpPullSource::new(base)
+            .watch_head(OrderKey::MIN, Duration::from_secs(3))
+            .await
+            .unwrap();
+        let elapsed = start.elapsed();
+        assert_eq!(
+            observed,
+            OrderKey::MIN,
+            "over-cap watch should echo the head"
+        );
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "over-cap watch parked instead of degrading to an immediate head: {elapsed:?}"
+        );
+
+        // The first watch is still parked; let it time out cleanly.
+        let _ = parked.await.unwrap();
+    }
+
+    // Finding (this changeset): an over-capacity `/watch` answers Ok immediately
+    // with an unchanged head. A consumer that re-arms on any Ok spins a tight
+    // watch/empty-pull loop under saturation. The client contract is to treat an
+    // unchanged head (head <= cursor) like a timeout and sleep WATCH_EMPTY_BACKOFF
+    // before re-arming. A zero-capacity server forces the immediate-echo path every
+    // time; over a fixed window the honored backoff must bound the re-arm count to a
+    // small multiple of window/backoff, not the hundreds a busy loop would reach.
+    #[tokio::test]
+    async fn unchanged_head_watch_does_not_busy_loop() {
+        // Cap of 0: every `/watch` is over capacity, so the server sheds the park
+        // and echoes the current head (MIN) with no hold — the saturation case.
+        let (base, _log, _head) = spawn_watch_node_with_limit(0).await;
+        let client = HttpPullSource::new(base);
+        let cursor = OrderKey::MIN;
+
+        let window = Duration::from_millis(1_200);
+        let deadline = Instant::now() + window;
+        let mut calls = 0usize;
+        while Instant::now() < deadline {
+            let head = client
+                .watch_head(cursor, Duration::from_secs(5))
+                .await
+                .unwrap();
+            calls += 1;
+            // The consumer fix: an Ok carrying no new head backs off instead of
+            // re-arming instantly.
+            if head <= cursor {
+                tokio::time::sleep(WATCH_EMPTY_BACKOFF).await;
+            }
+        }
+
+        // With the backoff honored, calls ≈ window / WATCH_EMPTY_BACKOFF (+1); a
+        // busy loop would reach into the hundreds. The ceiling is generous so the
+        // assertion keys on "bounded, not spinning," not an exact count.
+        let ceiling = (window.as_millis() / WATCH_EMPTY_BACKOFF.as_millis()) as usize + 3;
+        assert!(
+            calls <= ceiling,
+            "unchanged-head watch re-armed {calls} times in {window:?} (ceiling {ceiling}); \
+             it is busy-looping instead of backing off WATCH_EMPTY_BACKOFF"
+        );
     }
 }

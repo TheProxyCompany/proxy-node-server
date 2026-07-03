@@ -52,9 +52,10 @@ pub use transport::{Cursor, PeerId};
 pub use error::TransportError;
 #[cfg(feature = "pull-http")]
 pub use net::{
-    ApplyMode, DEFAULT_PULL_LIMIT, DeviceEntry, DevicesResp, HttpPullSource, IdentityResp,
-    PullResponse, ServeState, learn_devices, load_cursor, load_peer_keys, register_peer, router,
-    save_cursor, save_peer_keys, sync_once, sync_once_with,
+    ApplyMode, DEFAULT_MAX_PARKED_WATCHES, DEFAULT_PULL_LIMIT, DeviceEntry, DevicesResp,
+    HeadPublisher, HeadWatch, HttpPullSource, IdentityResp, PullResponse, ServeState,
+    WATCH_DEFAULT_WAIT, WATCH_EMPTY_BACKOFF, WATCH_MAX_WAIT, learn_devices, load_cursor,
+    load_peer_keys, register_peer, router, save_cursor, save_peer_keys, sync_once, sync_once_with,
 };
 #[cfg(feature = "pull-http")]
 pub use transport::PullSource;

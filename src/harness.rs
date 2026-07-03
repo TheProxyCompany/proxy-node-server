@@ -9,9 +9,9 @@ use std::time::{Duration, Instant};
 
 use crate::kv::{KvOp, KvStore, kv_store_id};
 use crate::{
-    DeviceIdentity, DeviceRegistry, ENVELOPE_VERSION, HttpPullSource, NodeClock, OpBody, OpId,
-    OpLog, OrderKey, ServeState, SignedOp, Store, learn_devices, register_peer, replay, router,
-    sync_once,
+    DeviceIdentity, DeviceRegistry, ENVELOPE_VERSION, HeadPublisher, HttpPullSource, NodeClock,
+    OpBody, OpId, OpLog, OrderKey, ServeState, SignedOp, Store, learn_devices, register_peer,
+    replay, router, sync_once,
 };
 
 /// One in-process node: identity, clock, shared log, store, a device registry it
@@ -23,6 +23,12 @@ pub struct MeshNode {
     pub store: Mutex<KvStore>,
     pub registry: Arc<Mutex<DeviceRegistry>>,
     pub base_url: String,
+    /// Push wake-up for this node's own `/watch`: `commit` publishes the new head
+    /// so peers parked on this node are woken the instant it appends, instead of
+    /// waiting out their fallback poll. Without this the harness serves an inert
+    /// `/watch` and the trickle bench silently degrades to fallback-interval
+    /// polling, hiding the whole point of push delivery.
+    head: HeadPublisher,
 }
 
 impl MeshNode {
@@ -45,11 +51,11 @@ impl MeshNode {
         reg.insert_key(*identity.verifying_key());
         let registry = Arc::new(Mutex::new(reg));
 
-        let app = router(ServeState::new(
-            identity.clone(),
-            log.clone(),
-            registry.clone(),
-        ));
+        let head = HeadPublisher::new(OrderKey::MIN);
+        let app = router(
+            ServeState::new(identity.clone(), log.clone(), registry.clone())
+                .with_watch(head.watch()),
+        );
         let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
         let bound = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -63,6 +69,7 @@ impl MeshNode {
             store,
             registry,
             base_url: format!("http://{bound}"),
+            head,
         }
     }
 
@@ -78,13 +85,20 @@ impl MeshNode {
         };
         let signed = SignedOp::seal(body, &self.identity).unwrap();
         let id = signed.id;
-        {
+        let new_head = {
             let mut log = self.log.lock().unwrap();
             log.append(signed);
+            log.head()
+        };
+        {
+            let log = self.log.lock().unwrap();
+            let mut store = self.store.lock().unwrap();
+            replay(&log, &mut *store).unwrap();
         }
-        let log = self.log.lock().unwrap();
-        let mut store = self.store.lock().unwrap();
-        replay(&log, &mut *store).unwrap();
+        // Wake any peer parked on this node's `/watch` now that the head moved.
+        if let Some(head) = new_head {
+            self.head.publish(head);
+        }
         id
     }
 

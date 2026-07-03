@@ -47,7 +47,9 @@ enum Command {
         /// Peer base URL to pull from (repeatable), e.g. http://127.0.0.1:51713.
         #[arg(long = "peer")]
         peers: Vec<String>,
-        /// Seconds between pull rounds.
+        /// Fallback poll interval, in seconds. The loop now blocks on peers'
+        /// `/watch` (push) and only sleeps this long — jittered — when no peer
+        /// offers push (pre-push/404) or a watch errors.
         #[arg(long, default_value_t = 2)]
         pull_interval: u64,
     },
@@ -221,18 +223,83 @@ fn hex(bytes: &[u8]) -> String {
 
 #[cfg(feature = "pull-http")]
 mod serve {
+    use std::future::Future;
     use std::net::SocketAddr;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
-    use std::time::Duration;
+    use std::task::Poll;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use proxy_node_server::{
-        DeviceIdentity, DeviceRegistry, HttpPullSource, KvStore, NodeClock, OpLog, OplogWriter,
-        ServeState, learn_devices, load_cursor, load_peer_keys, register_peer, replay,
+        DeviceId, DeviceIdentity, DeviceRegistry, HeadPublisher, HttpPullSource, KvStore,
+        NodeClock, OpLog, OplogWriter, OrderKey, ServeState, TransportError, WATCH_DEFAULT_WAIT,
+        WATCH_EMPTY_BACKOFF, learn_devices, load_cursor, load_peer_keys, register_peer, replay,
         replay_oplog_file, router, save_cursor, save_peer_keys, sync_once,
     };
 
     use super::{KEY_FILE, OPLOG_FILE, read_scalar};
+
+    /// How long a peer stays poll-only after its `/watch` errors before the loop
+    /// re-probes it for push support. Bounds the cost of a permanently pre-push
+    /// peer (one 404 every re-probe window, not every loop) while still letting a
+    /// peer that gains `/watch` — e.g. an upgraded restart — rejoin push delivery.
+    const WATCH_REPROBE_INTERVAL: Duration = Duration::from_secs(300);
+
+    /// One resolved peer to pull from: its client, device id, resume cursor, and
+    /// per-link watch capability. `poll_only_until` is `None` while the peer is
+    /// treated as push-capable (included in the `/watch` race); `Some(deadline)`
+    /// after its `/watch` errored, so it is pulled on the fallback interval until
+    /// `deadline`, when it is re-probed. Per-link so one pre-push peer's 404 can
+    /// never force the interval sleep onto push-capable peers.
+    struct Link {
+        source: HttpPullSource,
+        peer_id: DeviceId,
+        cursor: OrderKey,
+        poll_only_until: Option<Instant>,
+    }
+
+    /// Race the `/watch` of the currently push-capable links (indices into
+    /// `links`), resolving as soon as the first responds — a head change (new ops
+    /// to pull), a clean hold-window close, or an error (e.g. 404 on a pre-push
+    /// peer). Returns `(link index, result)` so the caller can mark exactly the
+    /// peer that answered. `capable` must be non-empty; each `watch_head` future
+    /// carries its own bounded timeout, so one always resolves. Dependency-free
+    /// `select_all`.
+    async fn wait_for_any_watch(
+        links: &[Link],
+        capable: &[usize],
+        wait: Duration,
+    ) -> (usize, Result<OrderKey, TransportError>) {
+        let mut futures: Vec<_> = capable
+            .iter()
+            .map(|&i| {
+                (
+                    i,
+                    Box::pin(links[i].source.watch_head(links[i].cursor, wait)),
+                )
+            })
+            .collect();
+        std::future::poll_fn(|cx| {
+            for (i, future) in futures.iter_mut() {
+                if let Poll::Ready(result) = future.as_mut().poll(cx) {
+                    return Poll::Ready((*i, result));
+                }
+            }
+            Poll::Pending
+        })
+        .await
+    }
+
+    /// Reconnect jitter in `0.5..1.5 × base`, so N daemons that all lost a
+    /// restarting peer do not re-probe it in lockstep. Uses wall-clock nanos as
+    /// cheap entropy — no rng dependency for a coarse spread.
+    fn jitter(base: Duration) -> Duration {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        base.mul_f64(0.5 + f64::from(nanos) / f64::from(u32::MAX))
+    }
 
     pub fn run(
         data_dir: PathBuf,
@@ -286,11 +353,20 @@ mod serve {
         let writer =
             Mutex::new(OplogWriter::open(&oplog_path).map_err(|e| format!("open oplog: {e}"))?);
 
-        let app = router(ServeState::new(
-            identity.clone(),
-            log.clone(),
-            registry.clone(),
-        ));
+        // Push publisher for this node's own `/watch`: peers watching us are woken
+        // the instant we append (relay) an op, instead of polling. Seeded with the
+        // post-replay head; correctness always reads the authoritative log head.
+        let head_pub = HeadPublisher::new(
+            log.lock()
+                .expect("oplog mutex poisoned")
+                .head()
+                .unwrap_or(OrderKey::MIN),
+        );
+
+        let app = router(
+            ServeState::new(identity.clone(), log.clone(), registry.clone())
+                .with_watch(head_pub.watch()),
+        );
         let listener = tokio::net::TcpListener::bind(listen)
             .await
             .map_err(|e| format!("bind {listen}: {e}"))?;
@@ -301,7 +377,7 @@ mod serve {
             }
         });
 
-        let mut targets = Vec::new();
+        let mut links: Vec<Link> = Vec::new();
         let mut learned_keys = false;
         for base in peers {
             let source = HttpPullSource::new(&base);
@@ -351,7 +427,12 @@ mod serve {
                     }
                     let cursor = load_cursor(&data_dir, &peer_id);
                     println!("peer {peer_id} at {base}");
-                    targets.push((source, peer_id, cursor));
+                    links.push(Link {
+                        source,
+                        peer_id,
+                        cursor,
+                        poll_only_until: None,
+                    });
                 }
                 Err(e) => eprintln!("register peer {base}: {e}"),
             }
@@ -376,36 +457,118 @@ mod serve {
             }
         }
 
+        // `--pull-interval` is now the *fallback*/jitter cadence, applied
+        // per-link: push-capable peers park on `/watch`, while peers whose watch
+        // 404'd (pre-push) are polled on this interval until their re-probe window
+        // elapses. One old peer's instant 404 no longer forces the interval sleep
+        // onto push-capable peers — the watch race includes capable peers only.
         let interval = Duration::from_secs(pull_interval);
         loop {
-            for (source, peer_id, cursor) in &mut targets {
-                let before = *cursor;
-                let result = sync_once(
-                    source,
-                    &registry,
-                    &clock,
-                    &log,
-                    &store,
-                    cursor,
-                    Some(&writer),
-                )
-                .await;
-                // The cursor only ever advances over ops the op-log has already
-                // fsynced, so persisting it is safe whether the batch fully
-                // completed or aborted partway on a bad op — it never points
-                // past durable ops.
-                if *cursor != before {
-                    if let Err(e) = save_cursor(&data_dir, peer_id, *cursor) {
-                        eprintln!("save cursor {peer_id}: {e}");
+            // 1. Drain every peer to exhaustion, so a short-limit page never waits
+            //    on the watch/timer — pagination spins pages with no sleep. Both
+            //    push-capable and poll-only peers are pulled here each round.
+            for link in &mut links {
+                loop {
+                    let before = link.cursor;
+                    let result = sync_once(
+                        &link.source,
+                        &registry,
+                        &clock,
+                        &log,
+                        &store,
+                        &mut link.cursor,
+                        Some(&writer),
+                    )
+                    .await;
+                    // The cursor only ever advances over ops the op-log has already
+                    // fsynced, so persisting it is safe whether the batch fully
+                    // completed or aborted partway on a bad op — it never points
+                    // past durable ops.
+                    if link.cursor != before {
+                        if let Err(e) = save_cursor(&data_dir, &link.peer_id, link.cursor) {
+                            eprintln!("save cursor {}: {e}", link.peer_id);
+                        }
+                    }
+                    let applied = match &result {
+                        Ok(n) if *n > 0 => {
+                            println!("pulled {n} op(s) from {}", link.peer_id);
+                            // We relayed ops; wake anyone watching this node.
+                            if let Some(h) = log.lock().expect("oplog mutex poisoned").head() {
+                                head_pub.publish(h);
+                            }
+                            *n
+                        }
+                        Ok(_) => 0,
+                        Err(e) => {
+                            eprintln!("pull {}: {e}", link.peer_id);
+                            0
+                        }
+                    };
+                    // Stop draining once a round applies nothing new or aborts.
+                    if applied == 0 || link.cursor == before {
+                        break;
                     }
                 }
-                match result {
-                    Ok(n) if n > 0 => println!("pulled {n} op(s) from {peer_id}"),
-                    Ok(_) => {}
-                    Err(e) => eprintln!("pull {peer_id}: {e}"),
+            }
+
+            // 2. Re-probe: a poll-only peer whose backoff elapsed rejoins the
+            //    watch race, so an upgraded/restarted peer regains push delivery.
+            let now = Instant::now();
+            for link in &mut links {
+                if link.poll_only_until.is_some_and(|deadline| now >= deadline) {
+                    link.poll_only_until = None;
                 }
             }
-            tokio::time::sleep(interval).await;
+
+            // 3. Wait for the next pull trigger, per-link:
+            //    - push-capable peers: block on their `/watch` race;
+            //    - poll-only peers: bounded by the jittered fallback interval so
+            //      they are pulled on their own cadence, never gated on a capable
+            //      peer's watch;
+            //    - no capable peers (all pre-push, or no peers): pure interval poll.
+            let capable: Vec<usize> = links
+                .iter()
+                .enumerate()
+                .filter(|(_, link)| link.poll_only_until.is_none())
+                .map(|(i, _)| i)
+                .collect();
+            let any_poll_only = links.iter().any(|link| link.poll_only_until.is_some());
+
+            if capable.is_empty() {
+                tokio::time::sleep(jitter(interval)).await;
+                continue;
+            }
+
+            // A watch that errors marks *only that peer* poll-only (with a
+            // re-probe deadline); it never sleeps the interval on behalf of the
+            // capable peers, and never short-circuits their wait.
+            let outcome = if any_poll_only {
+                tokio::select! {
+                    resolved = wait_for_any_watch(&links, &capable, WATCH_DEFAULT_WAIT) => Some(resolved),
+                    _ = tokio::time::sleep(jitter(interval)) => None,
+                }
+            } else {
+                Some(wait_for_any_watch(&links, &capable, WATCH_DEFAULT_WAIT).await)
+            };
+            match outcome {
+                Some((idx, Err(e))) => {
+                    eprintln!(
+                        "watch {}: {e}; polling this peer until re-probe",
+                        links[idx].peer_id
+                    );
+                    links[idx].poll_only_until = Some(Instant::now() + WATCH_REPROBE_INTERVAL);
+                }
+                // A watch that returned Ok but no new head (a clean hold-window
+                // close, or an over-capacity server shedding the park and echoing
+                // the current head) would otherwise re-arm at once and, under
+                // saturation, spin a tight watch/empty-pull loop. Back off briefly
+                // before the next round. A real head move (head strictly past the
+                // link's cursor) skips the backoff so its ops are pulled at once.
+                Some((idx, Ok(head))) if head <= links[idx].cursor => {
+                    tokio::time::sleep(WATCH_EMPTY_BACKOFF).await;
+                }
+                _ => {}
+            }
         }
     }
 }
