@@ -30,16 +30,36 @@
 //! an empty log and never leaves the `MIN` head, so it is never declared
 //! settled). No assertions — the functional tests own pass/fail; this only
 //! records numbers, one JSON object per line, and exits 0.
+//!
+//! `--mode trickle` is the "Clash of Clans live sync" profile: instead of one
+//! bulk burst, each node commits one `KvOp::Put` every `--trickle-ms` for
+//! `--duration-secs`, and every op's value carries the commit wall-clock time
+//! (UNIX nanoseconds, big-endian, in its leading bytes, then padded to
+//! `--payload-bytes` to approximate a chat message). Any receiver computes the
+//! one-way propagation delay of an op as `arrival_wall - embedded_commit_wall`,
+//! needing no clock exchange beyond what the machines already run: tailnet Macs
+//! keep NTP, so ~ms skew is acceptable when the latencies themselves are in the
+//! hundreds of ms. That honesty caveat is echoed in the output metadata. The
+//! pull loop runs concurrently the whole time; its existing 150ms cadence is the
+//! effective client-side pull interval and is reported as such.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use proxy_node_server::harness::{MeshNode, rss_kib};
-use proxy_node_server::{HttpPullSource, KvOp, OrderKey, learn_devices, register_peer, sync_once};
+use proxy_node_server::{
+    DeviceId, HttpPullSource, KvOp, KvStore, OpId, OrderKey, Store, learn_devices, register_peer,
+    sync_once,
+};
+
+/// Leading bytes of every trickle op's value: the commit wall-clock time as
+/// UNIX nanoseconds, big-endian (`u128`). Everything after is zero padding up to
+/// `--payload-bytes`.
+const TS_BYTES: usize = 16;
 
 #[derive(Parser)]
 #[command(about = "One mesh-benchmark node: serve, peer, commit, converge.")]
@@ -66,6 +86,25 @@ struct Args {
     /// pulling from this node before it disappears.
     #[arg(long, default_value_t = 30)]
     linger_secs: u64,
+    /// `bulk` (one burst, then converge) or `trickle` (live per-op sync).
+    #[arg(long, value_enum, default_value = "bulk")]
+    mode: Mode,
+    /// Trickle mode: milliseconds between this node's commits.
+    #[arg(long, default_value_t = 500)]
+    trickle_ms: u64,
+    /// Trickle mode: how long this node keeps committing, in seconds.
+    #[arg(long, default_value_t = 60)]
+    duration_secs: u64,
+    /// Trickle mode: bytes per op value (>= 16; leading 16 hold the timestamp),
+    /// approximating a chat message rather than the 8-byte bulk counters.
+    #[arg(long, default_value_t = 512)]
+    payload_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum Mode {
+    Bulk,
+    Trickle,
 }
 
 /// One peer this node pulls from, plus the state needed to detect it settling.
@@ -119,7 +158,7 @@ async fn main() {
 
     // Startup: bind the server and start serving. Once `spawn_on` returns, the
     // identity exists and `/identity`, `/head`, `/ops`, `/devices` are live.
-    let node = MeshNode::spawn_on(args.listen).await;
+    let node = Arc::new(MeshNode::spawn_on(args.listen).await);
     let self_hex = node.identity.device_id().to_hex();
     let startup_ms = start.elapsed().as_secs_f64() * 1e3;
     println!(
@@ -161,6 +200,26 @@ async fn main() {
         "{{\"event\":\"peers_ready\",\"label\":\"{}\",\"peers_ready_ms\":{peers_ready_ms:.3}}}",
         args.label
     );
+
+    // Trickle mode owns its own commit/pull/summary flow; hand it the shared
+    // context and return before the bulk path below (left byte-for-byte intact).
+    if args.mode == Mode::Trickle {
+        run_trickle(
+            &node,
+            &mut peers,
+            &args,
+            settle,
+            &self_hex,
+            startup_ms,
+            peers_ready_ms,
+            &samples,
+            &stop,
+            sampler,
+        )
+        .await;
+        tokio::time::sleep(Duration::from_secs(args.linger_secs)).await;
+        return;
+    }
 
     // Commit this node's ops. Keys are namespaced by label so two nodes writing
     // "the same" index never collide in the shared store.
@@ -293,4 +352,218 @@ async fn main() {
     );
     // Keep serving so slower peers can drain this node before it disappears.
     tokio::time::sleep(Duration::from_secs(args.linger_secs)).await;
+}
+
+/// UNIX wall-clock time in nanoseconds — the reference both the committer (embed)
+/// and the receiver (arrival) read, so one-way delay needs no clock handshake.
+fn unix_nanos() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock before UNIX epoch")
+        .as_nanos()
+}
+
+/// Nearest-rank percentile over an already-sorted ascending slice. Empty → 0.
+fn percentile(sorted: &[f64], q: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    let idx = (((sorted.len() - 1) as f64) * q).round() as usize;
+    sorted[idx.min(sorted.len() - 1)]
+}
+
+/// Trickle mode: commit a timestamped op every `--trickle-ms` for
+/// `--duration-secs` while the pull loop runs concurrently, timing each remote
+/// op's propagation delay from its embedded commit time to local arrival.
+#[allow(clippy::too_many_arguments)]
+async fn run_trickle(
+    node: &Arc<MeshNode>,
+    peers: &mut [Peer],
+    args: &Args,
+    settle: Duration,
+    self_hex: &str,
+    startup_ms: f64,
+    peers_ready_ms: f64,
+    samples: &Arc<Mutex<Vec<(f64, f64)>>>,
+    stop: &Arc<AtomicBool>,
+    sampler: tokio::task::JoinHandle<()>,
+) {
+    let self_device: DeviceId = node.identity.device_id();
+    let trickle = Duration::from_millis(args.trickle_ms.max(1));
+    let payload_bytes = args.payload_bytes.max(TS_BYTES);
+    // Commit count is fixed from duration/interval, so every node running the
+    // same params sends the same number — the symmetric expectation "never
+    // received" is measured against.
+    let n_commits = ((args.duration_secs * 1000) / args.trickle_ms.max(1)).max(1) as usize;
+
+    // Committer task: one Put every `trickle`, value = commit wall time (UNIX
+    // nanos, big-endian) in the leading TS_BYTES, then zero padding.
+    let sent = Arc::new(AtomicUsize::new(0));
+    let commits_done = Arc::new(AtomicBool::new(false));
+    let committer = {
+        let node = node.clone();
+        let sent = sent.clone();
+        let commits_done = commits_done.clone();
+        let label = args.label.clone();
+        tokio::spawn(async move {
+            for i in 0..n_commits {
+                let mut value = vec![0u8; payload_bytes];
+                value[..TS_BYTES].copy_from_slice(&unix_nanos().to_be_bytes());
+                node.commit(&KvOp::Put {
+                    key: format!("{label}/t{i}"),
+                    value,
+                });
+                sent.fetch_add(1, Ordering::Relaxed);
+                tokio::time::sleep(trickle).await;
+            }
+            commits_done.store(true, Ordering::Relaxed);
+        })
+    };
+
+    println!(
+        "{{\"event\":\"trickle_start\",\"label\":\"{}\",\"n_commits\":{n_commits},\
+\"trickle_ms\":{},\"duration_secs\":{},\"payload_bytes\":{payload_bytes},\"pull_loop_ms\":150}}",
+        args.label, args.trickle_ms, args.duration_secs
+    );
+
+    let template = KvStore::new();
+    let mut seen: HashSet<OpId> = HashSet::new();
+    let mut last_len = 0usize;
+    let mut latencies: Vec<f64> = Vec::new();
+    let mut received: HashMap<String, usize> = HashMap::new();
+    let mut last_progress = Instant::now();
+    let mut drain_deadline: Option<Instant> = None;
+
+    loop {
+        for peer in peers.iter_mut() {
+            if let Err(e) = sync_once(
+                &peer.source,
+                &node.registry,
+                &node.clock,
+                &node.log,
+                &node.store,
+                &mut peer.cursor,
+                None,
+            )
+            .await
+            {
+                eprintln!("pull {}: {e}", peer.base);
+                let _ = learn_devices(&peer.source, &node.registry).await;
+            }
+            if let Ok(head) = peer.source.fetch_head().await {
+                peer.last_head = head;
+            }
+        }
+
+        // Pick up ops applied since the last pass. The log is append-only, so a
+        // length change is the cheap gate; on a change we diff against `seen`
+        // rather than `since(cursor)` because concurrent peers interleave by HLC
+        // and a remote op can land below the current head. `arrival_ns` is read
+        // once, right after the pull round, as the ops' local arrival time.
+        let arrival_ns = unix_nanos();
+        let mut batch: Vec<Vec<u8>> = Vec::new();
+        let mut authors: Vec<String> = Vec::new();
+        {
+            let log = node.log.lock().unwrap();
+            let len = log.len();
+            if len != last_len {
+                for op in log.iter() {
+                    if seen.insert(op.id) && op.body.device != self_device {
+                        authors.push(op.body.device.to_hex());
+                        batch.push(op.body.payload.clone());
+                    }
+                }
+                last_len = len;
+            }
+        }
+        for (payload, author) in batch.into_iter().zip(authors) {
+            if let Ok(KvOp::Put { value, .. }) = template.decode(&payload) {
+                if value.len() >= TS_BYTES {
+                    let mut ts = [0u8; TS_BYTES];
+                    ts.copy_from_slice(&value[..TS_BYTES]);
+                    let commit_ns = u128::from_be_bytes(ts);
+                    latencies.push(arrival_ns.saturating_sub(commit_ns) as f64 / 1e6);
+                }
+            }
+            *received.entry(author).or_default() += 1;
+        }
+
+        if last_progress.elapsed() >= Duration::from_secs(5) {
+            let mut sorted = latencies.clone();
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let recv_total: usize = received.values().sum();
+            println!(
+                "{{\"event\":\"progress\",\"label\":\"{}\",\"sent\":{},\"received\":{recv_total},\
+\"p50_ms\":{:.3},\"p95_ms\":{:.3}}}",
+                args.label,
+                sent.load(Ordering::Relaxed),
+                percentile(&sorted, 0.50),
+                percentile(&sorted, 0.95),
+            );
+            last_progress = Instant::now();
+        }
+
+        // After the last commit, drain the tail for 2*settle before summarizing.
+        if commits_done.load(Ordering::Relaxed) {
+            let deadline = *drain_deadline.get_or_insert_with(|| Instant::now() + 2 * settle);
+            if Instant::now() >= deadline {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+
+    let _ = committer.await;
+    let sent_total = sent.load(Ordering::Relaxed);
+
+    stop.store(true, Ordering::Relaxed);
+    let _ = sampler.await;
+
+    let mut sorted = latencies.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let p50 = percentile(&sorted, 0.50);
+    let p95 = percentile(&sorted, 0.95);
+    let p99 = percentile(&sorted, 0.99);
+    let max = sorted.last().copied().unwrap_or(0.0);
+
+    let received_total: usize = received.values().sum();
+    let never_total: usize = peers
+        .iter()
+        .map(|p| sent_total.saturating_sub(received.get(&p.device_hex).copied().unwrap_or(0)))
+        .sum();
+
+    let peers_json = peers
+        .iter()
+        .map(|p| {
+            let recv = received.get(&p.device_hex).copied().unwrap_or(0);
+            let never = sent_total.saturating_sub(recv);
+            let drained = p.cursor >= p.last_head;
+            format!(
+                "{{\"base\":\"{}\",\"device\":\"{}\",\"received\":{recv},\
+\"never_received\":{never},\"drained\":{drained}}}",
+                p.base, p.device_hex
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let rss_json = samples
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(t, mb)| format!("{{\"t_ms\":{t:.1},\"mb\":{mb:.2}}}"))
+        .collect::<Vec<_>>()
+        .join(",");
+
+    println!(
+        "{{\"event\":\"summary\",\"mode\":\"trickle\",\"label\":\"{}\",\"device\":\"{}\",\
+\"startup_ms\":{startup_ms:.3},\"peers_ready_ms\":{peers_ready_ms:.3},\
+\"trickle_ms\":{},\"duration_secs\":{},\"payload_bytes\":{payload_bytes},\"pull_loop_ms\":150,\
+\"sent\":{sent_total},\"received\":{received_total},\"never_received\":{never_total},\
+\"latency_p50_ms\":{p50:.3},\"latency_p95_ms\":{p95:.3},\"latency_p99_ms\":{p99:.3},\
+\"latency_max_ms\":{max:.3},\
+\"clock_note\":\"latency = arrival_wall - embedded_commit_wall (UNIX nanos); tailnet Macs run NTP, so ~ms skew is acceptable at ~hundreds-of-ms latencies\",\
+\"peers\":[{peers_json}],\"rss_mb\":[{rss_json}]}}",
+        args.label, self_hex, args.trickle_ms, args.duration_secs
+    );
 }
