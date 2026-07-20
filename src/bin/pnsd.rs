@@ -47,9 +47,11 @@ enum Command {
         /// Peer base URL to pull from (repeatable), e.g. http://127.0.0.1:51713.
         #[arg(long = "peer")]
         peers: Vec<String>,
-        /// Fallback poll interval, in seconds. The loop now blocks on peers'
-        /// `/watch` (push) and only sleeps this long — jittered — when no peer
-        /// offers push (pre-push/404) or a watch errors.
+        /// Use the legacy semantic-order v1 pull/watch protocol. This is never
+        /// selected automatically when relay v2 is unavailable.
+        #[arg(long)]
+        legacy_v1: bool,
+        /// Fallback poll interval, in seconds, used when a watch errors.
         #[arg(long, default_value_t = 2)]
         pull_interval: u64,
     },
@@ -93,8 +95,15 @@ fn main() -> ExitCode {
             data_dir,
             listen,
             peers,
+            legacy_v1,
             pull_interval,
-        }) => serve::run(resolve_data_dir(data_dir), listen, peers, pull_interval),
+        }) => serve::run(
+            resolve_data_dir(data_dir),
+            listen,
+            peers,
+            legacy_v1,
+            pull_interval,
+        ),
         None => {
             eprintln!("no command given; try `pnsd --help`");
             return ExitCode::FAILURE;
@@ -232,29 +241,30 @@ mod serve {
 
     use proxy_node_server::{
         DeviceId, DeviceIdentity, DeviceRegistry, HeadPublisher, HttpPullSource, KvStore,
-        NodeClock, OpLog, OplogWriter, OrderKey, ServeState, TransportError, WATCH_DEFAULT_WAIT,
-        WATCH_EMPTY_BACKOFF, learn_devices, load_cursor, load_peer_keys, register_peer, replay,
-        replay_oplog_file, router, save_cursor, save_peer_keys, sync_once,
+        NodeClock, OpLog, OplogWriter, OrderKey, RelayCursorV2, RelayPageV2, ServeState,
+        TransportError, WATCH_DEFAULT_WAIT, WATCH_EMPTY_BACKOFF, learn_attested_devices,
+        learn_devices, load_cursor, load_peer_keys, load_relay_caller_keys, load_relay_cursor,
+        register_peer_with_key, relay_router, replay, replay_oplog_file, router, save_cursor,
+        save_peer_keys, save_relay_caller_keys, save_relay_cursor, sync_once, sync_relay_once_v2,
     };
 
     use super::{KEY_FILE, OPLOG_FILE, read_scalar};
 
-    /// How long a peer stays poll-only after its `/watch` errors before the loop
-    /// re-probes it for push support. Bounds the cost of a permanently pre-push
-    /// peer (one 404 every re-probe window, not every loop) while still letting a
-    /// peer that gains `/watch` — e.g. an upgraded restart — rejoin push delivery.
+    /// How long a peer stays poll-only after its selected protocol's `/watch`
+    /// errors before the loop re-probes it. Relay-v2 errors never select v1.
     const WATCH_REPROBE_INTERVAL: Duration = Duration::from_secs(300);
 
     /// One resolved peer to pull from: its client, device id, resume cursor, and
     /// per-link watch capability. `poll_only_until` is `None` while the peer is
     /// treated as push-capable (included in the `/watch` race); `Some(deadline)`
-    /// after its `/watch` errored, so it is pulled on the fallback interval until
-    /// `deadline`, when it is re-probed. Per-link so one pre-push peer's 404 can
-    /// never force the interval sleep onto push-capable peers.
+    /// after its selected `/watch` errored, so it is pulled with the same protocol
+    /// on the fallback interval until `deadline`, when its watch is re-probed.
     struct Link {
         source: HttpPullSource,
         peer_id: DeviceId,
-        cursor: OrderKey,
+        peer_key: [u8; 33],
+        relay_cursor: RelayCursorV2,
+        legacy_cursor: OrderKey,
         poll_only_until: Option<Instant>,
     }
 
@@ -265,7 +275,7 @@ mod serve {
     /// peer that answered. `capable` must be non-empty; each `watch_head` future
     /// carries its own bounded timeout, so one always resolves. Dependency-free
     /// `select_all`.
-    async fn wait_for_any_watch(
+    async fn wait_for_any_legacy_watch(
         links: &[Link],
         capable: &[usize],
         wait: Duration,
@@ -275,7 +285,39 @@ mod serve {
             .map(|&i| {
                 (
                     i,
-                    Box::pin(links[i].source.watch_head(links[i].cursor, wait)),
+                    Box::pin(links[i].source.watch_head(links[i].legacy_cursor, wait)),
+                )
+            })
+            .collect();
+        std::future::poll_fn(|cx| {
+            for (i, future) in futures.iter_mut() {
+                if let Poll::Ready(result) = future.as_mut().poll(cx) {
+                    return Poll::Ready((*i, result));
+                }
+            }
+            Poll::Pending
+        })
+        .await
+    }
+
+    async fn wait_for_any_relay_watch(
+        identity: &DeviceIdentity,
+        links: &[Link],
+        capable: &[usize],
+        wait: Duration,
+    ) -> (usize, Result<RelayPageV2, TransportError>) {
+        let mut futures: Vec<_> = capable
+            .iter()
+            .map(|&i| {
+                (
+                    i,
+                    Box::pin(links[i].source.watch_relay_head_v2(
+                        identity,
+                        links[i].peer_id,
+                        &links[i].peer_key,
+                        links[i].relay_cursor,
+                        wait,
+                    )),
                 )
             })
             .collect();
@@ -305,16 +347,18 @@ mod serve {
         data_dir: PathBuf,
         listen: SocketAddr,
         peers: Vec<String>,
+        legacy_v1: bool,
         pull_interval: u64,
     ) -> Result<(), String> {
         let rt = tokio::runtime::Runtime::new().map_err(|e| format!("tokio runtime: {e}"))?;
-        rt.block_on(serve(data_dir, listen, peers, pull_interval))
+        rt.block_on(serve(data_dir, listen, peers, legacy_v1, pull_interval))
     }
 
     async fn serve(
         data_dir: PathBuf,
         listen: SocketAddr,
         peers: Vec<String>,
+        legacy_v1: bool,
         pull_interval: u64,
     ) -> Result<(), String> {
         let scalar = read_scalar(&data_dir.join(KEY_FILE))?;
@@ -335,6 +379,14 @@ mod serve {
         // Shared so the /devices route gossips these keys while the pull loop
         // both learns new ones and verifies pulled ops against them.
         let registry = Arc::new(Mutex::new(registry));
+
+        let mut relay_callers = DeviceRegistry::new();
+        relay_callers.insert_key(*identity.verifying_key());
+        let known_relay_callers = load_relay_caller_keys(&data_dir, &mut relay_callers);
+        if known_relay_callers > 0 {
+            println!("loaded {known_relay_callers} direct relay caller key(s)");
+        }
+        let relay_callers = Arc::new(Mutex::new(relay_callers));
 
         let oplog_path = data_dir.join(OPLOG_FILE);
         let log = Arc::new(Mutex::new(OpLog::new()));
@@ -363,10 +415,14 @@ mod serve {
                 .unwrap_or(OrderKey::MIN),
         );
 
-        let app = router(
-            ServeState::new(identity.clone(), log.clone(), registry.clone())
-                .with_watch(head_pub.watch()),
-        );
+        let state = ServeState::new(identity.clone(), log.clone(), registry.clone())
+            .with_relay_callers(relay_callers.clone())
+            .with_watch(head_pub.watch());
+        let app = if legacy_v1 {
+            router(state)
+        } else {
+            relay_router(state)
+        };
         let listener = tokio::net::TcpListener::bind(listen)
             .await
             .map_err(|e| format!("bind {listen}: {e}"))?;
@@ -381,8 +437,8 @@ mod serve {
         let mut learned_keys = false;
         for base in peers {
             let source = HttpPullSource::new(&base);
-            match register_peer(&source, &registry).await {
-                Ok((peer_id, newly_added)) => {
+            match register_peer_with_key(&source, &registry).await {
+                Ok((peer_id, peer_key, newly_added)) => {
                     // A NEWLY learned key that fails to persist must not
                     // verify ops at all — not for this peer's target, and not
                     // transitively via other peers' logs — or a cursor could
@@ -402,11 +458,39 @@ mod serve {
                         }
                         learned_keys = true;
                     }
+                    let newly_added_relay_caller = {
+                        let mut callers = relay_callers.lock().expect("relay callers poisoned");
+                        let newly_added = !callers.contains(&peer_id);
+                        callers
+                            .insert_sec1(&peer_key)
+                            .map_err(|e| format!("register relay caller {peer_id}: {e}"))?;
+                        newly_added
+                    };
+                    if newly_added_relay_caller {
+                        if let Err(e) = save_relay_caller_keys(
+                            &data_dir,
+                            &relay_callers.lock().expect("relay callers poisoned"),
+                        ) {
+                            relay_callers
+                                .lock()
+                                .expect("relay callers poisoned")
+                                .remove(&peer_id);
+                            eprintln!(
+                                "persist direct relay caller: {e}; skipping peer {base} this run"
+                            );
+                            continue;
+                        }
+                    }
                     // Gossip: adopt every device this peer vouches for so ops it
                     // relays from third parties verify. Same durability rule —
                     // persist before pulling, roll back exactly what we added on
                     // a failed save so no un-persisted key ever verifies an op.
-                    match learn_devices(&source, &registry).await {
+                    let learned = if legacy_v1 {
+                        learn_devices(&source, &registry).await
+                    } else {
+                        learn_attested_devices(&source, peer_id, &peer_key, &registry).await
+                    };
+                    match learned {
                         Ok(added) if !added.is_empty() => {
                             if let Err(e) = save_peer_keys(
                                 &data_dir,
@@ -425,12 +509,16 @@ mod serve {
                         Ok(_) => {}
                         Err(e) => eprintln!("learn devices {base}: {e}"),
                     }
-                    let cursor = load_cursor(&data_dir, &peer_id);
-                    println!("peer {peer_id} at {base}");
+                    let relay_cursor = load_relay_cursor(&data_dir, &peer_id);
+                    let legacy_cursor = load_cursor(&data_dir, &peer_id);
+                    let protocol = if legacy_v1 { "legacy v1" } else { "relay v2" };
+                    println!("peer {peer_id} at {base} ({protocol})");
                     links.push(Link {
                         source,
                         peer_id,
-                        cursor,
+                        peer_key,
+                        relay_cursor,
+                        legacy_cursor,
                         poll_only_until: None,
                     });
                 }
@@ -454,14 +542,15 @@ mod serve {
                 println!("recovered {recovered} op(s) for newly known peers");
                 let mut store = store.lock().expect("store mutex poisoned");
                 replay(&log, &mut *store).map_err(|e| format!("replay store: {e}"))?;
+                if let Some(head) = log.head() {
+                    head_pub.publish(head);
+                }
             }
         }
 
-        // `--pull-interval` is now the *fallback*/jitter cadence, applied
-        // per-link: push-capable peers park on `/watch`, while peers whose watch
-        // 404'd (pre-push) are polled on this interval until their re-probe window
-        // elapses. One old peer's instant 404 no longer forces the interval sleep
-        // onto push-capable peers — the watch race includes capable peers only.
+        // `--pull-interval` is the per-link fallback/jitter cadence. A relay-v2
+        // watch failure switches only that link to relay-v2 polling; it never
+        // selects the legacy protocol.
         let interval = Duration::from_secs(pull_interval);
         loop {
             // 1. Drain every peer to exhaustion, so a short-limit page never waits
@@ -469,44 +558,90 @@ mod serve {
             //    push-capable and poll-only peers are pulled here each round.
             for link in &mut links {
                 loop {
-                    let before = link.cursor;
-                    let result = sync_once(
-                        &link.source,
-                        &registry,
-                        &clock,
-                        &log,
-                        &store,
-                        &mut link.cursor,
-                        Some(&writer),
-                    )
-                    .await;
-                    // The cursor only ever advances over ops the op-log has already
-                    // fsynced, so persisting it is safe whether the batch fully
-                    // completed or aborted partway on a bad op — it never points
-                    // past durable ops.
-                    if link.cursor != before {
-                        if let Err(e) = save_cursor(&data_dir, &link.peer_id, link.cursor) {
-                            eprintln!("save cursor {}: {e}", link.peer_id);
-                        }
-                    }
-                    let applied = match &result {
-                        Ok(n) if *n > 0 => {
-                            println!("pulled {n} op(s) from {}", link.peer_id);
-                            // We relayed ops; wake anyone watching this node.
-                            if let Some(h) = log.lock().expect("oplog mutex poisoned").head() {
-                                head_pub.publish(h);
+                    if legacy_v1 {
+                        let before = link.legacy_cursor;
+                        let result = sync_once(
+                            &link.source,
+                            &registry,
+                            &clock,
+                            &log,
+                            &store,
+                            &mut link.legacy_cursor,
+                            Some(&writer),
+                        )
+                        .await;
+                        if link.legacy_cursor != before {
+                            if let Err(e) =
+                                save_cursor(&data_dir, &link.peer_id, link.legacy_cursor)
+                            {
+                                eprintln!("save cursor {}: {e}", link.peer_id);
                             }
-                            *n
                         }
-                        Ok(_) => 0,
-                        Err(e) => {
-                            eprintln!("pull {}: {e}", link.peer_id);
-                            0
+                        let applied = match &result {
+                            Ok(n) if *n > 0 => {
+                                println!("pulled {n} op(s) from {}", link.peer_id);
+                                if let Some(head) = log.lock().expect("oplog mutex poisoned").head()
+                                {
+                                    head_pub.publish(head);
+                                }
+                                *n
+                            }
+                            Ok(_) => 0,
+                            Err(e) => {
+                                eprintln!("pull {}: {e}", link.peer_id);
+                                0
+                            }
+                        };
+                        if applied == 0 || link.legacy_cursor == before {
+                            break;
                         }
-                    };
-                    // Stop draining once a round applies nothing new or aborts.
-                    if applied == 0 || link.cursor == before {
-                        break;
+                    } else {
+                        let before = link.relay_cursor;
+                        let result = sync_relay_once_v2(
+                            &link.source,
+                            &identity,
+                            link.peer_id,
+                            &link.peer_key,
+                            &registry,
+                            &clock,
+                            &log,
+                            &store,
+                            &mut link.relay_cursor,
+                            Some(&writer),
+                        )
+                        .await;
+                        if link.relay_cursor != before {
+                            if let Err(e) =
+                                save_relay_cursor(&data_dir, &link.peer_id, link.relay_cursor)
+                            {
+                                eprintln!("save relay cursor {}: {e}", link.peer_id);
+                            }
+                        }
+                        let keep_draining = match &result {
+                            Ok(outcome) => {
+                                if outcome.received > 0 {
+                                    println!(
+                                        "pulled {} relay op(s) from {}",
+                                        outcome.received, link.peer_id
+                                    );
+                                }
+                                if outcome.appended > 0 {
+                                    if let Some(head) =
+                                        log.lock().expect("oplog mutex poisoned").head()
+                                    {
+                                        head_pub.publish(head);
+                                    }
+                                }
+                                outcome.received > 0 || outcome.reset
+                            }
+                            Err(e) => {
+                                eprintln!("relay pull {}: {e}", link.peer_id);
+                                false
+                            }
+                        };
+                        if !keep_draining || link.relay_cursor == before {
+                            break;
+                        }
                     }
                 }
             }
@@ -525,7 +660,7 @@ mod serve {
             //    - poll-only peers: bounded by the jittered fallback interval so
             //      they are pulled on their own cadence, never gated on a capable
             //      peer's watch;
-            //    - no capable peers (all pre-push, or no peers): pure interval poll.
+            //    - no capable peers (or no peers): pure interval poll.
             let capable: Vec<usize> = links
                 .iter()
                 .enumerate()
@@ -542,32 +677,55 @@ mod serve {
             // A watch that errors marks *only that peer* poll-only (with a
             // re-probe deadline); it never sleeps the interval on behalf of the
             // capable peers, and never short-circuits their wait.
-            let outcome = if any_poll_only {
-                tokio::select! {
-                    resolved = wait_for_any_watch(&links, &capable, WATCH_DEFAULT_WAIT) => Some(resolved),
-                    _ = tokio::time::sleep(jitter(interval)) => None,
+            if legacy_v1 {
+                let outcome = if any_poll_only {
+                    tokio::select! {
+                        resolved = wait_for_any_legacy_watch(&links, &capable, WATCH_DEFAULT_WAIT) => Some(resolved),
+                        _ = tokio::time::sleep(jitter(interval)) => None,
+                    }
+                } else {
+                    Some(wait_for_any_legacy_watch(&links, &capable, WATCH_DEFAULT_WAIT).await)
+                };
+                match outcome {
+                    Some((idx, Err(e))) => {
+                        eprintln!(
+                            "watch {}: {e}; polling this peer until re-probe",
+                            links[idx].peer_id
+                        );
+                        links[idx].poll_only_until = Some(Instant::now() + WATCH_REPROBE_INTERVAL);
+                    }
+                    Some((idx, Ok(head))) if head <= links[idx].legacy_cursor => {
+                        tokio::time::sleep(WATCH_EMPTY_BACKOFF).await;
+                    }
+                    _ => {}
                 }
             } else {
-                Some(wait_for_any_watch(&links, &capable, WATCH_DEFAULT_WAIT).await)
-            };
-            match outcome {
-                Some((idx, Err(e))) => {
-                    eprintln!(
-                        "watch {}: {e}; polling this peer until re-probe",
-                        links[idx].peer_id
-                    );
-                    links[idx].poll_only_until = Some(Instant::now() + WATCH_REPROBE_INTERVAL);
+                let outcome = if any_poll_only {
+                    tokio::select! {
+                        resolved = wait_for_any_relay_watch(&identity, &links, &capable, WATCH_DEFAULT_WAIT) => Some(resolved),
+                        _ = tokio::time::sleep(jitter(interval)) => None,
+                    }
+                } else {
+                    Some(
+                        wait_for_any_relay_watch(&identity, &links, &capable, WATCH_DEFAULT_WAIT)
+                            .await,
+                    )
+                };
+                match outcome {
+                    Some((idx, Err(e))) => {
+                        eprintln!(
+                            "relay watch {}: {e}; polling relay v2 until re-probe",
+                            links[idx].peer_id
+                        );
+                        links[idx].poll_only_until = Some(Instant::now() + WATCH_REPROBE_INTERVAL);
+                    }
+                    Some((idx, Ok(page)))
+                        if !page.reset && page.head <= links[idx].relay_cursor.after =>
+                    {
+                        tokio::time::sleep(WATCH_EMPTY_BACKOFF).await;
+                    }
+                    _ => {}
                 }
-                // A watch that returned Ok but no new head (a clean hold-window
-                // close, or an over-capacity server shedding the park and echoing
-                // the current head) would otherwise re-arm at once and, under
-                // saturation, spin a tight watch/empty-pull loop. Back off briefly
-                // before the next round. A real head move (head strictly past the
-                // link's cursor) skips the backoff so its ops are pulled at once.
-                Some((idx, Ok(head))) if head <= links[idx].cursor => {
-                    tokio::time::sleep(WATCH_EMPTY_BACKOFF).await;
-                }
-                _ => {}
             }
         }
     }

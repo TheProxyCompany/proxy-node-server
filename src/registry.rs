@@ -79,11 +79,38 @@ impl DeviceRegistry {
 pub trait DeviceBook: Clone + Send + Sync + 'static {
     /// Every trusted device as `(device_id, compressed SEC1 key)`.
     fn known_devices(&self) -> Vec<(DeviceId, [u8; 33])>;
+
+    /// Fallible form used by the HTTP serving path. Existing in-memory books
+    /// keep the infallible behavior; storage-backed implementations should
+    /// override this so a read failure cannot be misrepresented as an empty,
+    /// successfully-attested device set.
+    fn try_known_devices(&self) -> Result<Vec<(DeviceId, [u8; 33])>, String> {
+        Ok(self.known_devices())
+    }
+
+    /// Resolve one requester's verifying key for mutually authenticated relay
+    /// v2 requests. Storage-backed books may override this with an indexed
+    /// lookup; the default preserves compatibility while retaining fallible
+    /// read semantics.
+    fn try_key_for_device(&self, id: &DeviceId) -> Result<Option<[u8; 33]>, String> {
+        Ok(self
+            .try_known_devices()?
+            .into_iter()
+            .find_map(|(known, key)| (known == *id).then_some(key)))
+    }
 }
 
 impl DeviceBook for Arc<Mutex<DeviceRegistry>> {
     fn known_devices(&self) -> Vec<(DeviceId, [u8; 33])> {
         self.lock().expect("registry mutex poisoned").entries()
+    }
+
+    fn try_key_for_device(&self, id: &DeviceId) -> Result<Option<[u8; 33]>, String> {
+        Ok(self
+            .lock()
+            .expect("registry mutex poisoned")
+            .key_for(id)
+            .map(crate::identity::sec1_compressed))
     }
 }
 

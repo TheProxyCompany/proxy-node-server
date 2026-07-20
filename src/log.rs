@@ -6,17 +6,61 @@ use std::collections::{BTreeMap, HashSet};
 use std::ops::Bound;
 use std::sync::{Arc, Mutex};
 
+use rand_core::{OsRng, RngCore};
+
 use crate::error::ReplayError;
 use crate::op::{OpId, OrderKey, SignedOp};
 use crate::store::{OpContext, Store};
 
+/// Durable identity and bounds of one relay-local arrival stream. `epoch`
+/// changes whenever a stream cannot safely continue its prior sequence space;
+/// `floor` is the greatest sequence no longer available, and `head` is the
+/// greatest sequence assigned so far.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RelayStreamState {
+    pub epoch: [u8; 32],
+    pub head: u64,
+    pub floor: u64,
+}
+
+/// One signed operation at its relay-local insertion sequence.
+#[derive(Clone, Debug)]
+pub struct RelayLogEntry {
+    pub seq: u64,
+    pub op: SignedOp,
+}
+
+/// An atomic view of a relay stream and a bounded page from it.
+#[derive(Clone, Debug)]
+pub struct RelayLogPage {
+    pub state: RelayStreamState,
+    pub entries: Vec<RelayLogEntry>,
+}
+
 /// An append-only, totally-ordered set of signed ops, keyed by the full
 /// `(hlc, device, op_id)` order key so two distinct ops never overwrite each
 /// other.
-#[derive(Default)]
 pub struct OpLog {
     ops: BTreeMap<OrderKey, SignedOp>,
     ids: HashSet<OpId>,
+    relay_epoch: [u8; 32],
+    relay_order: Vec<OrderKey>,
+}
+
+impl Default for OpLog {
+    fn default() -> Self {
+        let mut relay_epoch = [0u8; 32];
+        OsRng.fill_bytes(&mut relay_epoch);
+        if relay_epoch == [0u8; 32] {
+            relay_epoch[0] = 1;
+        }
+        Self {
+            ops: BTreeMap::new(),
+            ids: HashSet::new(),
+            relay_epoch,
+            relay_order: Vec::new(),
+        }
+    }
 }
 
 impl OpLog {
@@ -31,7 +75,9 @@ impl OpLog {
         if !self.ids.insert(op.id) {
             return false;
         }
-        self.ops.insert(op.order_key(), op);
+        let order_key = op.order_key();
+        self.relay_order.push(order_key);
+        self.ops.insert(order_key, op);
         true
     }
 
@@ -67,6 +113,42 @@ impl OpLog {
 
     pub fn is_empty(&self) -> bool {
         self.ops.is_empty()
+    }
+
+    /// Current relay-local stream identity and insertion bounds.
+    pub fn relay_state(&self) -> RelayStreamState {
+        RelayStreamState {
+            epoch: self.relay_epoch,
+            head: self.relay_order.len() as u64,
+            floor: 0,
+        }
+    }
+
+    /// Operations strictly after `after`, ordered by first local insertion,
+    /// independent of their semantic [`OrderKey`].
+    pub fn relay_page(&self, after: u64, limit: usize) -> RelayLogPage {
+        let start = usize::try_from(after)
+            .unwrap_or(usize::MAX)
+            .min(self.relay_order.len());
+        let entries = self
+            .relay_order
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(limit)
+            .map(|(index, order_key)| RelayLogEntry {
+                seq: index as u64 + 1,
+                op: self
+                    .ops
+                    .get(order_key)
+                    .expect("relay order references an inserted op")
+                    .clone(),
+            })
+            .collect();
+        RelayLogPage {
+            state: self.relay_state(),
+            entries,
+        }
     }
 }
 
@@ -132,6 +214,19 @@ pub trait LogSource: Clone + Send + Sync + 'static {
     fn head(&self) -> Option<OrderKey>;
     /// Whether an op with this id is already present.
     fn contains(&self, id: &OpId) -> bool;
+
+    /// Relay-local stream state, when this source supports the v2 insertion-
+    /// ordered transport. The default keeps existing implementations and v1
+    /// routes working unchanged.
+    fn relay_state(&self) -> Result<Option<RelayStreamState>, String> {
+        Ok(None)
+    }
+
+    /// Atomic relay stream state plus operations strictly after `after`, capped
+    /// at `limit`. `Ok(None)` means the source supports only v1.
+    fn relay_page(&self, _after: u64, _limit: usize) -> Result<Option<RelayLogPage>, String> {
+        Ok(None)
+    }
 }
 
 impl LogSource for Arc<Mutex<OpLog>> {
@@ -150,6 +245,20 @@ impl LogSource for Arc<Mutex<OpLog>> {
 
     fn contains(&self, id: &OpId) -> bool {
         self.lock().expect("oplog mutex poisoned").contains(id)
+    }
+
+    fn relay_state(&self) -> Result<Option<RelayStreamState>, String> {
+        Ok(Some(
+            self.lock().expect("oplog mutex poisoned").relay_state(),
+        ))
+    }
+
+    fn relay_page(&self, after: u64, limit: usize) -> Result<Option<RelayLogPage>, String> {
+        Ok(Some(
+            self.lock()
+                .expect("oplog mutex poisoned")
+                .relay_page(after, limit),
+        ))
     }
 }
 
@@ -185,6 +294,15 @@ mod tests {
         assert_eq!(log.len(), 1);
     }
 
+    #[test]
+    fn relay_epoch_is_nonzero_and_changes_between_boots() {
+        let first = OpLog::new().relay_state().epoch;
+        let second = OpLog::new().relay_state().epoch;
+        assert_ne!(first, [0u8; 32]);
+        assert_ne!(second, [0u8; 32]);
+        assert_ne!(first, second);
+    }
+
     // Regression, finding 1: two distinct ops from one device at the same HLC
     // must both survive; keying by HLC+device alone silently dropped one.
     #[test]
@@ -214,6 +332,28 @@ mod tests {
 
         let order: Vec<Hlc> = log.iter().map(|o| o.body.hlc).collect();
         assert_eq!(order, vec![Hlc(10), Hlc(21), Hlc(25), Hlc(30)]);
+    }
+
+    #[test]
+    fn relay_sequence_delivers_a_late_lower_order_key() {
+        let id = DeviceIdentity::generate();
+        let mut log = OpLog::new();
+        let high = op_at(&id, 30);
+        let low = op_at(&id, 10);
+
+        assert!(log.append(high.clone()));
+        let first = log.relay_page(0, 10);
+        assert_eq!(first.entries.len(), 1);
+        assert_eq!(first.entries[0].seq, 1);
+        assert_eq!(first.entries[0].op.id, high.id);
+
+        assert!(log.append(low.clone()));
+        assert!(low.order_key() < high.order_key());
+        let late = log.relay_page(1, 10);
+        assert_eq!(late.state.head, 2);
+        assert_eq!(late.entries.len(), 1);
+        assert_eq!(late.entries[0].seq, 2);
+        assert_eq!(late.entries[0].op.id, low.id);
     }
 
     #[test]
