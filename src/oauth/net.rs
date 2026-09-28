@@ -203,8 +203,13 @@ where
     C: Consent + 'static,
 {
     let issuer = issuer_of(&headers);
+    let asked_at = issuer.clone();
     let at = now();
-    match blocking(server, move |server| server.authorize(request, at)).await {
+    match blocking(server, move |server| {
+        server.authorize(request, &asked_at, at)
+    })
+    .await
+    {
         Ok(Ok(Ok(ask))) => waiting_page(&issuer, &ask.client_name, &ask.id),
         Ok(Ok(Err(Refusal::Redirect(url)))) => Redirect::to(&url).into_response(),
         Ok(Ok(Err(Refusal::Page { status, message }))) => {
@@ -627,7 +632,12 @@ mod tests {
             url.starts_with("http://localhost:4242/callback?code="),
             "{url}"
         );
-        assert!(url.ends_with("&state=s1"), "{url}");
+        assert!(
+            url.contains(&format!(
+                "&state=s1&iss=https%3A%2F%2Fjckwind.proxy.ing&client_id={client_id}"
+            )),
+            "{url}"
+        );
         let code = url
             .split("code=")
             .nth(1)

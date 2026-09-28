@@ -10,8 +10,10 @@
 //!
 //! This is OAuth 2.1 as MCP clients speak it: the authorization code grant
 //! with PKCE (S256, required), dynamic client registration (RFC 7591), server
-//! metadata (RFC 8414), protected-resource metadata (RFC 9728) and revocation
-//! (RFC 7009). Clients are public — there is no client secret — because
+//! metadata (RFC 8414), protected-resource metadata (RFC 9728), revocation
+//! (RFC 7009), and the issuer named on every answer to an authorize
+//! (RFC 9207), so a client that was sent here by a deep link into Proxy
+//! learns which address let it in. Clients are public — there is no client secret — because
 //! holding the code verifier is the proof.
 //!
 //! Two seams are the node's to fill. A [`Store`] keeps clients, asks and
@@ -55,6 +57,10 @@ pub struct Ask {
     pub id: String,
     pub client_id: String,
     pub client_name: String,
+    /// The address that was asked, `https://<name>.proxy.ing`: named as
+    /// `iss` on the answer, with the client's id, so a client sent here by
+    /// Proxy itself learns where to redeem its code.
+    pub issuer: String,
     pub redirect_uri: String,
     pub scope: Option<String>,
     pub state: Option<String>,
@@ -482,11 +488,14 @@ impl<S: Store, C: Consent> Server<S, C> {
 
     /// RFC 6749 §4.1.1 with PKCE (RFC 7636, S256 only). A good request
     /// becomes an [`Ask`] the [`Consent`] puts in front of the person.
+    /// `issuer` is the address asked, which every answer names.
     pub fn authorize(
         &self,
         request: AuthorizeRequest,
+        issuer: &str,
         now: u64,
     ) -> Result<Result<Ask, Refusal>, OAuthError> {
+        let issuer = issuer.trim_end_matches('/');
         let page = |message: &str| {
             Ok(Err(Refusal::Page {
                 status: 400,
@@ -527,6 +536,7 @@ impl<S: Store, C: Consent> Server<S, C> {
                     ("error", error),
                     ("error_description", description),
                     ("state", request.state.as_deref().unwrap_or("")),
+                    ("iss", issuer),
                 ],
             ))))
         };
@@ -563,6 +573,7 @@ impl<S: Store, C: Consent> Server<S, C> {
             id: random_hex(16),
             client_id: client.id,
             client_name: client.name,
+            issuer: issuer.to_string(),
             redirect_uri: redirect_uri.to_string(),
             scope: request
                 .scope
@@ -608,6 +619,7 @@ impl<S: Store, C: Consent> Server<S, C> {
                     ("error", "access_denied"),
                     ("error_description", "The person did not let the client in."),
                     ("state", ask.state.as_deref().unwrap_or("")),
+                    ("iss", &ask.issuer),
                 ],
             ))),
             Answer::Approved => {
@@ -830,12 +842,17 @@ fn code_is_fresh(ask: &Ask, now: u64) -> bool {
         .is_some_and(|issued| now.saturating_sub(issued) <= CODE_TTL_SECS)
 }
 
+/// The answer to an ask that was let in: the code and the state, the issuer
+/// (RFC 9207), and the client's id, for a client that never saw the
+/// address before Proxy sent it back here.
 fn approved_redirect(ask: &Ask, code: &str) -> String {
     redirect_with(
         &ask.redirect_uri,
         &[
             ("code", code),
             ("state", ask.state.as_deref().unwrap_or("")),
+            ("iss", &ask.issuer),
+            ("client_id", &ask.client_id),
         ],
     )
 }
@@ -944,6 +961,8 @@ mod tests {
             .unwrap()
     }
 
+    const ISSUER: &str = "https://jckwind.proxy.ing";
+
     fn asked(server: &Server<MemoryStore, Always>, client: &Client) -> Ask {
         server
             .authorize(
@@ -956,6 +975,7 @@ mod tests {
                     code_challenge: Some(challenge_of(VERIFIER)),
                     code_challenge_method: Some("S256".to_string()),
                 },
+                ISSUER,
                 NOW,
             )
             .unwrap()
@@ -1077,6 +1097,7 @@ mod tests {
                     redirect_uri: Some("https://evil.example/".to_string()),
                     ..Default::default()
                 },
+                ISSUER,
                 NOW,
             )
             .unwrap()
@@ -1089,6 +1110,7 @@ mod tests {
                     redirect_uri: Some("https://evil.example/".to_string()),
                     ..Default::default()
                 },
+                ISSUER,
                 NOW,
             )
             .unwrap()
@@ -1109,6 +1131,7 @@ mod tests {
                     state: Some("s 1".to_string()),
                     ..Default::default()
                 },
+                ISSUER,
                 NOW,
             )
             .unwrap()
@@ -1120,7 +1143,10 @@ mod tests {
             url.starts_with("https://claude.ai/api/mcp/auth_callback?error=invalid_request&"),
             "{url}"
         );
-        assert!(url.ends_with("&state=s%201"), "{url}");
+        assert!(
+            url.contains("&state=s%201&iss=https%3A%2F%2Fjckwind.proxy.ing"),
+            "{url}"
+        );
         let plain = server
             .authorize(
                 AuthorizeRequest {
@@ -1131,6 +1157,7 @@ mod tests {
                     code_challenge_method: Some("plain".to_string()),
                     ..Default::default()
                 },
+                ISSUER,
                 NOW,
             )
             .unwrap()
@@ -1153,7 +1180,13 @@ mod tests {
             redirect.starts_with("https://claude.ai/api/mcp/auth_callback?code="),
             "{redirect}"
         );
-        assert!(redirect.ends_with("&state=xyz"), "{redirect}");
+        assert!(
+            redirect.contains(&format!(
+                "&state=xyz&iss=https%3A%2F%2Fjckwind.proxy.ing&client_id={}",
+                client.id
+            )),
+            "{redirect}"
+        );
         // The same code until it is redeemed.
         assert_eq!(
             server.progress(&ask.id, NOW + 6).unwrap(),
@@ -1252,7 +1285,10 @@ mod tests {
             panic!()
         };
         assert!(url.contains("error=access_denied"), "{url}");
-        assert!(url.ends_with("&state=xyz"), "{url}");
+        assert!(
+            url.contains("&state=xyz&iss=https%3A%2F%2Fjckwind.proxy.ing"),
+            "{url}"
+        );
     }
 
     #[test]
