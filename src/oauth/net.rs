@@ -145,10 +145,13 @@ fn failed(error: super::OAuthError) -> Response {
     )
 }
 
+/// Run a rule on the blocking pool: a store may be a database. The error is
+/// the answer to send when the pool itself failed, boxed so the Ok side
+/// stays small.
 async fn blocking<S, C, T>(
     server: Arc<Server<S, C>>,
     run: impl FnOnce(&Server<S, C>) -> T + Send + 'static,
-) -> Result<T, Response>
+) -> Result<T, Box<Response>>
 where
     S: Store + 'static,
     C: Consent + 'static,
@@ -157,10 +160,10 @@ where
     tokio::task::spawn_blocking(move || run(&server))
         .await
         .map_err(|error| {
-            json(
+            Box::new(json(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 &serde_json::json!({ "error": "server_error", "error_description": error.to_string() }),
-            )
+            ))
         })
 }
 
@@ -186,7 +189,7 @@ where
         Ok(Ok(Ok(client))) => json(StatusCode::CREATED, &Registered::from(client)),
         Ok(Ok(Err(refusal))) => json(StatusCode::BAD_REQUEST, &refusal),
         Ok(Err(error)) => failed(error),
-        Err(response) => response,
+        Err(response) => *response,
     }
 }
 
@@ -213,7 +216,7 @@ where
                 .into_response()
         }
         Ok(Err(error)) => failed(error),
-        Err(response) => response,
+        Err(response) => *response,
     }
 }
 
@@ -260,7 +263,7 @@ where
             },
         ),
         Ok(Err(error)) => failed(error),
-        Err(response) => response,
+        Err(response) => *response,
     }
 }
 
@@ -289,7 +292,7 @@ where
             &refusal,
         ),
         Ok(Err(error)) => failed(error),
-        Err(response) => response,
+        Err(response) => *response,
     }
 }
 
@@ -316,7 +319,7 @@ where
     match blocking(server, move |server| server.revoke(&token, at)).await {
         Ok(Ok(())) => cors(StatusCode::OK.into_response()),
         Ok(Err(error)) => failed(error),
-        Err(response) => response,
+        Err(response) => *response,
     }
 }
 
