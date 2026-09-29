@@ -115,13 +115,10 @@ pub enum OAuthError {
 }
 
 /// Where clients, asks and tokens are kept. `put_client` and `put_ask` are
-/// upserts by id. A token is different, because taking one back must be
-/// final: `put_token` inserts a token, or on an id it already holds records
-/// its revocation, and a `revoked_at` once set is never cleared by a later
-/// put. `last_used_at` moves only through `touch_token`, which writes that
-/// one column of a live token and nothing else, so a request admitted just
-/// before the person removed the connection cannot write the old row back
-/// and restore it.
+/// upserts by id. A token is written once, by `put_token`, and from then on
+/// changes only through `revoke_token` and `touch_token`, each of which
+/// writes one column, so a request admitted just before the person removed
+/// the connection cannot write the old row back and restore it.
 pub trait Store: Send + Sync {
     fn put_client(&self, client: &Client) -> Result<(), OAuthError>;
     fn client(&self, id: &str) -> Result<Option<Client>, OAuthError>;
@@ -136,13 +133,19 @@ pub trait Store: Send + Sync {
     /// write. `None` when no ask holds the code or it was already taken, so
     /// two redemptions in flight together get one token between them.
     fn redeem_code(&self, code: &str) -> Result<Option<Ask>, OAuthError>;
+    /// Insert a token. An id the store already holds is an error, never an
+    /// update.
     fn put_token(&self, token: &Token) -> Result<(), OAuthError>;
+    /// Take the token `id` back at `now`: `false` when there is no such
+    /// token. A token already taken back keeps its first `revoked_at`.
+    fn revoke_token(&self, id: &str, now: u64) -> Result<bool, OAuthError>;
     /// Record that the live token `id` was used at `used_at`. A token that
     /// is revoked, or that does not exist, is left exactly as it is.
     fn touch_token(&self, id: &str, used_at: u64) -> Result<(), OAuthError>;
     fn token(&self, id: &str) -> Result<Option<Token>, OAuthError>;
     fn token_by_hash(&self, hash: &str) -> Result<Option<Token>, OAuthError>;
-    fn tokens(&self) -> Result<Vec<Token>, OAuthError>;
+    /// The tokens still out, oldest first: what Proxy lists as connected.
+    fn live_tokens(&self) -> Result<Vec<Token>, OAuthError>;
 }
 
 /// How an ask reaches the person, and how their answer comes back. On a
@@ -222,17 +225,25 @@ impl Store for MemoryStore {
 
     fn put_token(&self, token: &Token) -> Result<(), OAuthError> {
         let mut tokens = self.tokens.lock().map_err(poisoned)?;
-        match tokens.get_mut(&token.id) {
-            Some(held) => {
-                if held.revoked_at.is_none() {
-                    held.revoked_at = token.revoked_at;
-                }
-            }
-            None => {
-                tokens.insert(token.id.clone(), token.clone());
-            }
+        if tokens.contains_key(&token.id) {
+            return Err(OAuthError::Store(format!(
+                "token {} is already held",
+                token.id
+            )));
         }
+        tokens.insert(token.id.clone(), token.clone());
         Ok(())
+    }
+
+    fn revoke_token(&self, id: &str, now: u64) -> Result<bool, OAuthError> {
+        let mut tokens = self.tokens.lock().map_err(poisoned)?;
+        let Some(held) = tokens.get_mut(id) else {
+            return Ok(false);
+        };
+        if held.revoked_at.is_none() {
+            held.revoked_at = Some(now);
+        }
+        Ok(true)
     }
 
     fn touch_token(&self, id: &str, used_at: u64) -> Result<(), OAuthError> {
@@ -258,12 +269,13 @@ impl Store for MemoryStore {
             .cloned())
     }
 
-    fn tokens(&self) -> Result<Vec<Token>, OAuthError> {
+    fn live_tokens(&self) -> Result<Vec<Token>, OAuthError> {
         let mut tokens: Vec<Token> = self
             .tokens
             .lock()
             .map_err(poisoned)?
             .values()
+            .filter(|token| token.is_live())
             .cloned()
             .collect();
         tokens.sort_by(|a, b| a.issued_at.cmp(&b.issued_at).then(a.id.cmp(&b.id)));
@@ -781,27 +793,7 @@ impl<S: Store, C: Consent> Server<S, C> {
     /// RFC 7009. A token nobody holds revokes to nothing, and that is fine.
     pub fn revoke(&self, bearer: &str, now: u64) -> Result<(), OAuthError> {
         if let Some(token) = self.store.token_by_hash(&hash_token(bearer.trim()))? {
-            self.revoke_token(token, now)?;
-        }
-        Ok(())
-    }
-
-    /// Take a token back from Proxy, by id. `false` when there is no such
-    /// token.
-    pub fn revoke_id(&self, id: &str, now: u64) -> Result<bool, OAuthError> {
-        match self.store.token(id)? {
-            Some(token) => {
-                self.revoke_token(token, now)?;
-                Ok(true)
-            }
-            None => Ok(false),
-        }
-    }
-
-    fn revoke_token(&self, mut token: Token, now: u64) -> Result<(), OAuthError> {
-        if token.revoked_at.is_none() {
-            token.revoked_at = Some(now);
-            self.store.put_token(&token)?;
+            self.store.revoke_token(&token.id, now)?;
         }
         Ok(())
     }
@@ -830,16 +822,6 @@ impl<S: Store, C: Consent> Server<S, C> {
             self.store.touch_token(&token.id, now)?;
         }
         Ok(Some(token))
-    }
-
-    /// The tokens still out: what Proxy lists as connected, newest last.
-    pub fn connections(&self) -> Result<Vec<Token>, OAuthError> {
-        Ok(self
-            .store
-            .tokens()?
-            .into_iter()
-            .filter(Token::is_live)
-            .collect())
     }
 }
 
@@ -1214,7 +1196,7 @@ mod tests {
             .unwrap();
         assert_eq!(token.client_name, "Claude");
         assert_eq!(token.last_used_at, Some(NOW + 20));
-        assert_eq!(server.connections().unwrap().len(), 1);
+        assert_eq!(server.store().live_tokens().unwrap().len(), 1);
     }
 
     /// The person lets the client in, and the code on the redirect.
@@ -1305,7 +1287,7 @@ mod tests {
                 .filter_map(|outcome| outcome.as_ref().err())
                 .all(|refusal| refusal.error == "invalid_grant")
         );
-        assert_eq!(server.store().tokens().unwrap().len(), 1);
+        assert_eq!(server.store().live_tokens().unwrap().len(), 1);
     }
 
     /// The waiting page and, on the deep-link path, the client both poll the
@@ -1394,22 +1376,28 @@ mod tests {
 
         server.revoke(&issued.access_token, NOW + 100).unwrap();
         assert_eq!(server.admit(&issued.access_token, NOW + 101).unwrap(), None);
-        assert!(server.connections().unwrap().is_empty());
+        assert!(server.store().live_tokens().unwrap().is_empty());
         assert_eq!(
             server.store().token(&token.id).unwrap().unwrap().revoked_at,
             Some(NOW + 100)
         );
         // Revoking what nobody holds is fine, and by id says whether there was one.
         server.revoke("nothing", NOW).unwrap();
-        assert!(!server.revoke_id("nothing", NOW).unwrap());
+        assert!(!server.store().revoke_token("nothing", NOW).unwrap());
+        // Taken back twice, the first time stands.
+        assert!(server.store().revoke_token(&token.id, NOW + 200).unwrap());
+        assert_eq!(
+            server.store().token(&token.id).unwrap().unwrap().revoked_at,
+            Some(NOW + 100)
+        );
         assert_eq!(server.admit("", NOW).unwrap(), None);
     }
 
     /// Alex's finding on root PR 45: a request admitted just before the
     /// person removed the connection used to write its whole token row back,
     /// `revoked_at` and all, and the connection came back. Now the in-flight
-    /// write touches only a live token's `last_used_at`, and a put can never
-    /// clear a revocation.
+    /// write touches only a live token's `last_used_at`, and a token is put
+    /// once: a second put of its id is refused.
     #[test]
     fn a_request_in_flight_across_a_revoke_cannot_restore_the_connection() {
         let server = server(Answer::Approved);
@@ -1433,10 +1421,10 @@ mod tests {
         server.store().touch_token(&in_flight.id, NOW + 11).unwrap();
         let mut stale = in_flight.clone();
         stale.last_used_at = Some(NOW + 11);
-        server.store().put_token(&stale).unwrap();
+        assert!(server.store().put_token(&stale).is_err());
 
         assert_eq!(server.admit(&issued.access_token, NOW + 12).unwrap(), None);
-        assert!(server.connections().unwrap().is_empty());
+        assert!(server.store().live_tokens().unwrap().is_empty());
         let held = server.store().token(&in_flight.id).unwrap().unwrap();
         assert_eq!(held.revoked_at, Some(NOW + 10));
         assert_eq!(held.last_used_at, None, "a revoked token is not touched");
