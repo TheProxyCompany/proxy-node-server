@@ -127,7 +127,15 @@ pub trait Store: Send + Sync {
     fn client(&self, id: &str) -> Result<Option<Client>, OAuthError>;
     fn put_ask(&self, ask: &Ask) -> Result<(), OAuthError>;
     fn ask(&self, id: &str) -> Result<Option<Ask>, OAuthError>;
-    fn ask_by_code(&self, code: &str) -> Result<Option<Ask>, OAuthError>;
+    /// Give the ask `id` this code, issued at `now`, unless it already has
+    /// one, and return the ask with the code it holds. One write, so two
+    /// polls that both see the person's yes send the browser to the same
+    /// code. `None` when there is no such ask.
+    fn mint_code(&self, id: &str, code: &str, now: u64) -> Result<Option<Ask>, OAuthError>;
+    /// Take the ask whose code this is, marking the code used in the same
+    /// write. `None` when no ask holds the code or it was already taken, so
+    /// two redemptions in flight together get one token between them.
+    fn redeem_code(&self, code: &str) -> Result<Option<Ask>, OAuthError>;
     fn put_token(&self, token: &Token) -> Result<(), OAuthError>;
     /// Record that the live token `id` was used at `used_at`. A token that
     /// is revoked, or that does not exist, is left exactly as it is.
@@ -188,14 +196,28 @@ impl Store for MemoryStore {
         Ok(self.asks.lock().map_err(poisoned)?.get(id).cloned())
     }
 
-    fn ask_by_code(&self, code: &str) -> Result<Option<Ask>, OAuthError> {
-        Ok(self
-            .asks
-            .lock()
-            .map_err(poisoned)?
-            .values()
-            .find(|ask| ask.code.as_deref() == Some(code))
-            .cloned())
+    fn mint_code(&self, id: &str, code: &str, now: u64) -> Result<Option<Ask>, OAuthError> {
+        let mut asks = self.asks.lock().map_err(poisoned)?;
+        let Some(ask) = asks.get_mut(id) else {
+            return Ok(None);
+        };
+        if ask.code.is_none() {
+            ask.code = Some(code.to_string());
+            ask.code_issued_at = Some(now);
+        }
+        Ok(Some(ask.clone()))
+    }
+
+    fn redeem_code(&self, code: &str) -> Result<Option<Ask>, OAuthError> {
+        let mut asks = self.asks.lock().map_err(poisoned)?;
+        let Some(ask) = asks
+            .values_mut()
+            .find(|ask| !ask.code_used && ask.code.as_deref() == Some(code))
+        else {
+            return Ok(None);
+        };
+        ask.code_used = true;
+        Ok(Some(ask.clone()))
     }
 
     fn put_token(&self, token: &Token) -> Result<(), OAuthError> {
@@ -624,10 +646,10 @@ impl<S: Store, C: Consent> Server<S, C> {
     }
 
     /// Where an ask stands. The first poll after the person lets the client
-    /// in mints the code; later polls return the same redirect until the code
-    /// is redeemed.
+    /// in mints the code; later polls, and one racing the first, return the
+    /// same redirect until the code is redeemed.
     pub fn progress(&self, ask_id: &str, now: u64) -> Result<Progress, OAuthError> {
-        let Some(mut ask) = self.store.ask(ask_id)? else {
+        let Some(ask) = self.store.ask(ask_id)? else {
             return Ok(Progress::Gone);
         };
         if ask.code_used {
@@ -655,11 +677,15 @@ impl<S: Store, C: Consent> Server<S, C> {
                 ],
             ))),
             Answer::Approved => {
-                let code = random_hex(24);
-                ask.code = Some(code.clone());
-                ask.code_issued_at = Some(now);
-                self.store.put_ask(&ask)?;
-                Ok(Progress::Redirect(approved_redirect(&ask, &code)))
+                let Some(ask) = self.store.mint_code(&ask.id, &random_hex(24), now)? else {
+                    return Ok(Progress::Gone);
+                };
+                Ok(match ask.code.as_deref() {
+                    Some(code) if code_is_fresh(&ask, now) => {
+                        Progress::Redirect(approved_redirect(&ask, code))
+                    }
+                    _ => Progress::Gone,
+                })
             }
         }
     }
@@ -667,6 +693,9 @@ impl<S: Store, C: Consent> Server<S, C> {
     /// RFC 6749 §4.1.3 with the PKCE check (RFC 7636 §4.6). A code is
     /// redeemed once, within [`CODE_TTL_SECS`], by the client that asked, at
     /// the redirect it asked with, with the verifier its challenge came from.
+    /// The first request to present a code takes it, in one write to the
+    /// store, so the second of two in flight together is refused, and a
+    /// request that fails a check has spent the code.
     pub fn token(
         &self,
         request: TokenRequest,
@@ -700,16 +729,16 @@ impl<S: Store, C: Consent> Server<S, C> {
                 "code_verifier is required.",
             )));
         };
-        let Some(mut ask) = self.store.ask_by_code(code)? else {
+        let Some(ask) = self.store.redeem_code(code)? else {
             return Ok(Err(TokenRefusal::new(
                 "invalid_grant",
-                "The code is not one this server issued.",
+                "The code is not one this server issued, or it was already redeemed.",
             )));
         };
-        if ask.code_used || !code_is_fresh(&ask, now) {
+        if !code_is_fresh(&ask, now) {
             return Ok(Err(TokenRefusal::new(
                 "invalid_grant",
-                "The code was already redeemed, or is older than ten minutes.",
+                "The code is older than ten minutes.",
             )));
         }
         if request.client_id.as_deref().map(str::trim) != Some(ask.client_id.as_str()) {
@@ -730,8 +759,6 @@ impl<S: Store, C: Consent> Server<S, C> {
                 "The code_verifier does not match the code_challenge.",
             )));
         }
-        ask.code_used = true;
-        self.store.put_ask(&ask)?;
         let secret = random_hex(32);
         let token = Token {
             id: random_hex(16),
@@ -1190,16 +1217,23 @@ mod tests {
         assert_eq!(server.connections().unwrap().len(), 1);
     }
 
+    /// The person lets the client in, and the code on the redirect.
+    fn let_in(server: &Server<MemoryStore, Always>, client: &Client) -> (Ask, String) {
+        let ask = asked(server, client);
+        let Progress::Redirect(redirect) = server.progress(&ask.id, NOW).unwrap() else {
+            panic!()
+        };
+        (ask, code_in(&redirect))
+    }
+
+    /// Each wrong request is made with its own code, because the first
+    /// request to present a code spends it.
     #[test]
     fn a_code_is_bound_to_the_verifier_the_client_and_the_redirect_and_ten_minutes() {
         let server = server(Answer::Approved);
         let client = registered(&server);
-        let ask = asked(&server, &client);
-        let Progress::Redirect(redirect) = server.progress(&ask.id, NOW).unwrap() else {
-            panic!()
-        };
-        let code = code_in(&redirect);
 
+        let (_, code) = let_in(&server, &client);
         let wrong_verifier = redeem(
             &server,
             &client,
@@ -1209,7 +1243,15 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(wrong_verifier.error, "invalid_grant");
+        // Spent: the right verifier is too late now.
+        assert_eq!(
+            redeem(&server, &client, &code, VERIFIER, NOW + 2)
+                .unwrap_err()
+                .error,
+            "invalid_grant"
+        );
 
+        let (_, code) = let_in(&server, &client);
         let other = Client {
             id: "other".to_string(),
             ..client.clone()
@@ -1218,6 +1260,7 @@ mod tests {
         assert_eq!(wrong_client.error, "invalid_client");
         assert_eq!(wrong_client.status(), 401);
 
+        let (_, code) = let_in(&server, &client);
         let elsewhere = Client {
             redirect_uris: vec!["https://claude.ai/other".to_string()],
             ..client.clone()
@@ -1229,6 +1272,7 @@ mod tests {
             "invalid_grant"
         );
 
+        let (ask, code) = let_in(&server, &client);
         let late = redeem(&server, &client, &code, VERIFIER, NOW + CODE_TTL_SECS + 1).unwrap_err();
         assert_eq!(late.error, "invalid_grant");
         // Late, the waiting page is told it is gone too.
@@ -1236,6 +1280,59 @@ mod tests {
             server.progress(&ask.id, NOW + CODE_TTL_SECS + 1).unwrap(),
             Progress::Gone
         );
+    }
+
+    /// Two redemptions of one code in flight together: the store takes the
+    /// code in one write, so one gets the token and the other is refused.
+    #[test]
+    fn two_redemptions_in_flight_together_mint_one_token() {
+        let server = server(Answer::Approved);
+        let client = registered(&server);
+        let (_, code) = let_in(&server, &client);
+        let outcomes: Vec<Result<Issued, TokenRefusal>> = std::thread::scope(|scope| {
+            let threads: Vec<_> = (0..8)
+                .map(|_| scope.spawn(|| redeem(&server, &client, &code, VERIFIER, NOW + 1)))
+                .collect();
+            threads
+                .into_iter()
+                .map(|thread| thread.join().unwrap())
+                .collect()
+        });
+        assert_eq!(outcomes.iter().filter(|outcome| outcome.is_ok()).count(), 1);
+        assert!(
+            outcomes
+                .iter()
+                .filter_map(|outcome| outcome.as_ref().err())
+                .all(|refusal| refusal.error == "invalid_grant")
+        );
+        assert_eq!(server.store().tokens().unwrap().len(), 1);
+    }
+
+    /// The waiting page and, on the deep-link path, the client both poll the
+    /// same ask. Two polls that both see the person's yes are sent to one
+    /// code, so the browser that arrives second is not sent back with a
+    /// code the store no longer holds.
+    #[test]
+    fn two_polls_that_both_see_the_yes_are_sent_to_one_code() {
+        let server = server(Answer::Approved);
+        let client = registered(&server);
+        let ask = asked(&server, &client);
+        let redirects: Vec<Progress> = std::thread::scope(|scope| {
+            let threads: Vec<_> = (0..8)
+                .map(|_| scope.spawn(|| server.progress(&ask.id, NOW + 1).unwrap()))
+                .collect();
+            threads
+                .into_iter()
+                .map(|thread| thread.join().unwrap())
+                .collect()
+        });
+        let Progress::Redirect(first) = &redirects[0] else {
+            panic!("{redirects:?}")
+        };
+        assert!(redirects.iter().all(|progress| progress == &redirects[0]));
+        let held = server.store().ask(&ask.id).unwrap().unwrap();
+        assert_eq!(held.code.as_deref(), Some(code_in(first).as_str()));
+        assert!(redeem(&server, &client, &code_in(first), VERIFIER, NOW + 2).is_ok());
     }
 
     #[test]
