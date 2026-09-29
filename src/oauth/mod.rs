@@ -1,7 +1,7 @@
 //! OAuth for a Proxy's address.
 //!
 //! The node is the authorization server for the surfaces it serves at
-//! `https://<name>.proxy.ing` — `/mcp`, `/inference`, `/client`. Something
+//! `https://<name>.proxy.ing`: `/mcp`, `/inference`, `/client`. Something
 //! that wants in (Claude, an editor, a dashboard) registers itself, sends the
 //! person to `/oauth/authorize`, and the person lets it in from Proxy on
 //! their Mac or phone: one click, nothing to paste. The node then issues the
@@ -13,8 +13,8 @@
 //! metadata (RFC 8414), protected-resource metadata (RFC 9728), revocation
 //! (RFC 7009), and the issuer named on every answer to an authorize
 //! (RFC 9207), so a client that was sent here by a deep link into Proxy
-//! learns which address let it in. Clients are public — there is no client secret — because
-//! holding the code verifier is the proof.
+//! learns which address let it in. Clients are public, with no client
+//! secret, because holding the code verifier is the proof.
 //!
 //! Two seams are the node's to fill. A [`Store`] keeps clients, asks and
 //! tokens; [`MemoryStore`] is the reference. A [`Consent`] puts an ask in
@@ -149,7 +149,7 @@ pub trait Store: Send + Sync {
 }
 
 /// How an ask reaches the person, and how their answer comes back. On a
-/// Proxy this is a Move — "Claude wants to connect to your address" — on the
+/// Proxy this is a Move, "Claude wants to connect to your address", on the
 /// Mac and the phone; `answer` reads that Move's status.
 pub trait Consent: Send + Sync {
     fn ask(&self, ask: &Ask) -> Result<(), OAuthError>;

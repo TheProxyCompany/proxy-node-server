@@ -6,8 +6,8 @@
 //! configuration; no request header says where the node is.
 //!
 //! Every answer here is public by design: registration, the waiting page,
-//! the token exchange. What they guard is elsewhere — the bearer gate on the
-//! node's surfaces, which admits a token through
+//! the token exchange. What they guard is elsewhere, at the bearer gate on
+//! the node's surfaces, which admits a token through
 //! [`Server::admit`](super::Server::admit).
 
 use std::sync::Arc;
