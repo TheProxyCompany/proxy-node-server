@@ -381,7 +381,9 @@ fn address_of(issuer: &str) -> String {
 
 /// The waiting page: who wants in, where, and that the answer is given in
 /// Proxy. It polls `ask/<id>` beside itself and follows the redirect that
-/// comes back.
+/// comes back. The client's name and the ask's id ride on the note as data
+/// attributes, escaped once for HTML, and the script reads them from there,
+/// so the script itself carries nothing a client chose.
 fn waiting_page(issuer: &str, client_name: &str, ask_id: &str) -> Response {
     let address = escape(&address_of(issuer));
     let client = escape(client_name);
@@ -389,33 +391,7 @@ fn waiting_page(issuer: &str, client_name: &str, ask_id: &str) -> Response {
         "<strong>{client}</strong> wants to connect to <strong>{address}</strong>. \
          Let it in from Proxy on your Mac or phone, or reject it there."
     );
-    let script = format!(
-        r#"<script>
-(function () {{
-  var ask = new URL("ask/{id}", location.href);
-  var note = document.getElementById("note");
-  var tick = function () {{
-    fetch(ask, {{ cache: "no-store" }}).then(function (r) {{ return r.json(); }}).then(function (answer) {{
-      if (answer.status === "let_in") {{
-        note.textContent = "Let in. Taking you back to {client_js}…";
-        location.replace(answer.redirect);
-      }} else if (answer.status === "refused") {{
-        note.textContent = "Not let in. Nothing changed. Taking you back…";
-        location.replace(answer.redirect);
-      }} else if (answer.status === "gone") {{
-        note.textContent = "This ask is no longer open. Start again from {client_js}.";
-      }} else {{
-        setTimeout(tick, 2000);
-      }}
-    }}).catch(function () {{ setTimeout(tick, 4000); }});
-  }};
-  tick();
-}})();
-</script>"#,
-        id = escape(ask_id),
-        client_js = client.replace('\\', "\\\\").replace('"', "\\\""),
-    );
-    let html = page(issuer, "Let it in?", &lede, Some(&script));
+    let html = page(issuer, "Let it in?", &lede, Some((client_name, ask_id)));
     cors(
         (
             StatusCode::OK,
@@ -426,13 +402,50 @@ fn waiting_page(issuer: &str, client_name: &str, ask_id: &str) -> Response {
     )
 }
 
-fn page(issuer: &str, title: &str, lede_html: &str, script: Option<&str>) -> String {
+const WAITING_SCRIPT: &str = r#"<script>
+(function () {
+  var note = document.getElementById("note");
+  var client = note.dataset.client;
+  var ask = new URL("ask/" + note.dataset.ask, location.href);
+  var tick = function () {
+    fetch(ask, { cache: "no-store" }).then(function (r) { return r.json(); }).then(function (answer) {
+      if (answer.status === "let_in") {
+        note.textContent = "Let in. Taking you back to " + client + "\u2026";
+        location.replace(answer.redirect);
+      } else if (answer.status === "refused") {
+        note.textContent = "Not let in. Nothing changed. Taking you back\u2026";
+        location.replace(answer.redirect);
+      } else if (answer.status === "gone") {
+        note.textContent = "This ask is no longer open. Start again from " + client + ".";
+      } else {
+        setTimeout(tick, 2000);
+      }
+    }).catch(function () { setTimeout(tick, 4000); });
+  };
+  tick();
+})();
+</script>"#;
+
+/// The page, with a note that is either the ask still waiting (the client's
+/// name and the ask's id, for [`WAITING_SCRIPT`]) or where to go from a
+/// refusal.
+fn page(issuer: &str, title: &str, lede_html: &str, waiting: Option<(&str, &str)>) -> String {
     let address = escape(&address_of(issuer));
     let title = escape(title);
-    let note = if script.is_some() {
-        "Waiting for you\u{2026}"
-    } else {
-        "Go back to where you started and try again."
+    let (note, script) = match waiting {
+        Some((client_name, ask_id)) => (
+            format!(
+                r#"<p id="note" class="note" data-client="{}" data-ask="{}">Waiting for you&hellip;</p>"#,
+                escape(client_name),
+                escape(ask_id)
+            ),
+            WAITING_SCRIPT,
+        ),
+        None => (
+            r#"<p id="note" class="note">Go back to where you started and try again.</p>"#
+                .to_string(),
+            "",
+        ),
     };
     format!(
         r#"<!doctype html>
@@ -457,14 +470,13 @@ fn page(issuer: &str, title: &str, lede_html: &str, script: Option<&str>) -> Str
   <p class="address">{address}</p>
   <h1>{title}</h1>
   <p>{lede}</p>
-  <p id="note" class="note">{note}</p>
+  {note}
 </main>
 {script}
 </body>
 </html>
 "#,
         lede = lede_html,
-        script = script.unwrap_or(""),
     )
 }
 
@@ -524,12 +536,21 @@ mod tests {
     }
 
     async fn register(client: &reqwest::Client, base: &str, redirect: &str) -> String {
+        register_as(client, base, "Claude", redirect).await
+    }
+
+    async fn register_as(
+        client: &reqwest::Client,
+        base: &str,
+        name: &str,
+        redirect: &str,
+    ) -> String {
         let response = client
             .post(format!("{base}/oauth/register"))
             .header("content-type", "application/json")
-            .body(format!(
-                r#"{{"client_name":"Claude","redirect_uris":["{redirect}"]}}"#
-            ))
+            .body(
+                serde_json::json!({ "client_name": name, "redirect_uris": [redirect] }).to_string(),
+            )
             .send()
             .await
             .unwrap();
@@ -723,7 +744,7 @@ mod tests {
             "{html}"
         );
         let ask_id = html
-            .split("new URL(\"ask/")
+            .split("data-ask=\"")
             .nth(1)
             .unwrap()
             .split('"')
@@ -812,6 +833,43 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), 200);
         assert!(server.admit(&bearer, now()).unwrap().is_none());
+    }
+
+    /// A client's name is escaped once for each place it is shown. On the
+    /// page it is HTML; the script reads it from a data attribute, so a
+    /// name with a quote, an ampersand or a tag reads as the person expects
+    /// and runs nothing.
+    #[tokio::test]
+    async fn a_clients_name_is_escaped_once_for_the_page_and_once_for_the_script() {
+        let (_, app) = app(Always(Answer::Pending));
+        let base = serve(app).await;
+        let client = reqwest::Client::new();
+        let redirect = "http://localhost:4242/callback";
+        let client_id = register_as(&client, &base, "Jack's Editor & Co <b>", redirect).await;
+        let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(VERIFIER.as_bytes()));
+        let html = client
+            .get(format!(
+                "{base}/oauth/authorize?response_type=code&client_id={client_id}&redirect_uri={}&code_challenge={challenge}",
+                utf8_percent_encode(redirect, NON_ALPHANUMERIC)
+            ))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(
+            html.contains("<strong>Jack&#39;s Editor &amp; Co &lt;b&gt;</strong> wants to connect"),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"data-client="Jack&#39;s Editor &amp; Co &lt;b&gt;" data-ask=""#),
+            "{html}"
+        );
+        assert!(html.contains("note.dataset.client"), "{html}");
+        let script = html.split("<script>").nth(1).unwrap();
+        assert!(!script.contains("Jack"), "{script}");
+        assert!(!html.contains("<b>"), "{html}");
     }
 
     #[tokio::test]
