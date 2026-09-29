@@ -203,6 +203,7 @@ where
     C: Consent + 'static,
 {
     let issuer = issuer_of(&headers);
+    let wants_json = asks_for_json(&headers);
     let asked_at = issuer.clone();
     let at = now();
     match blocking(server, move |server| {
@@ -210,6 +211,14 @@ where
     })
     .await
     {
+        Ok(Ok(Ok(ask))) if wants_json => json(
+            StatusCode::OK,
+            &Asked {
+                ask: ask.id.clone(),
+                client_name: ask.client_name.clone(),
+                poll: format!("/oauth/ask/{}", ask.id),
+            },
+        ),
         Ok(Ok(Ok(ask))) => waiting_page(&issuer, &ask.client_name, &ask.id),
         Ok(Ok(Err(Refusal::Redirect(url)))) => Redirect::to(&url).into_response(),
         Ok(Ok(Err(Refusal::Page { status, message }))) => {
@@ -223,6 +232,29 @@ where
         Ok(Err(error)) => failed(error),
         Err(response) => *response,
     }
+}
+
+/// A client with no browser (a Proxy at another address seating this one
+/// in a party) sends `Accept: application/json` and gets the ask to poll
+/// instead of the waiting page.
+fn asks_for_json(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|accept| {
+            accept.split(',').any(|part| {
+                part.trim().split(';').next().unwrap_or("").trim() == "application/json"
+            })
+        })
+}
+
+/// The ask as a client polls it: what to poll and who the person is told
+/// asked.
+#[derive(Serialize)]
+struct Asked {
+    ask: String,
+    client_name: String,
+    poll: String,
 }
 
 #[derive(Serialize)]
@@ -508,6 +540,62 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string()
+    }
+
+    /// A client with no browser asks with `Accept: application/json` and
+    /// gets the ask to poll instead of the page; the same ask then answers
+    /// the poll like any other.
+    #[tokio::test]
+    async fn a_client_that_asks_for_json_gets_the_ask_to_poll_instead_of_the_page() {
+        let (_, app) = app(Always(Answer::Pending));
+        let base = serve(app).await;
+        let client = reqwest::Client::new();
+        let redirect = "https://official.proxy.ing/oauth/party-callback";
+        let client_id = register(&client, &base, redirect).await;
+        let challenge = base64url(&Sha256::digest(VERIFIER.as_bytes()));
+        let response = client
+            .get(format!(
+                "{base}/oauth/authorize?response_type=code&client_id={client_id}&redirect_uri={}&state=s1&code_challenge={challenge}&code_challenge_method=S256&scope=party%3Ap1",
+                crate::oauth::encode_component(redirect)
+            ))
+            .header("host", "jckwind.proxy.ing")
+            .header("accept", "application/json; q=0.9, text/html")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.headers()["content-type"], "application/json");
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        let answer = value(&response.text().await.unwrap());
+        let ask_id = answer["ask"].as_str().unwrap().to_string();
+        assert!(!ask_id.is_empty());
+        assert_eq!(answer["client_name"], "Claude");
+        assert_eq!(answer["poll"], format!("/oauth/ask/{ask_id}"));
+        let text = client
+            .get(format!("{base}{}", answer["poll"].as_str().unwrap()))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert_eq!(value(&text)["status"], "waiting");
+        // Without the header, and with an accept that is not JSON, the page.
+        let page = client
+            .get(format!(
+                "{base}/oauth/authorize?response_type=code&client_id={client_id}&redirect_uri={}&state=s2&code_challenge={challenge}&code_challenge_method=S256",
+                crate::oauth::encode_component(redirect)
+            ))
+            .header("accept", "text/html,application/xhtml+xml")
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            page.headers()["content-type"]
+                .to_str()
+                .unwrap()
+                .starts_with("text/html")
+        );
     }
 
     #[tokio::test]
