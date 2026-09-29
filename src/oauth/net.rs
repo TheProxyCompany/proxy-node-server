@@ -39,12 +39,6 @@ pub fn now() -> u64 {
 /// `None` is a node with no address yet, and its routes say so.
 pub type Issuer = Arc<dyn Fn() -> Option<String> + Send + Sync>;
 
-/// An issuer that is one address for as long as the node runs.
-pub fn fixed_issuer(issuer: &str) -> Issuer {
-    let issuer = issuer.to_string();
-    Arc::new(move || Some(issuer.clone()))
-}
-
 /// The server behind the routes, and how it reads the address it answers at.
 struct At<S: Store, C: Consent> {
     server: Arc<Server<S, C>>,
@@ -525,6 +519,12 @@ mod tests {
 
     const VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
     const ISSUER: &str = "https://jckwind.proxy.ing";
+
+    /// The address a test node has for as long as it runs.
+    fn fixed_issuer(issuer: &str) -> Issuer {
+        let issuer = issuer.to_string();
+        Arc::new(move || Some(issuer.clone()))
+    }
 
     /// A consent the test answers when it likes.
     struct Held(Mutex<Answer>);
