@@ -108,7 +108,14 @@ pub enum OAuthError {
     Consent(String),
 }
 
-/// Where clients, asks and tokens are kept. Every `put_*` is an upsert by id.
+/// Where clients, asks and tokens are kept. `put_client` and `put_ask` are
+/// upserts by id. A token is different, because taking one back must be
+/// final: `put_token` inserts a token, or on an id it already holds records
+/// its revocation, and a `revoked_at` once set is never cleared by a later
+/// put. `last_used_at` moves only through `touch_token`, which writes that
+/// one column of a live token and nothing else, so a request admitted just
+/// before the person removed the connection cannot write the old row back
+/// and restore it.
 pub trait Store: Send + Sync {
     fn put_client(&self, client: &Client) -> Result<(), OAuthError>;
     fn client(&self, id: &str) -> Result<Option<Client>, OAuthError>;
@@ -116,6 +123,9 @@ pub trait Store: Send + Sync {
     fn ask(&self, id: &str) -> Result<Option<Ask>, OAuthError>;
     fn ask_by_code(&self, code: &str) -> Result<Option<Ask>, OAuthError>;
     fn put_token(&self, token: &Token) -> Result<(), OAuthError>;
+    /// Record that the live token `id` was used at `used_at`. A token that
+    /// is revoked, or that does not exist, is left exactly as it is.
+    fn touch_token(&self, id: &str, used_at: u64) -> Result<(), OAuthError>;
     fn token(&self, id: &str) -> Result<Option<Token>, OAuthError>;
     fn token_by_hash(&self, hash: &str) -> Result<Option<Token>, OAuthError>;
     fn tokens(&self) -> Result<Vec<Token>, OAuthError>;
@@ -183,10 +193,26 @@ impl Store for MemoryStore {
     }
 
     fn put_token(&self, token: &Token) -> Result<(), OAuthError> {
-        self.tokens
-            .lock()
-            .map_err(poisoned)?
-            .insert(token.id.clone(), token.clone());
+        let mut tokens = self.tokens.lock().map_err(poisoned)?;
+        match tokens.get_mut(&token.id) {
+            Some(held) => {
+                if held.revoked_at.is_none() {
+                    held.revoked_at = token.revoked_at;
+                }
+            }
+            None => {
+                tokens.insert(token.id.clone(), token.clone());
+            }
+        }
+        Ok(())
+    }
+
+    fn touch_token(&self, id: &str, used_at: u64) -> Result<(), OAuthError> {
+        if let Some(held) = self.tokens.lock().map_err(poisoned)?.get_mut(id) {
+            if held.is_live() {
+                held.last_used_at = Some(used_at);
+            }
+        }
         Ok(())
     }
 
@@ -748,7 +774,10 @@ impl<S: Store, C: Consent> Server<S, C> {
     }
 
     /// The token behind a bearer, if it is one this server issued and still
-    /// live. Marks it used, at most once a minute.
+    /// live. Marks it used, at most once a minute, through
+    /// [`Store::touch_token`]: only `last_used_at` is written, never the row
+    /// this request read, so a revoke that lands while the request is in
+    /// flight stays a revoke.
     pub fn admit(&self, bearer: &str, now: u64) -> Result<Option<Token>, OAuthError> {
         let bearer = bearer.trim();
         if bearer.is_empty() {
@@ -765,7 +794,7 @@ impl<S: Store, C: Consent> Server<S, C> {
             .is_none_or(|used| now.saturating_sub(used) >= TOUCH_EVERY_SECS)
         {
             token.last_used_at = Some(now);
-            self.store.put_token(&token)?;
+            self.store.touch_token(&token.id, now)?;
         }
         Ok(Some(token))
     }
@@ -1331,6 +1360,45 @@ mod tests {
         server.revoke("nothing", NOW).unwrap();
         assert!(!server.revoke_id("nothing", NOW).unwrap());
         assert_eq!(server.admit("", NOW).unwrap(), None);
+    }
+
+    /// Alex's finding on root PR 45: a request admitted just before the
+    /// person removed the connection used to write its whole token row back,
+    /// `revoked_at` and all, and the connection came back. Now the in-flight
+    /// write touches only a live token's `last_used_at`, and a put can never
+    /// clear a revocation.
+    #[test]
+    fn a_request_in_flight_across_a_revoke_cannot_restore_the_connection() {
+        let server = server(Answer::Approved);
+        let client = registered(&server);
+        let ask = asked(&server, &client);
+        let Progress::Redirect(redirect) = server.progress(&ask.id, NOW).unwrap() else {
+            panic!()
+        };
+        let issued = redeem(&server, &client, &code_in(&redirect), VERIFIER, NOW).unwrap();
+
+        // The request reads the token while it is live...
+        let in_flight = server
+            .store()
+            .token_by_hash(&hash_token(&issued.access_token))
+            .unwrap()
+            .unwrap();
+        assert!(in_flight.is_live());
+        // ...the person removes the connection...
+        server.revoke(&issued.access_token, NOW + 10).unwrap();
+        // ...and the request then records its last use, both ways it could.
+        server.store().touch_token(&in_flight.id, NOW + 11).unwrap();
+        let mut stale = in_flight.clone();
+        stale.last_used_at = Some(NOW + 11);
+        server.store().put_token(&stale).unwrap();
+
+        assert_eq!(server.admit(&issued.access_token, NOW + 12).unwrap(), None);
+        assert!(server.connections().unwrap().is_empty());
+        let held = server.store().token(&in_flight.id).unwrap().unwrap();
+        assert_eq!(held.revoked_at, Some(NOW + 10));
+        assert_eq!(held.last_used_at, None, "a revoked token is not touched");
+        // Touching what does not exist is nothing.
+        server.store().touch_token("nothing", NOW).unwrap();
     }
 
     #[test]
