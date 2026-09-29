@@ -478,7 +478,10 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
-    use crate::oauth::{Always, Answer, Ask, Consent, MemoryStore, OAuthError, base64url};
+    use crate::oauth::{Always, Answer, Ask, Consent, MemoryStore, OAuthError};
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
     use sha2::{Digest, Sha256};
 
     const VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
@@ -520,7 +523,7 @@ mod tests {
     fn redeem_body(code: &str, redirect: &str, client_id: &str) -> String {
         format!(
             "grant_type=authorization_code&code={code}&redirect_uri={}&client_id={client_id}&code_verifier={VERIFIER}",
-            crate::oauth::encode_component(redirect)
+            utf8_percent_encode(redirect, NON_ALPHANUMERIC)
         )
     }
 
@@ -552,11 +555,11 @@ mod tests {
         let client = reqwest::Client::new();
         let redirect = "https://official.proxy.ing/oauth/party-callback";
         let client_id = register(&client, &base, redirect).await;
-        let challenge = base64url(&Sha256::digest(VERIFIER.as_bytes()));
+        let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(VERIFIER.as_bytes()));
         let response = client
             .get(format!(
                 "{base}/oauth/authorize?response_type=code&client_id={client_id}&redirect_uri={}&state=s1&code_challenge={challenge}&code_challenge_method=S256&scope=party%3Ap1",
-                crate::oauth::encode_component(redirect)
+                utf8_percent_encode(redirect, NON_ALPHANUMERIC)
             ))
             .header("host", "jckwind.proxy.ing")
             .header("accept", "application/json; q=0.9, text/html")
@@ -584,7 +587,7 @@ mod tests {
         let page = client
             .get(format!(
                 "{base}/oauth/authorize?response_type=code&client_id={client_id}&redirect_uri={}&state=s2&code_challenge={challenge}&code_challenge_method=S256",
-                crate::oauth::encode_component(redirect)
+                utf8_percent_encode(redirect, NON_ALPHANUMERIC)
             ))
             .header("accept", "text/html,application/xhtml+xml")
             .send()
@@ -662,13 +665,13 @@ mod tests {
             .unwrap();
         let redirect = "http://localhost:4242/callback";
         let client_id = register(&client, &base, redirect).await;
-        let challenge = base64url(&Sha256::digest(VERIFIER.as_bytes()));
+        let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(VERIFIER.as_bytes()));
 
         // The waiting page, with the ask id in its script.
         let response = client
             .get(format!(
                 "{base}/oauth/authorize?response_type=code&client_id={client_id}&redirect_uri={}&state=s1&code_challenge={challenge}&code_challenge_method=S256",
-                crate::oauth::encode_component(redirect)
+                utf8_percent_encode(redirect, NON_ALPHANUMERIC)
             ))
             .header("host", "jckwind.proxy.ing")
             .send()
@@ -790,7 +793,7 @@ mod tests {
         let response = client
             .get(format!(
                 "{base}/oauth/authorize?response_type=code&client_id={client_id}&redirect_uri={}&state=s1",
-                crate::oauth::encode_component(redirect)
+                utf8_percent_encode(redirect, NON_ALPHANUMERIC)
             ))
             .send()
             .await

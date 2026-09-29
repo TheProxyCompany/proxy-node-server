@@ -61,11 +61,7 @@ impl OpId {
     }
 
     pub fn to_hex(&self) -> String {
-        let mut s = String::with_capacity(64);
-        for b in self.0 {
-            s.push_str(&format!("{b:02x}"));
-        }
-        s
+        crate::identity::encode_hex(&self.0)
     }
 }
 

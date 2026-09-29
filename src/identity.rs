@@ -23,11 +23,11 @@ impl DeviceId {
     }
 
     pub fn to_hex(&self) -> String {
-        to_hex(&self.0)
+        encode_hex(&self.0)
     }
 
     pub fn from_hex(s: &str) -> Result<Self, IdentityError> {
-        let bytes = from_hex(s)?;
+        let bytes = decode_hex(s).ok_or(IdentityError::InvalidHex)?;
         if bytes.len() != 32 {
             return Err(IdentityError::InvalidLength {
                 expected: 32,
@@ -153,7 +153,9 @@ fn device_id_of(key: &VerifyingKey) -> DeviceId {
     DeviceId(digest.into())
 }
 
-fn to_hex(bytes: &[u8]) -> String {
+/// Bytes as lowercase hex: the crate's one encoder, for device ids, op ids,
+/// signatures, nonces, cursors and OAuth secrets alike.
+pub(crate) fn encode_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut s = String::with_capacity(bytes.len() * 2);
     for &b in bytes {
@@ -163,26 +165,24 @@ fn to_hex(bytes: &[u8]) -> String {
     s
 }
 
-fn from_hex(s: &str) -> Result<Vec<u8>, IdentityError> {
+/// Hex, either case, back to bytes; `None` for an odd length or a character
+/// that is not hex.
+pub(crate) fn decode_hex(s: &str) -> Option<Vec<u8>> {
     if s.len() % 2 != 0 {
-        return Err(IdentityError::InvalidHex);
+        return None;
     }
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len() / 2);
-    for pair in bytes.chunks(2) {
-        let hi = hex_val(pair[0])?;
-        let lo = hex_val(pair[1])?;
-        out.push((hi << 4) | lo);
-    }
-    Ok(out)
+    s.as_bytes()
+        .chunks_exact(2)
+        .map(|pair| Some((hex_val(pair[0])? << 4) | hex_val(pair[1])?))
+        .collect()
 }
 
-fn hex_val(c: u8) -> Result<u8, IdentityError> {
+fn hex_val(c: u8) -> Option<u8> {
     match c {
-        b'0'..=b'9' => Ok(c - b'0'),
-        b'a'..=b'f' => Ok(c - b'a' + 10),
-        b'A'..=b'F' => Ok(c - b'A' + 10),
-        _ => Err(IdentityError::InvalidHex),
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -241,7 +241,7 @@ mod tests {
     }
 
     fn decode<const N: usize>(hex: &str) -> [u8; N] {
-        let bytes = from_hex(hex).unwrap();
+        let bytes = decode_hex(hex).unwrap();
         assert_eq!(bytes.len(), N);
         let mut out = [0u8; N];
         out.copy_from_slice(&bytes);

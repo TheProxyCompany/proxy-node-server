@@ -22,7 +22,7 @@ use tokio::sync::{Semaphore, watch};
 use crate::durable::OplogWriter;
 use crate::error::TransportError;
 use crate::hlc::NodeClock;
-use crate::identity::{DeviceId, DeviceIdentity};
+use crate::identity::{DeviceId, DeviceIdentity, decode_hex, encode_hex};
 use crate::log::{LogSource, OpLog, RelayLogEntry, RelayStreamState, apply_range, replay};
 use crate::op::{OrderKey, SignedOp};
 use crate::registry::{DeviceBook, DeviceRegistry};
@@ -2306,58 +2306,15 @@ fn save_keys(path: &Path, registry: &DeviceRegistry) -> std::io::Result<()> {
 // ---------------------------------------------------------------------------
 
 fn encode_order_key(key: &OrderKey) -> String {
-    let bytes = key.to_wire();
-    let mut s = String::with_capacity(144);
-    for b in bytes {
-        s.push(hex_digit(b >> 4));
-        s.push(hex_digit(b & 0x0f));
-    }
-    s
+    encode_hex(&key.to_wire())
 }
 
 fn decode_order_key(s: &str) -> Option<OrderKey> {
-    if s.len() != 144 {
-        return None;
-    }
-    let bytes = s.as_bytes();
-    let mut wire = [0u8; 72];
-    for (i, chunk) in bytes.chunks_exact(2).enumerate() {
-        wire[i] = (hex_val(chunk[0])? << 4) | hex_val(chunk[1])?;
-    }
-    Some(OrderKey::from_wire(&wire))
-}
-
-fn encode_hex(bytes: &[u8]) -> String {
-    let mut encoded = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        encoded.push(hex_digit(byte >> 4));
-        encoded.push(hex_digit(byte & 0x0f));
-    }
-    encoded
+    decode_fixed_hex::<72>(s).map(|wire| OrderKey::from_wire(&wire))
 }
 
 fn decode_fixed_hex<const N: usize>(encoded: &str) -> Option<[u8; N]> {
-    if encoded.len() != N * 2 {
-        return None;
-    }
-    let mut decoded = [0u8; N];
-    for (index, chunk) in encoded.as_bytes().chunks_exact(2).enumerate() {
-        decoded[index] = (hex_val(chunk[0])? << 4) | hex_val(chunk[1])?;
-    }
-    Some(decoded)
-}
-
-fn hex_digit(nibble: u8) -> char {
-    b"0123456789abcdef"[nibble as usize] as char
-}
-
-fn hex_val(c: u8) -> Option<u8> {
-    match c {
-        b'0'..=b'9' => Some(c - b'0'),
-        b'a'..=b'f' => Some(c - b'a' + 10),
-        b'A'..=b'F' => Some(c - b'A' + 10),
-        _ => None,
-    }
+    decode_hex(encoded)?.try_into().ok()
 }
 
 #[cfg(test)]

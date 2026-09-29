@@ -24,10 +24,16 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 use thiserror::Error;
+
+use crate::identity::encode_hex;
 
 #[cfg(feature = "pull-http")]
 pub mod net;
@@ -850,8 +856,8 @@ pub fn pkce_matches(verifier: &str, challenge: &str) -> bool {
     if !code_challenge_is_well_formed(verifier) {
         return false;
     }
-    let digest = Sha256::digest(verifier.as_bytes());
-    constant_time_eq(base64url(&digest).as_bytes(), challenge.as_bytes())
+    let digest = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+    digest.as_bytes().ct_eq(challenge.as_bytes()).into()
 }
 
 /// What is kept of a token: the hex SHA-256 of the bearer string.
@@ -898,69 +904,18 @@ pub fn redirect_with(redirect_uri: &str, params: &[(&str, &str)]) -> String {
         url.push(separator);
         url.push_str(name);
         url.push('=');
-        url.push_str(&encode_component(value));
+        url.extend(utf8_percent_encode(value, QUERY_VALUE));
         separator = '&';
     }
     url
 }
 
-/// Percent-encoding for a query value: everything but the unreserved set.
-pub fn encode_component(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
-            out.push(byte as char);
-        } else {
-            out.push('%');
-            out.push(hex_digit(byte >> 4).to_ascii_uppercase());
-            out.push(hex_digit(byte & 0x0f).to_ascii_uppercase());
-        }
-    }
-    out
-}
-
-/// Base64url without padding (RFC 4648 §5), as PKCE wants it.
-pub fn base64url(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let b = [
-            chunk[0],
-            *chunk.get(1).unwrap_or(&0),
-            *chunk.get(2).unwrap_or(&0),
-        ];
-        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
-        out.push(ALPHABET[(n >> 18) as usize & 63] as char);
-        out.push(ALPHABET[(n >> 12) as usize & 63] as char);
-        if chunk.len() > 1 {
-            out.push(ALPHABET[(n >> 6) as usize & 63] as char);
-        }
-        if chunk.len() > 2 {
-            out.push(ALPHABET[n as usize & 63] as char);
-        }
-    }
-    out
-}
-
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
-}
-
-fn encode_hex(bytes: &[u8]) -> String {
-    let mut encoded = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        encoded.push(hex_digit(byte >> 4));
-        encoded.push(hex_digit(byte & 0x0f));
-    }
-    encoded
-}
-
-fn hex_digit(nibble: u8) -> char {
-    b"0123456789abcdef"[nibble as usize] as char
-}
+/// A query value keeps only the unreserved set (RFC 3986 §2.3).
+const QUERY_VALUE: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~');
 
 #[cfg(test)]
 mod tests {
@@ -970,7 +925,7 @@ mod tests {
     const VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
 
     fn challenge_of(verifier: &str) -> String {
-        base64url(&Sha256::digest(verifier.as_bytes()))
+        URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
     }
 
     fn server(answer: Answer) -> Server<MemoryStore, Always> {
@@ -1058,15 +1013,6 @@ mod tests {
             "short",
             "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
         ));
-    }
-
-    #[test]
-    fn base64url_is_unpadded_and_url_safe() {
-        assert_eq!(base64url(b""), "");
-        assert_eq!(base64url(b"f"), "Zg");
-        assert_eq!(base64url(b"fo"), "Zm8");
-        assert_eq!(base64url(b"foo"), "Zm9v");
-        assert_eq!(base64url(&[0xfb, 0xff]), "-_8");
     }
 
     #[test]
