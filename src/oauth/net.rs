@@ -8,7 +8,10 @@
 //! Every answer here is public by design: registration, the waiting page,
 //! the token exchange. What they guard is elsewhere, at the bearer gate on
 //! the node's surfaces, which admits a token through
-//! [`Server::admit`](super::Server::admit).
+//! [`Server::admit`](super::Server::admit). Public is not free: one source
+//! gets its share of registrations and asks in a window and then `429`, and
+//! every registration is said to the node's [`Audit`], with where it came
+//! from and where it sends the person back to.
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -22,8 +25,14 @@ use serde::Serialize;
 
 use super::{
     AuthorizeRequest, Consent, Progress, Refusal, Registered, Registration, Server, Store,
-    TokenRequest, resource_metadata, server_metadata,
+    TokenRequest, family_words, redirect_origin, resource_metadata, scope_families,
+    server_metadata,
 };
+
+/// The header the edge puts on a request that came through the tunnel,
+/// with the address it came from. Without it the request is from this
+/// machine.
+const SOURCE_HEADER: &str = "cf-connecting-ip";
 
 /// Seconds since the epoch, the clock the rules run on.
 pub fn now() -> u64 {
@@ -39,10 +48,22 @@ pub fn now() -> u64 {
 /// `None` is a node with no address yet, and its routes say so.
 pub type Issuer = Arc<dyn Fn() -> Option<String> + Send + Sync>;
 
-/// The server behind the routes, and how it reads the address it answers at.
+/// Where the routes say what happened, one line at a time: who registered,
+/// from where, for which origin; which source was slowed. The node hands
+/// its log; [`silent`] is for a node with none.
+pub type Audit = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// An audit that says nothing.
+pub fn silent() -> Audit {
+    Arc::new(|_| {})
+}
+
+/// The server behind the routes, how it reads the address it answers at,
+/// and where it says what happened.
 struct At<S: Store, C: Consent> {
     server: Arc<Server<S, C>>,
     issuer: Issuer,
+    audit: Audit,
 }
 
 impl<S: Store, C: Consent> Clone for At<S, C> {
@@ -50,13 +71,14 @@ impl<S: Store, C: Consent> Clone for At<S, C> {
         Self {
             server: Arc::clone(&self.server),
             issuer: Arc::clone(&self.issuer),
+            audit: Arc::clone(&self.audit),
         }
     }
 }
 
 /// `/register`, `/authorize`, `/ask/{id}`, `/token`, `/revoke`: mount under
 /// `/oauth`.
-pub fn router<S, C>(server: Arc<Server<S, C>>, issuer: Issuer) -> Router
+pub fn router<S, C>(server: Arc<Server<S, C>>, issuer: Issuer, audit: Audit) -> Router
 where
     S: Store + 'static,
     C: Consent + 'static,
@@ -67,7 +89,37 @@ where
         .route("/ask/{id}", get(ask::<S, C>))
         .route("/token", post(token::<S, C>).options(preflight))
         .route("/revoke", post(revoke::<S, C>).options(preflight))
-        .with_state(At { server, issuer })
+        .with_state(At {
+            server,
+            issuer,
+            audit,
+        })
+}
+
+/// Where a request came from, for the limits and the audit: the address the
+/// edge names, or this machine.
+fn source_of(headers: &HeaderMap) -> String {
+    headers
+        .get(SOURCE_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| "this machine".to_string())
+}
+
+/// A source that had its share in this window. The window is
+/// [`super::REGISTER_LIMIT`] or [`super::AUTHORIZE_LIMIT`] long, and the
+/// answer says to come back after it.
+fn slowed(window_secs: u64, description: &str) -> Response {
+    let mut response = json(
+        StatusCode::TOO_MANY_REQUESTS,
+        &serde_json::json!({ "error": "too_many_requests", "error_description": description }),
+    );
+    if let Ok(value) = window_secs.to_string().parse() {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+    response
 }
 
 /// `/oauth-authorization-server` and `/oauth-protected-resource`: mount
@@ -186,13 +238,27 @@ where
 }
 
 async fn register<S, C>(
-    State(At { server, .. }): State<At<S, C>>,
+    State(At { server, audit, .. }): State<At<S, C>>,
+    headers: HeaderMap,
     body: Result<axum::Json<Registration>, axum::extract::rejection::JsonRejection>,
 ) -> Response
 where
     S: Store + 'static,
     C: Consent + 'static,
 {
+    let source = source_of(&headers);
+    let at = now();
+    if !server.may_register(&source, at) {
+        audit(&format!(
+            "oauth: {source} was slowed: {} registrations in {} seconds",
+            super::REGISTER_LIMIT.0,
+            super::REGISTER_LIMIT.1
+        ));
+        return slowed(
+            super::REGISTER_LIMIT.1,
+            "Too many registrations from where you are; try again later.",
+        );
+    }
     let registration = match body {
         Ok(axum::Json(registration)) => registration,
         Err(rejection) => {
@@ -202,17 +268,39 @@ where
             );
         }
     };
-    let at = now();
     match blocking(server, move |server| server.register(registration, at)).await {
-        Ok(Ok(Ok(client))) => json(StatusCode::CREATED, &Registered::from(client)),
-        Ok(Ok(Err(refusal))) => json(StatusCode::BAD_REQUEST, &refusal),
+        Ok(Ok(Ok(client))) => {
+            let origins: Vec<String> = client
+                .redirect_uris
+                .iter()
+                .map(|uri| redirect_origin(uri))
+                .collect();
+            audit(&format!(
+                "oauth: {source} registered {:?} ({}), sent back to {}",
+                client.name,
+                client.id,
+                origins.join(", ")
+            ));
+            json(StatusCode::CREATED, &Registered::from(client))
+        }
+        Ok(Ok(Err(refusal))) => {
+            audit(&format!(
+                "oauth: {source} was refused a registration: {}",
+                refusal.error_description
+            ));
+            json(StatusCode::BAD_REQUEST, &refusal)
+        }
         Ok(Err(error)) => failed(error),
         Err(response) => *response,
     }
 }
 
 async fn authorize<S, C>(
-    State(At { server, issuer }): State<At<S, C>>,
+    State(At {
+        server,
+        issuer,
+        audit,
+    }): State<At<S, C>>,
     headers: HeaderMap,
     Query(request): Query<AuthorizeRequest>,
 ) -> Response
@@ -224,9 +312,31 @@ where
         Ok(issuer) => issuer,
         Err(response) => return *response,
     };
+    let source = source_of(&headers);
+    let at = now();
+    if !server.may_ask(&source, at) {
+        audit(&format!(
+            "oauth: {source} was slowed: {} asks in {} seconds",
+            super::AUTHORIZE_LIMIT.0,
+            super::AUTHORIZE_LIMIT.1
+        ));
+        let mut response = (
+            StatusCode::TOO_MANY_REQUESTS,
+            Html(page(
+                &issuer,
+                "Too many asks",
+                "Too many asks to connect have come from where you are. Wait a few minutes and start again from where you were.",
+                None,
+            )),
+        )
+            .into_response();
+        if let Ok(value) = super::AUTHORIZE_LIMIT.1.to_string().parse() {
+            response.headers_mut().insert(header::RETRY_AFTER, value);
+        }
+        return response;
+    }
     let wants_json = asks_for_json(&headers);
     let asked_at = issuer.clone();
-    let at = now();
     match blocking(server, move |server| {
         server.authorize(request, &asked_at, at)
     })
@@ -237,10 +347,12 @@ where
             &Asked {
                 ask: ask.id.clone(),
                 client_name: ask.client_name.clone(),
+                origin: redirect_origin(&ask.redirect_uri),
+                scope: ask.scope.clone().unwrap_or_default(),
                 poll: format!("/oauth/ask/{}", ask.id),
             },
         ),
-        Ok(Ok(Ok(ask))) => waiting_page(&issuer, &ask.client_name, &ask.id),
+        Ok(Ok(Ok(ask))) => waiting_page(&issuer, &ask),
         Ok(Ok(Err(Refusal::Redirect(url)))) => Redirect::to(&url).into_response(),
         Ok(Ok(Err(Refusal::Page { status, message }))) => {
             let status = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST);
@@ -269,12 +381,14 @@ fn asks_for_json(headers: &HeaderMap) -> bool {
         })
 }
 
-/// The ask as a client polls it: what to poll and who the person is told
-/// asked.
+/// The ask as a client polls it: what to poll, who the person is told
+/// asked, where it is sent back to, and what it asked for.
 #[derive(Serialize)]
 struct Asked {
     ask: String,
     client_name: String,
+    origin: String,
+    scope: String,
     poll: String,
 }
 
@@ -405,19 +519,42 @@ fn address_of(issuer: &str) -> String {
         .to_string()
 }
 
-/// The waiting page: who wants in, where, and that the answer is given in
-/// Proxy. It polls `ask/<id>` beside itself and follows the redirect that
-/// comes back. The client's name and the ask's id ride on the note as data
-/// attributes, escaped once for HTML, and the script reads them from there,
-/// so the script itself carries nothing a client chose.
-fn waiting_page(issuer: &str, client_name: &str, ask_id: &str) -> Response {
+/// What a scope asks for, in plain words, for the person: `open threads
+/// with your agents..., and run your models`.
+pub fn scope_words(scope: Option<&str>) -> String {
+    let words: Vec<&str> = scope_families(scope)
+        .into_iter()
+        .map(family_words)
+        .collect();
+    match words.as_slice() {
+        [] => "nothing at your address itself".to_string(),
+        [one] => (*one).to_string(),
+        [first @ .., last] => format!("{}, and {last}", first.join(", ")),
+    }
+}
+
+/// The waiting page: who wants in, where it sends the person back to, what
+/// it asks for, and that the answer is given in Proxy. It polls `ask/<id>`
+/// beside itself and follows the redirect that comes back. The client's
+/// name and the ask's id ride on the note as data attributes, escaped once
+/// for HTML, and the script reads them from there, so the script itself
+/// carries nothing a client chose.
+fn waiting_page(issuer: &str, ask: &super::Ask) -> Response {
     let address = escape(&address_of(issuer));
-    let client = escape(client_name);
+    let client = escape(&ask.client_name);
+    let origin = escape(&redirect_origin(&ask.redirect_uri));
+    let asks_for = escape(&scope_words(ask.scope.as_deref()));
     let lede = format!(
-        "<strong>{client}</strong> wants to connect to <strong>{address}</strong>. \
+        "<strong>{client}</strong> wants to connect to <strong>{address}</strong> and be \
+         sent back to <strong>{origin}</strong>. It asks to {asks_for}, for thirty days. \
          Let it in from Proxy on your Mac or phone, or reject it there."
     );
-    let html = page(issuer, "Let it in?", &lede, Some((client_name, ask_id)));
+    let html = page(
+        issuer,
+        "Let it in?",
+        &lede,
+        Some((ask.client_name.as_str(), ask.id.as_str())),
+    );
     cors(
         (
             StatusCode::OK,
@@ -551,7 +688,10 @@ mod tests {
     fn app<C: Consent + 'static>(consent: C) -> (Arc<Server<MemoryStore, C>>, Router) {
         let server = Arc::new(Server::new(MemoryStore::new(), consent));
         let app = Router::new()
-            .nest("/oauth", router(Arc::clone(&server), fixed_issuer(ISSUER)))
+            .nest(
+                "/oauth",
+                router(Arc::clone(&server), fixed_issuer(ISSUER), silent()),
+            )
             .nest("/.well-known", well_known_router(fixed_issuer(ISSUER)));
         (server, app)
     }
@@ -621,6 +761,8 @@ mod tests {
         let ask_id = answer["ask"].as_str().unwrap().to_string();
         assert!(!ask_id.is_empty());
         assert_eq!(answer["client_name"], "Claude");
+        assert_eq!(answer["origin"], "official.proxy.ing");
+        assert_eq!(answer["scope"], "party:p1");
         assert_eq!(answer["poll"], format!("/oauth/ask/{ask_id}"));
         let text = client
             .get(format!("{base}{}", answer["poll"].as_str().unwrap()))
@@ -674,6 +816,7 @@ mod tests {
         let metadata = value(&text);
         assert_eq!(metadata["issuer"], ISSUER);
         assert_eq!(metadata["token_endpoint"], format!("{ISSUER}/oauth/token"));
+        assert_eq!(metadata["scopes_supported"][0], "threads");
         assert_eq!(
             metadata["code_challenge_methods_supported"],
             serde_json::json!(["S256"])
@@ -756,7 +899,7 @@ mod tests {
         };
         let server = Arc::new(Server::new(MemoryStore::new(), Always(Answer::Pending)));
         let app = Router::new()
-            .nest("/oauth", router(server, Arc::clone(&issuer)))
+            .nest("/oauth", router(server, Arc::clone(&issuer), silent()))
             .nest("/.well-known", well_known_router(issuer));
         let base = serve(app).await;
         let client = reqwest::Client::new();
@@ -828,7 +971,9 @@ mod tests {
         let html = response.text().await.unwrap();
         assert!(
             html.contains(
-                "<strong>Claude</strong> wants to connect to <strong>jckwind.proxy.ing</strong>"
+                "<strong>Claude</strong> wants to connect to <strong>jckwind.proxy.ing</strong> \
+                 and be sent back to <strong>this machine</strong>. It asks to open threads \
+                 with your agents and read and post in them, for thirty days."
             ),
             "{html}"
         );
@@ -895,6 +1040,8 @@ mod tests {
         assert_eq!(response.headers()["cache-control"], "no-store");
         let issued = value(&response.text().await.unwrap());
         assert_eq!(issued["token_type"], "Bearer");
+        assert_eq!(issued["scope"], "threads");
+        assert_eq!(issued["expires_in"], crate::oauth::TOKEN_TTL_SECS);
         let bearer = issued["access_token"].as_str().unwrap().to_string();
         assert!(server.admit(&bearer, now()).unwrap().is_some());
 
@@ -1024,5 +1171,108 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), 404);
+    }
+
+    /// One source gets its share of registrations and asks in a window and
+    /// then `429`; another source is not slowed by it. Every registration
+    /// is said to the audit with where it came from and where it sends the
+    /// person back to.
+    #[tokio::test]
+    async fn a_source_gets_its_share_of_registrations_and_asks_and_each_one_is_said() {
+        let said: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let audit: Audit = {
+            let said = Arc::clone(&said);
+            Arc::new(move |line: &str| said.lock().unwrap().push(line.to_string()))
+        };
+        let server = Arc::new(Server::new(MemoryStore::new(), Always(Answer::Pending)));
+        let app = Router::new().nest(
+            "/oauth",
+            router(Arc::clone(&server), fixed_issuer(ISSUER), audit),
+        );
+        let base = serve(app).await;
+        let client = reqwest::Client::new();
+        let redirect = "https://claude.ai/api/mcp/auth_callback";
+        let register_from = |source: &'static str| {
+            let client = client.clone();
+            let base = base.clone();
+            async move {
+                client
+                    .post(format!("{base}/oauth/register"))
+                    .header("content-type", "application/json")
+                    .header("cf-connecting-ip", source)
+                    .body(
+                        serde_json::json!({ "client_name": "Claude", "redirect_uris": [redirect] })
+                            .to_string(),
+                    )
+                    .send()
+                    .await
+                    .unwrap()
+            }
+        };
+        for _ in 0..crate::oauth::REGISTER_LIMIT.0 {
+            assert_eq!(register_from("203.0.113.9").await.status(), 201);
+        }
+        let slowed = register_from("203.0.113.9").await;
+        assert_eq!(slowed.status(), 429);
+        assert_eq!(
+            slowed.headers()["retry-after"],
+            crate::oauth::REGISTER_LIMIT.1.to_string().as_str()
+        );
+        assert_eq!(
+            value(&slowed.text().await.unwrap())["error"],
+            "too_many_requests"
+        );
+        assert_eq!(register_from("203.0.113.10").await.status(), 201);
+        {
+            let said = said.lock().unwrap();
+            let registered = said
+                .iter()
+                .filter(|line| line.contains("203.0.113.9 registered \"Claude\""))
+                .count();
+            assert_eq!(
+                registered as u32,
+                crate::oauth::REGISTER_LIMIT.0,
+                "{said:?}"
+            );
+            assert!(
+                said.iter()
+                    .any(|line| line.contains("sent back to claude.ai")),
+                "{said:?}"
+            );
+            assert!(
+                said.iter()
+                    .any(|line| line.contains("203.0.113.9 was slowed")),
+                "{said:?}"
+            );
+        }
+
+        // Asks: the same share, and the page says to wait.
+        let client_id = register(&client, &base, redirect).await;
+        let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(VERIFIER.as_bytes()));
+        let ask_from = |source: &'static str| {
+            let client = client.clone();
+            let base = base.clone();
+            let client_id = client_id.clone();
+            let challenge = challenge.clone();
+            async move {
+                client
+                    .get(format!(
+                        "{base}/oauth/authorize?response_type=code&client_id={client_id}&redirect_uri={}&code_challenge={challenge}",
+                        utf8_percent_encode(redirect, NON_ALPHANUMERIC)
+                    ))
+                    .header("cf-connecting-ip", source)
+                    .send()
+                    .await
+                    .unwrap()
+            }
+        };
+        for _ in 0..crate::oauth::AUTHORIZE_LIMIT.0 {
+            assert_eq!(ask_from("198.51.100.7").await.status(), 200);
+        }
+        let slowed = ask_from("198.51.100.7").await;
+        assert_eq!(slowed.status(), 429);
+        assert!(slowed.headers().contains_key("retry-after"));
+        assert!(slowed.text().await.unwrap().contains("Too many asks"));
+        assert_eq!(ask_from("198.51.100.8").await.status(), 200);
     }
 }

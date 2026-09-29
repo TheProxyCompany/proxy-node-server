@@ -53,10 +53,17 @@ as an MCP client, an editor or a dashboard, registers itself (RFC 7591), sends
 the person to `/oauth/authorize` with a PKCE challenge, and the person lets it
 in from Proxy on their Mac or phone: one click, nothing to paste. The node
 issues the bearer the client carries from then on, and the person takes it back
-when they like. Two seams are the node's: a `Store` for clients, asks and
-tokens, and a `Consent` that puts the ask in front of the person and reports
-what they said. The routers read the node's address from the node itself, never
-from a request header. Discovery is RFC 8414 and RFC 9728 under `/.well-known`.
+when they like. A bearer opens only the path families its scope names
+(`threads`, `life-map-read`, `life-map-write`, `computer`, `mail`, `messages`,
+`inference`, `moves`; an ask that names none gets `threads`), and it runs out
+after thirty days, when the client asks again and the person sees the ask
+again. There is no refresh token. One source gets its share of registrations
+and asks in a window, then `429`, and every registration is said to the node's
+audit with where it came from. Two seams are the node's: a `Store` for clients,
+asks and tokens, and a `Consent` that puts the ask in front of the person and
+reports what they said. The routers read the node's address from the node
+itself, never from a request header. Discovery is RFC 8414 and RFC 9728 under
+`/.well-known`.
 
 ## Benchmarks
 

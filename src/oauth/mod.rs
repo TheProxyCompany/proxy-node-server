@@ -16,6 +16,16 @@
 //! learns which address let it in. Clients are public, with no client
 //! secret, because holding the code verifier is the proof.
 //!
+//! A token opens what its scope names and nothing more, and it ends. The
+//! scope is a set of path families ([`FAMILIES`]): a client asks for the
+//! families it needs, the person sees them on the ask, and the gate at the
+//! address opens only those. An ask that names none gets [`DEFAULT_SCOPE`],
+//! the narrowest the connect flow needs. A token lasts [`TOKEN_TTL_SECS`];
+//! then the client asks again and the person sees the ask again. There is
+//! no refresh token, on purpose: a refresh token is a second secret that
+//! extends access with nobody in the loop, and the point of the expiry is
+//! that the person is in the loop.
+//!
 //! Two seams are the node's to fill. A [`Store`] keeps clients, asks and
 //! tokens; [`MemoryStore`] is the reference. A [`Consent`] puts an ask in
 //! front of the person and reports what they said. The HTTP routes are in
@@ -45,6 +55,167 @@ pub const ASK_TTL_SECS: u64 = 15 * 60;
 /// A token's `last_used_at` moves at most this often, so admitting a bearer
 /// on every request is a read, not a write.
 pub const TOUCH_EVERY_SECS: u64 = 60;
+/// A token lasts this long from issue: thirty days. After that the client
+/// asks again and the person sees the ask again.
+pub const TOKEN_TTL_SECS: u64 = 30 * 24 * 60 * 60;
+/// One source may register this many clients in a window.
+pub const REGISTER_LIMIT: (u32, u64) = (10, 10 * 60);
+/// One source may open this many asks in a window.
+pub const AUTHORIZE_LIMIT: (u32, u64) = (30, 10 * 60);
+
+/// The path families a token can open at the address, each one word of a
+/// scope. The gate at the address maps every path it guards to one of these
+/// or to nothing.
+pub const FAMILIES: [&str; 8] = [
+    "threads",
+    "life-map-read",
+    "life-map-write",
+    "computer",
+    "mail",
+    "messages",
+    "inference",
+    "moves",
+];
+/// What an ask gets when it names no scope: the client API threads with the
+/// person's agents, which is what a dashboard needs to ask their Proxy a
+/// question, and nothing else.
+pub const DEFAULT_SCOPE: &str = "threads";
+
+/// What a family opens, in plain words, for the ask the person sees.
+pub fn family_words(family: &str) -> &'static str {
+    match family {
+        "threads" => "open threads with your agents and read and post in them",
+        "life-map-read" => "read your Life Map",
+        "life-map-write" => "change your Life Map, and use your Proxy's tools",
+        "computer" => "control your computer and phone",
+        "mail" => "read and send your mail",
+        "messages" => "read and send your messages",
+        "inference" => "run your models",
+        "moves" => "see and resolve your Moves",
+        _ => "",
+    }
+}
+
+/// A scope as the server keeps it: the families it names, in [`FAMILIES`]
+/// order and once each, then any purpose scope such as `party:<id>;...`,
+/// which grants no family and is read by whoever fills the [`Consent`]. A
+/// word that is neither is refused, so a client cannot ask for what the
+/// address does not have. Nothing asked is [`DEFAULT_SCOPE`].
+pub fn normalize_scope(requested: Option<&str>) -> Result<String, String> {
+    let requested = requested.map(str::trim).unwrap_or("");
+    if requested.is_empty() {
+        return Ok(DEFAULT_SCOPE.to_string());
+    }
+    let mut families: Vec<&str> = Vec::new();
+    let mut purposes: Vec<&str> = Vec::new();
+    for word in requested.split_whitespace() {
+        if FAMILIES.contains(&word) {
+            if !families.contains(&word) {
+                families.push(word);
+            }
+        } else if word.contains(':') && !word.starts_with(':') {
+            if !purposes.contains(&word) {
+                purposes.push(word);
+            }
+        } else {
+            return Err(format!(
+                "{word} is not a scope this address has; the scopes are {}",
+                FAMILIES.join(", ")
+            ));
+        }
+    }
+    families.sort_by_key(|family| FAMILIES.iter().position(|known| known == family));
+    Ok(families
+        .into_iter()
+        .chain(purposes)
+        .collect::<Vec<_>>()
+        .join(" "))
+}
+
+/// The families a stored scope names. A token with no scope, from before
+/// scopes were kept, opens the default and nothing more.
+pub fn scope_families(scope: Option<&str>) -> Vec<&'static str> {
+    let scope = scope.map(str::trim).filter(|scope| !scope.is_empty());
+    let words: Vec<&str> = match scope {
+        Some(scope) => scope.split_whitespace().collect(),
+        None => vec![DEFAULT_SCOPE],
+    };
+    FAMILIES
+        .iter()
+        .copied()
+        .filter(|family| words.contains(family))
+        .collect()
+}
+
+/// Whether a stored scope opens `family`.
+pub fn scope_opens(scope: Option<&str>, family: &str) -> bool {
+    scope_families(scope).contains(&family)
+}
+
+/// The origin a redirect sends the person back to, as the ask names it:
+/// the host of an `https` redirect, or `this machine` for the loopback.
+pub fn redirect_origin(redirect_uri: &str) -> String {
+    let rest = redirect_uri
+        .strip_prefix("https://")
+        .or_else(|| redirect_uri.strip_prefix("http://"))
+        .unwrap_or(redirect_uri);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let authority = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    let host = authority
+        .rsplit_once(':')
+        .filter(|(_, port)| port.chars().all(|c| c.is_ascii_digit()))
+        .map_or(authority, |(host, _)| host);
+    if matches!(host, "localhost" | "127.0.0.1" | "[::1]") {
+        "this machine".to_string()
+    } else {
+        host.to_lowercase()
+    }
+}
+
+/// So many events per source per window, in memory: enough to slow a
+/// script that registers clients or opens asks at an address it has no
+/// business at, and honest about being per process and gone with it.
+pub struct Limiter {
+    per: u32,
+    window_secs: u64,
+    windows: Mutex<HashMap<String, (u64, u32)>>,
+}
+
+impl Limiter {
+    /// At most `per` events from one source in any `window_secs`.
+    pub fn new(per: u32, window_secs: u64) -> Self {
+        Self {
+            per,
+            window_secs,
+            windows: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Count one event from `source` at `now`: `true` if it is within the
+    /// limit. Windows that have passed are dropped as sources come and go,
+    /// so the table holds only the sources of the last window.
+    pub fn allow(&self, source: &str, now: u64) -> bool {
+        let Ok(mut windows) = self.windows.lock() else {
+            return false;
+        };
+        if windows.len() >= 4096 {
+            let window_secs = self.window_secs;
+            windows.retain(|_, (started, _)| now.saturating_sub(*started) < window_secs);
+        }
+        let (started, count) = windows.entry(source.to_string()).or_insert((now, 0));
+        if now.saturating_sub(*started) >= self.window_secs {
+            *started = now;
+            *count = 0;
+        }
+        if *count >= self.per {
+            return false;
+        }
+        *count += 1;
+        true
+    }
+}
 
 /// Something registered to connect: what it calls itself, and where it may be
 /// sent back to.
@@ -87,7 +258,8 @@ pub enum Answer {
 }
 
 /// A token a client holds. Only its hash is kept; the token itself is shown
-/// once, at issue.
+/// once, at issue. It opens the families its scope names until
+/// `expires_at`, unless the person takes it back first.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Token {
     pub id: String,
@@ -96,13 +268,31 @@ pub struct Token {
     pub hash: String,
     pub scope: Option<String>,
     pub issued_at: u64,
+    pub expires_at: u64,
     pub last_used_at: Option<u64>,
     pub revoked_at: Option<u64>,
 }
 
 impl Token {
+    /// Not taken back. Whether it has run out is a question of the clock:
+    /// [`Token::is_live_at`].
     pub fn is_live(&self) -> bool {
         self.revoked_at.is_none()
+    }
+
+    /// Not taken back and not run out at `now`.
+    pub fn is_live_at(&self, now: u64) -> bool {
+        self.is_live() && now < self.expires_at
+    }
+
+    /// The families this token opens.
+    pub fn families(&self) -> Vec<&'static str> {
+        scope_families(self.scope.as_deref())
+    }
+
+    /// Whether this token opens `family`.
+    pub fn opens(&self, family: &str) -> bool {
+        scope_opens(self.scope.as_deref(), family)
     }
 }
 
@@ -144,8 +334,9 @@ pub trait Store: Send + Sync {
     fn touch_token(&self, id: &str, used_at: u64) -> Result<(), OAuthError>;
     fn token(&self, id: &str) -> Result<Option<Token>, OAuthError>;
     fn token_by_hash(&self, hash: &str) -> Result<Option<Token>, OAuthError>;
-    /// The tokens still out, oldest first: what Proxy lists as connected.
-    fn live_tokens(&self) -> Result<Vec<Token>, OAuthError>;
+    /// The tokens still out at `now`, neither taken back nor run out,
+    /// oldest first: what Proxy lists as connected.
+    fn live_tokens(&self, now: u64) -> Result<Vec<Token>, OAuthError>;
 }
 
 /// How an ask reaches the person, and how their answer comes back. On a
@@ -269,13 +460,13 @@ impl Store for MemoryStore {
             .cloned())
     }
 
-    fn live_tokens(&self) -> Result<Vec<Token>, OAuthError> {
+    fn live_tokens(&self, now: u64) -> Result<Vec<Token>, OAuthError> {
         let mut tokens: Vec<Token> = self
             .tokens
             .lock()
             .map_err(poisoned)?
             .values()
-            .filter(|token| token.is_live())
+            .filter(|token| token.is_live_at(now))
             .cloned()
             .collect();
         tokens.sort_by(|a, b| a.issued_at.cmp(&b.issued_at).then(a.id.cmp(&b.id)));
@@ -387,13 +578,15 @@ pub struct TokenRequest {
     pub code_verifier: Option<String>,
 }
 
-/// A token, shown once. It does not expire; the person revokes it from Proxy.
+/// A token, shown once, with what it opens and how long it lasts (RFC 6749
+/// §5.1). When it runs out the client asks again; there is no refresh
+/// token. The person can take it back from Proxy before then.
 #[derive(Clone, Debug, Serialize)]
 pub struct Issued {
     pub access_token: String,
     pub token_type: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub scope: Option<String>,
+    pub expires_in: u64,
+    pub scope: String,
 }
 
 /// RFC 6749 §5.2.
@@ -435,14 +628,17 @@ pub struct ServerMetadata {
     pub code_challenge_methods_supported: [&'static str; 1],
     pub token_endpoint_auth_methods_supported: [&'static str; 1],
     pub revocation_endpoint_auth_methods_supported: [&'static str; 1],
+    pub scopes_supported: [&'static str; 8],
 }
 
-/// RFC 9728: the resource names the server that guards it, which is itself.
+/// RFC 9728: the resource names the server that guards it, which is itself,
+/// and the scopes a client can ask for.
 #[derive(Clone, Debug, Serialize)]
 pub struct ResourceMetadata {
     pub resource: String,
     pub authorization_servers: [String; 1],
     pub bearer_methods_supported: [&'static str; 1],
+    pub scopes_supported: [&'static str; 8],
 }
 
 pub fn server_metadata(issuer: &str) -> ServerMetadata {
@@ -458,6 +654,7 @@ pub fn server_metadata(issuer: &str) -> ServerMetadata {
         code_challenge_methods_supported: ["S256"],
         token_endpoint_auth_methods_supported: ["none"],
         revocation_endpoint_auth_methods_supported: ["none"],
+        scopes_supported: FAMILIES,
     }
 }
 
@@ -467,14 +664,31 @@ pub fn resource_metadata(issuer: &str) -> ResourceMetadata {
         resource: issuer.clone(),
         authorization_servers: [issuer],
         bearer_methods_supported: ["header"],
+        scopes_supported: FAMILIES,
     }
 }
 
 /// The `WWW-Authenticate` value a 401 carries so a client finds its way to
-/// `/oauth/authorize` (RFC 9728 §5.1).
-pub fn www_authenticate(issuer: &str) -> String {
+/// `/oauth/authorize` (RFC 9728 §5.1). With `scope`, the family the path
+/// asked for needs (RFC 6750 §3), so a client asks for that and no more.
+pub fn www_authenticate(issuer: &str, scope: Option<&str>) -> String {
     let issuer = issuer.trim_end_matches('/');
-    format!("Bearer resource_metadata=\"{issuer}/.well-known/oauth-protected-resource\"")
+    let mut value =
+        format!("Bearer resource_metadata=\"{issuer}/.well-known/oauth-protected-resource\"");
+    if let Some(scope) = scope.filter(|scope| !scope.is_empty()) {
+        value.push_str(&format!(", scope=\"{scope}\""));
+    }
+    value
+}
+
+/// The `WWW-Authenticate` value a 403 carries when the bearer is real but
+/// its scope does not open the family asked for (RFC 6750 §3.1).
+pub fn insufficient_scope(issuer: &str, scope: &str) -> String {
+    let issuer = issuer.trim_end_matches('/');
+    format!(
+        "Bearer error=\"insufficient_scope\", scope=\"{scope}\", \
+         resource_metadata=\"{issuer}/.well-known/oauth-protected-resource\""
+    )
 }
 
 // --- The server ---
@@ -485,11 +699,18 @@ pub fn www_authenticate(issuer: &str) -> String {
 pub struct Server<S: Store, C: Consent> {
     store: S,
     consent: C,
+    registers: Limiter,
+    asks: Limiter,
 }
 
 impl<S: Store, C: Consent> Server<S, C> {
     pub fn new(store: S, consent: C) -> Self {
-        Self { store, consent }
+        Self {
+            store,
+            consent,
+            registers: Limiter::new(REGISTER_LIMIT.0, REGISTER_LIMIT.1),
+            asks: Limiter::new(AUTHORIZE_LIMIT.0, AUTHORIZE_LIMIT.1),
+        }
     }
 
     pub fn store(&self) -> &S {
@@ -498,6 +719,18 @@ impl<S: Store, C: Consent> Server<S, C> {
 
     pub fn consent(&self) -> &C {
         &self.consent
+    }
+
+    /// Count a registration from `source` at `now`: `false` when that
+    /// source has registered [`REGISTER_LIMIT`] clients in the window.
+    pub fn may_register(&self, source: &str, now: u64) -> bool {
+        self.registers.allow(source, now)
+    }
+
+    /// Count an ask from `source` at `now`: `false` when that source has
+    /// opened [`AUTHORIZE_LIMIT`] asks in the window.
+    pub fn may_ask(&self, source: &str, now: u64) -> bool {
+        self.asks.allow(source, now)
     }
 
     /// RFC 7591. A client needs a name the person will recognise and at
@@ -635,16 +868,17 @@ impl<S: Store, C: Consent> Server<S, C> {
                 "PKCE is required: send a code_challenge of 43 to 128 unreserved characters.",
             );
         };
+        let scope = match normalize_scope(request.scope.as_deref()) {
+            Ok(scope) => scope,
+            Err(why) => return refuse("invalid_scope", &why),
+        };
         let ask = Ask {
             id: random_hex(16),
             client_id: client.id,
             client_name: client.name,
             issuer: issuer.to_string(),
             redirect_uri: redirect_uri.to_string(),
-            scope: request
-                .scope
-                .map(|scope| scope.trim().to_string())
-                .filter(|scope| !scope.is_empty()),
+            scope: Some(scope),
             state: request.state.filter(|state| !state.is_empty()),
             code_challenge: code_challenge.to_string(),
             asked_at: now,
@@ -772,13 +1006,15 @@ impl<S: Store, C: Consent> Server<S, C> {
             )));
         }
         let secret = random_hex(32);
+        let scope = ask.scope.unwrap_or_else(|| DEFAULT_SCOPE.to_string());
         let token = Token {
             id: random_hex(16),
             client_id: ask.client_id,
             client_name: ask.client_name,
             hash: hash_token(&secret),
-            scope: ask.scope.clone(),
+            scope: Some(scope.clone()),
             issued_at: now,
+            expires_at: now + TOKEN_TTL_SECS,
             last_used_at: None,
             revoked_at: None,
         };
@@ -786,7 +1022,8 @@ impl<S: Store, C: Consent> Server<S, C> {
         Ok(Ok(Issued {
             access_token: secret,
             token_type: "Bearer",
-            scope: ask.scope,
+            expires_in: TOKEN_TTL_SECS,
+            scope,
         }))
     }
 
@@ -798,11 +1035,11 @@ impl<S: Store, C: Consent> Server<S, C> {
         Ok(())
     }
 
-    /// The token behind a bearer, if it is one this server issued and still
-    /// live. Marks it used, at most once a minute, through
-    /// [`Store::touch_token`]: only `last_used_at` is written, never the row
-    /// this request read, so a revoke that lands while the request is in
-    /// flight stays a revoke.
+    /// The token behind a bearer, if it is one this server issued, not taken
+    /// back and not run out at `now`. Marks it used, at most once a minute,
+    /// through [`Store::touch_token`]: only `last_used_at` is written, never
+    /// the row this request read, so a revoke that lands while the request
+    /// is in flight stays a revoke.
     pub fn admit(&self, bearer: &str, now: u64) -> Result<Option<Token>, OAuthError> {
         let bearer = bearer.trim();
         if bearer.is_empty() {
@@ -811,7 +1048,7 @@ impl<S: Store, C: Consent> Server<S, C> {
         let Some(mut token) = self.store.token_by_hash(&hash_token(bearer))? else {
             return Ok(None);
         };
-        if !token.is_live() {
+        if !token.is_live_at(now) {
             return Ok(None);
         }
         if token
@@ -1196,7 +1433,7 @@ mod tests {
             .unwrap();
         assert_eq!(token.client_name, "Claude");
         assert_eq!(token.last_used_at, Some(NOW + 20));
-        assert_eq!(server.store().live_tokens().unwrap().len(), 1);
+        assert_eq!(server.store().live_tokens(NOW).unwrap().len(), 1);
     }
 
     /// The person lets the client in, and the code on the redirect.
@@ -1287,7 +1524,7 @@ mod tests {
                 .filter_map(|outcome| outcome.as_ref().err())
                 .all(|refusal| refusal.error == "invalid_grant")
         );
-        assert_eq!(server.store().live_tokens().unwrap().len(), 1);
+        assert_eq!(server.store().live_tokens(NOW).unwrap().len(), 1);
     }
 
     /// The waiting page and, on the deep-link path, the client both poll the
@@ -1376,7 +1613,7 @@ mod tests {
 
         server.revoke(&issued.access_token, NOW + 100).unwrap();
         assert_eq!(server.admit(&issued.access_token, NOW + 101).unwrap(), None);
-        assert!(server.store().live_tokens().unwrap().is_empty());
+        assert!(server.store().live_tokens(NOW).unwrap().is_empty());
         assert_eq!(
             server.store().token(&token.id).unwrap().unwrap().revoked_at,
             Some(NOW + 100)
@@ -1424,7 +1661,7 @@ mod tests {
         assert!(server.store().put_token(&stale).is_err());
 
         assert_eq!(server.admit(&issued.access_token, NOW + 12).unwrap(), None);
-        assert!(server.store().live_tokens().unwrap().is_empty());
+        assert!(server.store().live_tokens(NOW).unwrap().is_empty());
         let held = server.store().token(&in_flight.id).unwrap().unwrap();
         assert_eq!(held.revoked_at, Some(NOW + 10));
         assert_eq!(held.last_used_at, None, "a revoked token is not touched");
@@ -1455,9 +1692,19 @@ mod tests {
             ["https://jckwind.proxy.ing".to_string()]
         );
         assert_eq!(
-            www_authenticate("https://jckwind.proxy.ing"),
+            www_authenticate("https://jckwind.proxy.ing", None),
             "Bearer resource_metadata=\"https://jckwind.proxy.ing/.well-known/oauth-protected-resource\""
         );
+        assert_eq!(
+            www_authenticate("https://jckwind.proxy.ing/", Some("inference")),
+            "Bearer resource_metadata=\"https://jckwind.proxy.ing/.well-known/oauth-protected-resource\", scope=\"inference\""
+        );
+        assert_eq!(
+            insufficient_scope("https://jckwind.proxy.ing", "mail"),
+            "Bearer error=\"insufficient_scope\", scope=\"mail\", resource_metadata=\"https://jckwind.proxy.ing/.well-known/oauth-protected-resource\""
+        );
+        assert_eq!(metadata.scopes_supported, FAMILIES);
+        assert_eq!(resource.scopes_supported, FAMILIES);
     }
 
     #[test]
@@ -1476,5 +1723,190 @@ mod tests {
             ),
             "http://localhost:1/cb?error=access_denied&state=a%26b"
         );
+    }
+
+    /// A scope is the families it names, once each and in one order, plus a
+    /// purpose scope the node's owner reads. A word the address does not
+    /// have is refused on the client's redirect as `invalid_scope`, and an
+    /// ask that names nothing gets the default, the threads.
+    #[test]
+    fn a_scope_is_the_families_it_names_and_nothing_asked_is_the_default() {
+        assert_eq!(normalize_scope(None).unwrap(), "threads");
+        assert_eq!(normalize_scope(Some("  ")).unwrap(), "threads");
+        assert_eq!(
+            normalize_scope(Some("inference threads inference")).unwrap(),
+            "threads inference"
+        );
+        assert_eq!(
+            normalize_scope(Some("party:p1;title=x;host=a.proxy.ing moves")).unwrap(),
+            "moves party:p1;title=x;host=a.proxy.ing"
+        );
+        let refused = normalize_scope(Some("threads mcp")).unwrap_err();
+        assert!(
+            refused.starts_with("mcp is not a scope this address has"),
+            "{refused}"
+        );
+        assert!(normalize_scope(Some(":x")).is_err());
+        assert_eq!(scope_families(None), vec!["threads"]);
+        assert_eq!(scope_families(Some("")), vec!["threads"]);
+        assert_eq!(scope_families(Some("party:p1")), Vec::<&str>::new());
+        assert_eq!(
+            scope_families(Some("mail life-map-read")),
+            vec!["life-map-read", "mail"]
+        );
+        assert!(scope_opens(Some("mail life-map-read"), "mail"));
+        assert!(!scope_opens(Some("mail life-map-read"), "life-map-write"));
+        for family in FAMILIES {
+            assert!(!family_words(family).is_empty(), "{family} has no words");
+        }
+
+        let server = server(Answer::Approved);
+        let client = registered(&server);
+        let refused = server
+            .authorize(
+                AuthorizeRequest {
+                    response_type: Some("code".to_string()),
+                    client_id: Some(client.id.clone()),
+                    redirect_uri: Some(client.redirect_uris[0].clone()),
+                    scope: Some("everything".to_string()),
+                    state: Some("s".to_string()),
+                    code_challenge: Some(challenge_of(VERIFIER)),
+                    code_challenge_method: Some("S256".to_string()),
+                },
+                ISSUER,
+                NOW,
+            )
+            .unwrap()
+            .unwrap_err();
+        let Refusal::Redirect(url) = refused else {
+            panic!("{refused:?}")
+        };
+        assert!(url.contains("error=invalid_scope"), "{url}");
+        assert!(url.contains("&state=s&iss="), "{url}");
+        let ask = asked(&server, &client);
+        assert_eq!(ask.scope.as_deref(), Some("threads"));
+    }
+
+    /// A token opens what its scope names, for thirty days. Then it is not
+    /// admitted and not listed, and the client asks again: there is no
+    /// refresh token, so the person sees the ask again.
+    #[test]
+    fn a_token_opens_its_scope_for_thirty_days_and_then_the_client_asks_again() {
+        let server = server(Answer::Approved);
+        let client = registered(&server);
+        let ask = server
+            .authorize(
+                AuthorizeRequest {
+                    response_type: Some("code".to_string()),
+                    client_id: Some(client.id.clone()),
+                    redirect_uri: Some(client.redirect_uris[0].clone()),
+                    scope: Some("inference threads".to_string()),
+                    state: None,
+                    code_challenge: Some(challenge_of(VERIFIER)),
+                    code_challenge_method: Some("S256".to_string()),
+                },
+                ISSUER,
+                NOW,
+            )
+            .unwrap()
+            .unwrap();
+        let Progress::Redirect(redirect) = server.progress(&ask.id, NOW).unwrap() else {
+            panic!()
+        };
+        let issued = redeem(&server, &client, &code_in(&redirect), VERIFIER, NOW).unwrap();
+        assert_eq!(issued.scope, "threads inference");
+        assert_eq!(issued.expires_in, TOKEN_TTL_SECS);
+        assert_eq!(TOKEN_TTL_SECS, 30 * 24 * 60 * 60);
+
+        let token = server
+            .admit(&issued.access_token, NOW + 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(token.expires_at, NOW + TOKEN_TTL_SECS);
+        assert_eq!(token.families(), vec!["threads", "inference"]);
+        assert!(token.opens("inference"));
+        assert!(!token.opens("mail"));
+        assert!(
+            server
+                .admit(&issued.access_token, NOW + TOKEN_TTL_SECS - 1)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            server
+                .store()
+                .live_tokens(NOW + TOKEN_TTL_SECS - 1)
+                .unwrap()
+                .len(),
+            1
+        );
+        // Run out: not admitted, not listed, and never touched again.
+        assert_eq!(
+            server
+                .admit(&issued.access_token, NOW + TOKEN_TTL_SECS)
+                .unwrap(),
+            None
+        );
+        assert!(
+            server
+                .store()
+                .live_tokens(NOW + TOKEN_TTL_SECS)
+                .unwrap()
+                .is_empty()
+        );
+        let held = server.store().token(&token.id).unwrap().unwrap();
+        assert!(held.is_live(), "run out is not taken back");
+        assert!(!held.is_live_at(NOW + TOKEN_TTL_SECS));
+        assert_eq!(held.last_used_at, Some(NOW + TOKEN_TTL_SECS - 1));
+    }
+
+    /// One source gets its share of registrations and asks in a window and
+    /// no more; another source is not slowed by it; the window passes.
+    #[test]
+    fn a_source_is_slowed_after_its_share_of_registrations_and_asks() {
+        let server = server(Answer::Pending);
+        for _ in 0..REGISTER_LIMIT.0 {
+            assert!(server.may_register("203.0.113.9", NOW));
+        }
+        assert!(!server.may_register("203.0.113.9", NOW + 1));
+        assert!(server.may_register("203.0.113.10", NOW + 1));
+        assert!(server.may_register("203.0.113.9", NOW + REGISTER_LIMIT.1));
+        for _ in 0..AUTHORIZE_LIMIT.0 {
+            assert!(server.may_ask("203.0.113.9", NOW));
+        }
+        assert!(!server.may_ask("203.0.113.9", NOW + 1));
+        assert!(server.may_ask("loopback", NOW + 1));
+
+        // The table is bounded: sources whose window passed are dropped
+        // once it fills, and a source is never refused for someone else.
+        let limiter = Limiter::new(1, 10);
+        for source in 0..4096 {
+            assert!(limiter.allow(&source.to_string(), NOW));
+        }
+        assert!(!limiter.allow("0", NOW + 5));
+        assert!(limiter.allow("new", NOW + 20));
+        assert_eq!(limiter.windows.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn the_origin_of_a_redirect_is_its_host_or_this_machine() {
+        assert_eq!(
+            redirect_origin("https://claude.ai/api/mcp/auth_callback"),
+            "claude.ai"
+        );
+        assert_eq!(
+            redirect_origin("https://Dashboard.TheProxyCompany.com:8443/api/proxy/callback?x=1"),
+            "dashboard.theproxycompany.com"
+        );
+        assert_eq!(
+            redirect_origin("https://user@evil.example/cb"),
+            "evil.example"
+        );
+        assert_eq!(
+            redirect_origin("http://localhost:4242/callback"),
+            "this machine"
+        );
+        assert_eq!(redirect_origin("http://127.0.0.1/cb"), "this machine");
+        assert_eq!(redirect_origin("http://[::1]:5/cb"), "this machine");
     }
 }
