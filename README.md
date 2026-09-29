@@ -55,8 +55,8 @@ in from Proxy on their Mac or phone: one click, nothing to paste. The node
 issues the bearer the client carries from then on, and the person takes it back
 when they like. Two seams are the node's: a `Store` for clients, asks and
 tokens, and a `Consent` that puts the ask in front of the person and reports
-what they said. The routers are given the node's address as a value; no request
-header names it. Discovery is RFC 8414 and RFC 9728 under `/.well-known`.
+what they said. The routers read the node's address from the node itself, never
+from a request header. Discovery is RFC 8414 and RFC 9728 under `/.well-known`.
 
 ## Benchmarks
 
