@@ -24,7 +24,11 @@
 //! then the client asks again and the person sees the ask again. There is
 //! no refresh token, on purpose: a refresh token is a second secret that
 //! extends access with nobody in the loop, and the point of the expiry is
-//! that the person is in the loop.
+//! that the person is in the loop. A purpose token, one that names a
+//! purpose such as `party:<id>;...` and no family, has no clock
+//! ([`NO_EXPIRY`]): it opens one party thread, the person sees it under
+//! proxy.ing and removes it when they like, and a standing party does not
+//! end in silence on day thirty.
 //!
 //! Two seams are the node's to fill. A [`Store`] keeps clients, asks and
 //! tokens; [`MemoryStore`] is the reference. A [`Consent`] puts an ask in
@@ -58,6 +62,12 @@ pub const TOUCH_EVERY_SECS: u64 = 60;
 /// A token lasts this long from issue: thirty days. After that the client
 /// asks again and the person sees the ask again.
 pub const TOKEN_TTL_SECS: u64 = 30 * 24 * 60 * 60;
+/// The `expires_at` of a token that does not run out on the clock: a
+/// purpose token ([`scope_is_purpose_only`]), which opens one party thread
+/// and nothing else, and ends when the person removes the connection or
+/// the host takes the seat out of the party. It is kept as a time so every
+/// store holds it in the one column; it is the largest time a store can.
+pub const NO_EXPIRY: u64 = i64::MAX as u64;
 /// One source may register this many clients in a window.
 pub const REGISTER_LIMIT: (u32, u64) = (10, 10 * 60);
 /// One source may open this many asks in a window.
@@ -150,6 +160,26 @@ pub fn scope_families(scope: Option<&str>) -> Vec<&'static str> {
 /// Whether a stored scope opens `family`.
 pub fn scope_opens(scope: Option<&str>, family: &str) -> bool {
     scope_families(scope).contains(&family)
+}
+
+/// Whether a scope names a purpose (`party:<id>;...`) and no family: a
+/// token for one thing, such as a seat in one party, that opens nothing
+/// the families open. Such a token has no clock ([`NO_EXPIRY`]). A scope
+/// that names a family beside a purpose is an ordinary token and runs out.
+pub fn scope_is_purpose_only(scope: &str) -> bool {
+    let mut words = scope.split_whitespace().peekable();
+    words.peek().is_some()
+        && words
+            .all(|word| !FAMILIES.contains(&word) && word.contains(':') && !word.starts_with(':'))
+}
+
+/// When a token issued at `now` for `scope` runs out.
+pub fn expires_at_for(scope: &str, now: u64) -> u64 {
+    if scope_is_purpose_only(scope) {
+        NO_EXPIRY
+    } else {
+        now + TOKEN_TTL_SECS
+    }
 }
 
 /// The origin a redirect sends the person back to, as the ask names it:
@@ -283,6 +313,12 @@ impl Token {
     /// Not taken back and not run out at `now`.
     pub fn is_live_at(&self, now: u64) -> bool {
         self.is_live() && now < self.expires_at
+    }
+
+    /// Whether this token runs out on the clock at all. A purpose token
+    /// does not; see [`NO_EXPIRY`].
+    pub fn runs_out(&self) -> bool {
+        self.expires_at != NO_EXPIRY
     }
 
     /// The families this token opens.
@@ -579,12 +615,14 @@ pub struct TokenRequest {
 
 /// A token, shown once, with what it opens and how long it lasts (RFC 6749
 /// §5.1). When it runs out the client asks again; there is no refresh
-/// token. The person can take it back from Proxy before then.
+/// token. The person can take it back from Proxy before then. A purpose
+/// token does not run out on the clock and says no `expires_in`.
 #[derive(Clone, Debug, Serialize)]
 pub struct Issued {
     pub access_token: String,
     pub token_type: &'static str,
-    pub expires_in: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_in: Option<u64>,
     pub scope: String,
 }
 
@@ -1013,7 +1051,7 @@ impl<S: Store, C: Consent> Server<S, C> {
             hash: hash_token(&secret),
             scope: Some(scope.clone()),
             issued_at: now,
-            expires_at: now + TOKEN_TTL_SECS,
+            expires_at: expires_at_for(&scope, now),
             last_used_at: None,
             revoked_at: None,
         };
@@ -1021,7 +1059,7 @@ impl<S: Store, C: Consent> Server<S, C> {
         Ok(Ok(Issued {
             access_token: secret,
             token_type: "Bearer",
-            expires_in: TOKEN_TTL_SECS,
+            expires_in: token.runs_out().then_some(TOKEN_TTL_SECS),
             scope,
         }))
     }
@@ -1209,6 +1247,74 @@ mod tests {
             )
             .unwrap()
             .unwrap()
+    }
+
+    /// A purpose token opens one party thread and ends when the person or
+    /// the host ends it, never on the clock: a standing party does not end
+    /// in silence on day thirty. A purpose beside a family is an ordinary
+    /// token and runs out.
+    #[test]
+    fn a_purpose_token_has_no_clock() {
+        assert!(scope_is_purpose_only("party:p1;title=x;host=a.proxy.ing"));
+        assert!(!scope_is_purpose_only(
+            "party:p1;title=x;host=a.proxy.ing threads"
+        ));
+        assert!(!scope_is_purpose_only("threads"));
+        assert!(!scope_is_purpose_only(""));
+        assert_eq!(expires_at_for("party:p1", NOW), NO_EXPIRY);
+        assert_eq!(
+            expires_at_for("threads party:p1", NOW),
+            NOW + TOKEN_TTL_SECS
+        );
+        assert_eq!(expires_at_for("threads", NOW), NOW + TOKEN_TTL_SECS);
+
+        let server = server(Answer::Approved);
+        let client = registered(&server);
+        let ask = server
+            .authorize(
+                AuthorizeRequest {
+                    response_type: Some("code".to_string()),
+                    client_id: Some(client.id.clone()),
+                    redirect_uri: Some(client.redirect_uris[0].clone()),
+                    scope: Some("party:p1;title=x;host=a.proxy.ing".to_string()),
+                    state: None,
+                    code_challenge: Some(challenge_of(VERIFIER)),
+                    code_challenge_method: Some("S256".to_string()),
+                },
+                ISSUER,
+                NOW,
+            )
+            .unwrap()
+            .unwrap();
+        let Progress::Redirect(redirect) = server.progress(&ask.id, NOW).unwrap() else {
+            panic!()
+        };
+        let issued = redeem(&server, &client, &code_in(&redirect), VERIFIER, NOW).unwrap();
+        assert_eq!(issued.scope, "party:p1;title=x;host=a.proxy.ing");
+        assert_eq!(issued.expires_in, None);
+        assert!(
+            !serde_json::to_string(&issued)
+                .unwrap()
+                .contains("expires_in")
+        );
+
+        let day_31 = NOW + TOKEN_TTL_SECS + 24 * 60 * 60;
+        let token = server.admit(&issued.access_token, day_31).unwrap().unwrap();
+        assert!(!token.runs_out());
+        assert_eq!(token.expires_at, NO_EXPIRY);
+        assert!(token.is_live_at(day_31 * 10));
+        assert_eq!(token.families(), Vec::<&str>::new());
+        assert_eq!(server.store().live_tokens(day_31).unwrap().len(), 1);
+
+        // The person takes it back, and it is gone the same as any token.
+        server.revoke(&issued.access_token, day_31).unwrap();
+        assert!(
+            server
+                .admit(&issued.access_token, day_31 + 1)
+                .unwrap()
+                .is_none()
+        );
+        assert!(server.store().live_tokens(day_31 + 1).unwrap().is_empty());
     }
 
     fn code_in(redirect: &str) -> String {
@@ -1809,7 +1915,7 @@ mod tests {
         };
         let issued = redeem(&server, &client, &code_in(&redirect), VERIFIER, NOW).unwrap();
         assert_eq!(issued.scope, "threads inference");
-        assert_eq!(issued.expires_in, TOKEN_TTL_SECS);
+        assert_eq!(issued.expires_in, Some(TOKEN_TTL_SECS));
         assert_eq!(TOKEN_TTL_SECS, 30 * 24 * 60 * 60);
 
         let token = server

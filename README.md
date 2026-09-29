@@ -57,7 +57,10 @@ when they like. A bearer opens only the path families its scope names
 (`threads`, `life-map-read`, `life-map-write`, `computer`, `mail`, `messages`,
 `inference`, `moves`; an ask that names none gets `threads`), and it runs out
 after thirty days, when the client asks again and the person sees the ask
-again. There is no refresh token. One source gets its share of registrations
+again. There is no refresh token. A purpose token, one whose scope names a
+purpose such as `party:<id>;...` and no family, has no clock: it opens one
+party thread, and it ends when the person removes it or the host takes the
+seat out. One source gets its share of registrations
 and asks in a window, then `429`, and every registration is said to the node's
 audit with where it came from. Two seams are the node's: a `Store` for clients,
 asks and tokens, and a `Consent` that puts the ask in front of the person and
