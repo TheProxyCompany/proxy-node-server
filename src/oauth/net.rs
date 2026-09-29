@@ -1,7 +1,9 @@
 //! The OAuth routes (feature `pull-http`): what a client and the person's
 //! browser reach at the address. Two routers, mounted by the node where its
 //! address delivers them: [`router`] under `/oauth`, and
-//! [`well_known_router`] under `/.well-known`.
+//! [`well_known_router`] under `/.well-known`. Both are given the address
+//! as a value, `https://<name>.proxy.ing`, which the node knows from its own
+//! configuration; no request header says where the node is.
 //!
 //! Every answer here is public by design: registration, the waiting page,
 //! the token exchange. What they guard is elsewhere — the bearer gate on the
@@ -31,35 +33,25 @@ pub fn now() -> u64 {
         .unwrap_or(0)
 }
 
-/// The issuer a request was made to: `https://<host>`, or `http://` when the
-/// host is the loopback (a node reached directly, in development or tests).
-/// The address is what the tunnel preserves in `Host`.
-pub fn issuer_of(headers: &HeaderMap) -> String {
-    let host = headers
-        .get("x-forwarded-host")
-        .or_else(|| headers.get(header::HOST))
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|host| !host.is_empty())
-        .unwrap_or("localhost");
-    let bare = host.rsplit_once(':').map_or(host, |(name, port)| {
-        if port.chars().all(|c| c.is_ascii_digit()) {
-            name
-        } else {
-            host
+/// The server behind the routes, and the address it answers at.
+struct At<S: Store, C: Consent> {
+    server: Arc<Server<S, C>>,
+    issuer: Arc<str>,
+}
+
+impl<S: Store, C: Consent> Clone for At<S, C> {
+    fn clone(&self) -> Self {
+        Self {
+            server: Arc::clone(&self.server),
+            issuer: Arc::clone(&self.issuer),
         }
-    });
-    let scheme = if matches!(bare, "localhost" | "127.0.0.1" | "[::1]") {
-        "http"
-    } else {
-        "https"
-    };
-    format!("{scheme}://{host}")
+    }
 }
 
 /// `/register`, `/authorize`, `/ask/{id}`, `/token`, `/revoke`: mount under
-/// `/oauth`.
-pub fn router<S, C>(server: Arc<Server<S, C>>) -> Router
+/// `/oauth`. `issuer` is the node's address, `https://<name>.proxy.ing`, or
+/// `http://127.0.0.1:<port>` for a node reached directly.
+pub fn router<S, C>(server: Arc<Server<S, C>>, issuer: &str) -> Router
 where
     S: Store + 'static,
     C: Consent + 'static,
@@ -70,12 +62,15 @@ where
         .route("/ask/{id}", get(ask::<S, C>))
         .route("/token", post(token::<S, C>).options(preflight))
         .route("/revoke", post(revoke::<S, C>).options(preflight))
-        .with_state(server)
+        .with_state(At {
+            server,
+            issuer: Arc::from(issuer.trim_end_matches('/')),
+        })
 }
 
 /// `/oauth-authorization-server` and `/oauth-protected-resource`: mount
-/// under `/.well-known`. Both are built from the host the request came to.
-pub fn well_known_router() -> Router {
+/// under `/.well-known`. Both name `issuer`, the node's address.
+pub fn well_known_router(issuer: &str) -> Router {
     Router::new()
         .route(
             "/oauth-authorization-server",
@@ -89,6 +84,7 @@ pub fn well_known_router() -> Router {
             "/oauth-protected-resource/{*rest}",
             get(protected_resource_metadata).options(preflight),
         )
+        .with_state(Arc::<str>::from(issuer.trim_end_matches('/')))
 }
 
 fn cors(mut response: Response) -> Response {
@@ -129,12 +125,12 @@ async fn preflight() -> Response {
     cors(StatusCode::NO_CONTENT.into_response())
 }
 
-async fn authorization_server_metadata(headers: HeaderMap) -> Response {
-    json(StatusCode::OK, &server_metadata(&issuer_of(&headers)))
+async fn authorization_server_metadata(State(issuer): State<Arc<str>>) -> Response {
+    json(StatusCode::OK, &server_metadata(&issuer))
 }
 
-async fn protected_resource_metadata(headers: HeaderMap) -> Response {
-    json(StatusCode::OK, &resource_metadata(&issuer_of(&headers)))
+async fn protected_resource_metadata(State(issuer): State<Arc<str>>) -> Response {
+    json(StatusCode::OK, &resource_metadata(&issuer))
 }
 
 /// A store or consent failure is the node's, not the client's.
@@ -168,7 +164,7 @@ where
 }
 
 async fn register<S, C>(
-    State(server): State<Arc<Server<S, C>>>,
+    State(At { server, .. }): State<At<S, C>>,
     body: Result<axum::Json<Registration>, axum::extract::rejection::JsonRejection>,
 ) -> Response
 where
@@ -194,7 +190,7 @@ where
 }
 
 async fn authorize<S, C>(
-    State(server): State<Arc<Server<S, C>>>,
+    State(At { server, issuer }): State<At<S, C>>,
     headers: HeaderMap,
     Query(request): Query<AuthorizeRequest>,
 ) -> Response
@@ -202,9 +198,8 @@ where
     S: Store + 'static,
     C: Consent + 'static,
 {
-    let issuer = issuer_of(&headers);
     let wants_json = asks_for_json(&headers);
-    let asked_at = issuer.clone();
+    let asked_at = Arc::clone(&issuer);
     let at = now();
     match blocking(server, move |server| {
         server.authorize(request, &asked_at, at)
@@ -264,7 +259,7 @@ struct AskProgress {
     redirect: Option<String>,
 }
 
-async fn ask<S, C>(State(server): State<Arc<Server<S, C>>>, Path(id): Path<String>) -> Response
+async fn ask<S, C>(State(At { server, .. }): State<At<S, C>>, Path(id): Path<String>) -> Response
 where
     S: Store + 'static,
     C: Consent + 'static,
@@ -305,7 +300,7 @@ where
 }
 
 async fn token<S, C>(
-    State(server): State<Arc<Server<S, C>>>,
+    State(At { server, .. }): State<At<S, C>>,
     body: Result<Form<TokenRequest>, axum::extract::rejection::FormRejection>,
 ) -> Response
 where
@@ -339,7 +334,7 @@ struct Revocation {
 }
 
 async fn revoke<S, C>(
-    State(server): State<Arc<Server<S, C>>>,
+    State(At { server, .. }): State<At<S, C>>,
     body: Result<Form<Revocation>, axum::extract::rejection::FormRejection>,
 ) -> Response
 where
@@ -485,6 +480,7 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     const VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+    const ISSUER: &str = "https://jckwind.proxy.ing";
 
     /// A consent the test answers when it likes.
     struct Held(Mutex<Answer>);
@@ -511,8 +507,8 @@ mod tests {
     fn app<C: Consent + 'static>(consent: C) -> (Arc<Server<MemoryStore, C>>, Router) {
         let server = Arc::new(Server::new(MemoryStore::new(), consent));
         let app = Router::new()
-            .nest("/oauth", router(Arc::clone(&server)))
-            .nest("/.well-known", well_known_router());
+            .nest("/oauth", router(Arc::clone(&server), ISSUER))
+            .nest("/.well-known", well_known_router(ISSUER));
         (server, app)
     }
 
@@ -561,7 +557,6 @@ mod tests {
                 "{base}/oauth/authorize?response_type=code&client_id={client_id}&redirect_uri={}&state=s1&code_challenge={challenge}&code_challenge_method=S256&scope=party%3Ap1",
                 utf8_percent_encode(redirect, NON_ALPHANUMERIC)
             ))
-            .header("host", "jckwind.proxy.ing")
             .header("accept", "application/json; q=0.9, text/html")
             .send()
             .await
@@ -601,14 +596,22 @@ mod tests {
         );
     }
 
+    /// The address is the node's, given to the routers as a value. A
+    /// request that says otherwise in `Host` or `X-Forwarded-Host`, which
+    /// any client can send, changes nothing: the metadata, the waiting page
+    /// and the `iss` on the redirect all name the node's address.
     #[tokio::test]
-    async fn the_metadata_names_the_host_the_request_came_to() {
+    async fn the_address_is_the_nodes_whatever_the_headers_say() {
         let (_, app) = app(Always(Answer::Pending));
         let base = serve(app).await;
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
         let text = client
             .get(format!("{base}/.well-known/oauth-authorization-server"))
-            .header("host", "jckwind.proxy.ing")
+            .header("host", "evil.example")
+            .header("x-forwarded-host", "evil.example")
             .send()
             .await
             .unwrap()
@@ -616,22 +619,19 @@ mod tests {
             .await
             .unwrap();
         let metadata = value(&text);
-        assert_eq!(metadata["issuer"], "https://jckwind.proxy.ing");
-        assert_eq!(
-            metadata["token_endpoint"],
-            "https://jckwind.proxy.ing/oauth/token"
-        );
+        assert_eq!(metadata["issuer"], ISSUER);
+        assert_eq!(metadata["token_endpoint"], format!("{ISSUER}/oauth/token"));
         assert_eq!(
             metadata["code_challenge_methods_supported"],
             serde_json::json!(["S256"])
         );
 
-        // Reached on the loopback, it is http; a path under the resource
-        // metadata answers the same.
+        // A path under the resource metadata answers the same.
         let text = client
             .get(format!(
                 "{base}/.well-known/oauth-protected-resource/mcp/proxy"
             ))
+            .header("x-forwarded-host", "evil.example")
             .send()
             .await
             .unwrap()
@@ -639,8 +639,45 @@ mod tests {
             .await
             .unwrap();
         let resource = value(&text);
-        assert_eq!(resource["resource"], base);
-        assert_eq!(resource["authorization_servers"][0], base);
+        assert_eq!(resource["resource"], ISSUER);
+        assert_eq!(resource["authorization_servers"][0], ISSUER);
+
+        // The page and the refusal on the redirect name it too.
+        let redirect = "https://claude.ai/api/mcp/auth_callback";
+        let client_id = register(&client, &base, redirect).await;
+        let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(VERIFIER.as_bytes()));
+        let html = client
+            .get(format!(
+                "{base}/oauth/authorize?response_type=code&client_id={client_id}&redirect_uri={}&code_challenge={challenge}",
+                utf8_percent_encode(redirect, NON_ALPHANUMERIC)
+            ))
+            .header("x-forwarded-host", "evil.example")
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(
+            html.contains("wants to connect to <strong>jckwind.proxy.ing</strong>"),
+            "{html}"
+        );
+        assert!(!html.contains("evil.example"), "{html}");
+        let response = client
+            .get(format!(
+                "{base}/oauth/authorize?response_type=code&client_id={client_id}&redirect_uri={}",
+                utf8_percent_encode(redirect, NON_ALPHANUMERIC)
+            ))
+            .header("x-forwarded-host", "evil.example")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 303);
+        let location = response.headers()["location"].to_str().unwrap();
+        assert!(
+            location.ends_with("&iss=https%3A%2F%2Fjckwind.proxy.ing"),
+            "{location}"
+        );
 
         let preflight = client
             .request(reqwest::Method::OPTIONS, format!("{base}/oauth/token"))
@@ -673,7 +710,6 @@ mod tests {
                 "{base}/oauth/authorize?response_type=code&client_id={client_id}&redirect_uri={}&state=s1&code_challenge={challenge}&code_challenge_method=S256",
                 utf8_percent_encode(redirect, NON_ALPHANUMERIC)
             ))
-            .header("host", "jckwind.proxy.ing")
             .send()
             .await
             .unwrap();
