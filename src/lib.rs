@@ -13,6 +13,8 @@
 //! - [`durable`]: append-only op-log durability file for the reference daemon.
 //! - [`transport`]: the [`transport::PullSource`] seam.
 //! - [`net`] (feature `pull-http`): the HTTP pull server, client, and pull loop.
+//! - [`oauth`]: the node as the OAuth authorization server for its own
+//!   address, so a client connects with a click in Proxy, not a pasted bearer.
 //!
 //! The library is the primary artifact; the `pnsd` reference daemon builds under
 //! the `daemon` feature, and networked replication under `pull-http`.
@@ -33,6 +35,7 @@ pub mod kv;
 pub mod log;
 #[cfg(feature = "pull-http")]
 pub mod net;
+pub mod oauth;
 pub mod op;
 pub mod registry;
 pub mod store;

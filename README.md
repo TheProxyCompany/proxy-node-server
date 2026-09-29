@@ -45,6 +45,29 @@ consumers pull the smallest dependency graph. The `pnsd` daemon builds under the
 `pull-http`. Discovery providers and the in-process multi-daemon test/perf
 `harness` are each feature-gated and never leak into the default graph.
 
+## Connecting to an address
+
+A node is also the OAuth 2.1 authorization server for the surfaces it serves at
+its address (`oauth`, routes under `pull-http`). Something that wants in, such
+as an MCP client, an editor or a dashboard, registers itself (RFC 7591), sends
+the person to `/oauth/authorize` with a PKCE challenge, and the person lets it
+in from Proxy on their Mac or phone: one click, nothing to paste. The node
+issues the bearer the client carries from then on, and the person takes it back
+when they like. A bearer opens only the path families its scope names
+(`threads`, `life-map-read`, `life-map-write`, `computer`, `mail`, `messages`,
+`inference`, `moves`; an ask that names none gets `threads`), and it runs out
+after thirty days, when the client asks again and the person sees the ask
+again. There is no refresh token. A purpose token, one whose scope names a
+purpose such as `party:<id>;...` and no family, has no clock: it opens one
+party thread, and it ends when the person removes it or the host takes the
+seat out. One source gets its share of registrations
+and asks in a window, then `429`, and every registration is said to the node's
+audit with where it came from. Two seams are the node's: a `Store` for clients,
+asks and tokens, and a `Consent` that puts the ask in front of the person and
+reports what they said. The routers read the node's address from the node
+itself, never from a request header. Discovery is RFC 8414 and RFC 9728 under
+`/.well-known`.
+
 ## Benchmarks
 
 ```bash

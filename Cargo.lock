@@ -1071,17 +1071,20 @@ name = "proxy-node-server"
 version = "0.0.0"
 dependencies = [
  "axum",
+ "base64",
  "clap",
  "criterion",
  "futures-util",
  "mdns-sd",
  "p256",
+ "percent-encoding",
  "postcard",
  "rand_core",
  "reqwest",
  "serde",
  "serde_json",
  "sha2",
+ "subtle",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
@@ -1931,19 +1934,3 @@ name = "zmij"
 version = "1.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
-
-[[patch.unused]]
-name = "orchard-rs"
-version = "2026.6.2"
-
-[[patch.unused]]
-name = "pane"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "grand-central"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "trellis"
-version = "0.1.0"
