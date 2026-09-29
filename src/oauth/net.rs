@@ -349,7 +349,7 @@ where
                 client_name: ask.client_name.clone(),
                 origin: redirect_origin(&ask.redirect_uri),
                 scope: ask.scope.clone().unwrap_or_default(),
-                poll: format!("/oauth/ask/{}", ask.id),
+                poll: format!("ask/{}", ask.id),
             },
         ),
         Ok(Ok(Ok(ask))) => waiting_page(&issuer, &ask),
@@ -763,9 +763,9 @@ mod tests {
         assert_eq!(answer["client_name"], "Claude");
         assert_eq!(answer["origin"], "official.proxy.ing");
         assert_eq!(answer["scope"], "party:p1");
-        assert_eq!(answer["poll"], format!("/oauth/ask/{ask_id}"));
+        assert_eq!(answer["poll"], format!("ask/{ask_id}"));
         let text = client
-            .get(format!("{base}{}", answer["poll"].as_str().unwrap()))
+            .get(format!("{base}/oauth/{}", answer["poll"].as_str().unwrap()))
             .send()
             .await
             .unwrap()

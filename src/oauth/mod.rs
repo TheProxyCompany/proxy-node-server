@@ -474,8 +474,7 @@ impl Store for MemoryStore {
     }
 }
 
-/// A consent that answers every ask the same way; for tests and for a node
-/// with nobody to ask.
+/// A test double: a consent that answers every ask the same way.
 #[derive(Clone, Copy, Debug)]
 pub struct Always(pub Answer);
 
@@ -1630,11 +1629,6 @@ mod tests {
         assert_eq!(server.admit("", NOW).unwrap(), None);
     }
 
-    /// Alex's finding on root PR 45: a request admitted just before the
-    /// person removed the connection used to write its whole token row back,
-    /// `revoked_at` and all, and the connection came back. Now the in-flight
-    /// write touches only a live token's `last_used_at`, and a token is put
-    /// once: a second put of its id is refused.
     #[test]
     fn a_request_in_flight_across_a_revoke_cannot_restore_the_connection() {
         let server = server(Answer::Approved);
