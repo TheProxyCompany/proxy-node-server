@@ -955,13 +955,30 @@ impl PeerEndpoint {
             ));
         }
         let host = url.host_str().unwrap_or("");
-        let loopback = matches!(host, "127.0.0.1" | "::1" | "localhost");
+        let protected_http = host.eq_ignore_ascii_case("localhost")
+            || host
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| match ip {
+                    std::net::IpAddr::V4(ip) => {
+                        ip.is_loopback()
+                            || (ip.octets()[0] == 100 && (64..128).contains(&ip.octets()[1]))
+                    }
+                    std::net::IpAddr::V6(ip) => {
+                        ip.is_loopback() || {
+                            let segments = ip.segments();
+                            segments[0] == 0xfd7a && segments[1] == 0x115c && segments[2] == 0xa1e0
+                        }
+                    }
+                });
         match url.scheme() {
             "https" => {}
-            "http" if loopback => {}
+            "http" if protected_http => {}
             _ => {
                 return Err(PeerError::Invalid(
-                    "endpoint must be HTTPS, or loopback HTTP for local tests".into(),
+                    "endpoint must use HTTPS, loopback, or the encrypted Tailscale address range"
+                        .into(),
                 ));
             }
         }
@@ -1356,5 +1373,32 @@ mod tests {
             )
             .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod endpoint_tests {
+    use super::PeerEndpoint;
+    #[test]
+    fn accepts_existing_encrypted_mesh_routes_and_refuses_plain_network_routes() {
+        for url in [
+            "https://device.proxy.ing",
+            "http://127.0.0.1:51711",
+            "http://[::1]:51711",
+            "http://100.64.0.2:51711",
+            "http://[fd7a:115c:a1e0::2]:51711",
+        ] {
+            assert!(PeerEndpoint::new(url).is_ok(), "{url}");
+        }
+        for url in [
+            "http://192.168.1.2:51711",
+            "http://example.com",
+            "http://100.128.0.1",
+            "http://[fd7a::2]:51711",
+            "https://owner:secret@example.com",
+            "file:///tmp/route",
+        ] {
+            assert!(PeerEndpoint::new(url).is_err(), "{url}");
+        }
     }
 }

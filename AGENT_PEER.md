@@ -103,7 +103,9 @@ identical bytes cannot both pass the durable lookup:
     let reply: serde_json::Value = client.command(PeerCommand::Status { agent: "jarvis".into() }).await?;
 
 `PeerEndpoint::new` rejects URL credentials, fragments and non-HTTPS schemes;
-loopback HTTP (`127.0.0.1`, `::1`, `localhost`) is allowed for local tests.
+loopback HTTP is allowed for local peers. HTTP on the fixed encrypted Tailscale
+address ranges (100.64.0.0/10 and fd7a:115c:a1e0::/48) follows the existing
+Proxy mesh confidentiality policy; arbitrary LAN or public HTTP is refused.
 Redirects are disabled; request timeout is 75 s; response bodies are capped at
 4 MiB *while streaming* (a declared `Content-Length` over the cap is rejected
 early and an over-cap chunk is rejected before it is buffered), so a
