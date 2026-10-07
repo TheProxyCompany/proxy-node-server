@@ -122,7 +122,8 @@ impl Fixture {
                 let agent = request.command.agent_id().to_string();
                 let sender = request.sender.to_hex();
                 Ok::<Value, PeerError>(match request.command {
-                    PeerCommand::Ensure { definitions, .. } => {
+                    PeerCommand::Ensure { definitions, .. }
+                    | PeerCommand::Attach { definitions, .. } => {
                         let digest = definitions
                             .as_ref()
                             .map(|bundle| {

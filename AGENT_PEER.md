@@ -119,7 +119,11 @@ page is a transport failure, never a payload.
 
 Typed, closed set (`PeerCommand`): `Ensure { agent, definitions }`,
 `Open { agent }`, `Status { agent }`, `Submit { agent, input }`,
-`Events { agent, after_sequence, limit ≤ 256 }`, `Abort { agent }`. Every
+`Events { agent, after_sequence, limit ≤ 256 }`, `Abort { agent }`, and
+`Attach { agent, conversation_id, participant_id, definitions }`. Attach carries
+only bounded identities; the receiver rebuilds the selected Party configuration
+from its own trusted membership and loadout. It returns an opaque runtime handle
+for later commands, keeping that task separate from the owner's persistent root. Every
 variant names exactly one agent id — a caller can submit only to the exact
 requested agent, and every reply/event/status value is correlated with that
 id by the server's echo. There is no remote executable path, command line,
@@ -139,15 +143,16 @@ whether to install, and must refuse (`PeerError::Divergent`) rather than
 overwrite when its current digest differs from `expected`. A digest match
 never grants authority by itself.
 
-## Migration is not represented
+## Durable placement changes
 
-The shipping runtime has no atomic quiesce/admission fence, so no live
-handoff or state-copy command exists here. A future handoff command must go
-through an injected handler that proves admission is fenced, pending work is
-drained and a durable checkpoint is ready, and until then must return
-`PeerError::Unsupported`. An ordinary idle status or stopped process is not
-proof of safe migration. First placement and attachment (`Ensure`/`Open`)
-work without any of that.
+The host now exposes the runtime's typed prepare_handoff/status/resume fence.
+No network state-copy command is represented by this transport yet. A transfer
+handler must prove admission is durably fenced, accepted work and managed
+processes drained, all effects known, and exact inbox/journal cursor receipts
+verified. It must also transfer or explicitly retain each guest/workspace
+resource before resuming only the target. An ordinary idle status or stopped
+process is insufficient. First placement and scoped attachment work independently
+of that transfer protocol; an existing root must not be silently re-created empty.
 
 ## Proof scope and limits
 

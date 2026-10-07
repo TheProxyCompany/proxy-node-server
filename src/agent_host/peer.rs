@@ -324,6 +324,14 @@ pub enum PeerCommand {
     },
     /// Cooperative abort of the exact agent's current work.
     Abort { agent: String },
+    /// Attach a scoped Party task using receiver-owned replicated membership.
+    /// The wire carries identities only, never launch environment or paths.
+    Attach {
+        agent: String,
+        conversation_id: String,
+        participant_id: String,
+        definitions: Option<DefinitionBundle>,
+    },
 }
 
 fn default_event_limit() -> u32 {
@@ -420,7 +428,8 @@ impl PeerCommand {
             | Self::Status { agent }
             | Self::Submit { agent, .. }
             | Self::Events { agent, .. }
-            | Self::Abort { agent } => agent,
+            | Self::Abort { agent }
+            | Self::Attach { agent, .. } => agent,
         }
     }
 
@@ -443,10 +452,26 @@ impl PeerCommand {
                     bundle.verify_digest()?;
                 }
             }
+            Self::Attach {
+                conversation_id,
+                participant_id,
+                definitions,
+                ..
+            } => {
+                if [conversation_id, participant_id]
+                    .iter()
+                    .any(|id| id.is_empty() || id.len() > 256 || id.chars().any(char::is_control))
+                {
+                    return Err(PeerError::Invalid("invalid Party attachment scope".into()));
+                }
+                if let Some(bundle) = definitions {
+                    bundle.verify_digest()?;
+                }
+            }
             Self::Submit { input, .. } => {
                 if input.id.is_empty()
                     || input.id.len() > 256
-                    || !matches!(input.kind.as_str(), "prompt" | "event")
+                    || !matches!(input.kind.as_str(), "prompt" | "event" | "observation")
                     || input.message.len() > MAX_COMMAND_BYTES
                 {
                     return Err(PeerError::Invalid("invalid agent input".into()));
@@ -1399,6 +1424,39 @@ mod endpoint_tests {
             "file:///tmp/route",
         ] {
             assert!(PeerEndpoint::new(url).is_err(), "{url}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod attachment_tests {
+    use super::*;
+    #[test]
+    fn attachment_scope_round_trips_without_launch_paths_or_credentials() {
+        let request = PeerCommand::Attach {
+            agent: "dot".into(),
+            conversation_id: "party".into(),
+            participant_id: "party:dot".into(),
+            definitions: None,
+        };
+        request.validate().unwrap();
+        let bytes = postcard::to_allocvec(&request).unwrap();
+        let restored: PeerCommand = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(restored.agent_id(), "dot");
+        assert!(
+            matches!(restored, PeerCommand::Attach { participant_id, .. } if participant_id == "party:dot")
+        );
+        for participant in ["".to_string(), "x".repeat(257), "invalid\nscope".into()] {
+            assert!(
+                PeerCommand::Attach {
+                    agent: "dot".into(),
+                    conversation_id: "party".into(),
+                    participant_id: participant,
+                    definitions: None
+                }
+                .validate()
+                .is_err()
+            );
         }
     }
 }
