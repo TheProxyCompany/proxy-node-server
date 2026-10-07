@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use proxy_node_server::agent_host::http::{HostOperation, router};
 use proxy_node_server::agent_host::{
-    AgentHost, AgentInput, AgentSpec, EventSubscription, HostError,
+    AgentHost, AgentInput, AgentSpec, EventSubscription, HostError, WorkspaceMode,
 };
 use serde_json::{Value, json};
 
@@ -62,6 +62,7 @@ fn spec(root: &Path, id: &str) -> AgentSpec {
         agent_dir: root.join("identity"),
         state_dir: root.join("state").join(id),
         workspace: root.into(),
+        workspace_mode: WorkspaceMode::Host,
         seat_config: json!({"model":"original"}),
         space: None,
         env: BTreeMap::from([(

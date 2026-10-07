@@ -59,9 +59,20 @@ pub struct AgentSpec {
     pub agent_dir: PathBuf,
     pub state_dir: PathBuf,
     pub workspace: PathBuf,
+    pub workspace_mode: WorkspaceMode,
     pub seat_config: Value,
     pub env: BTreeMap<String, String>,
     pub space: Option<SpaceBinding>,
+}
+
+/// Where shell, file and process tools execute. A host workspace is an
+/// explicit authority choice, not an OS sandbox or a guest fallback.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceMode {
+    #[default]
+    Guest,
+    Host,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -474,12 +485,23 @@ impl AgentHost {
         let process = agent.process.lock().await;
         let pid = agent.pid.load(Ordering::SeqCst);
         let readiness = agent.readiness.lock().unwrap().clone();
+        let workspace = {
+            let spec = agent.spec.lock().unwrap();
+            let root = match spec.workspace_mode {
+                WorkspaceMode::Host => Some(spec.workspace.clone()),
+                WorkspaceMode::Guest => spec
+                    .space
+                    .as_ref()
+                    .map(|space| space.workspace_root.clone()),
+            };
+            json!({"mode":spec.workspace_mode,"root":root,"space_id":spec.space.as_ref().map(|space| &space.space_id),"os_sandbox":spec.workspace_mode == WorkspaceMode::Guest && spec.space.as_ref().is_some_and(|space| !matches!(&space.isolation, SpaceIsolation::Shared))})
+        };
         let available = pid != 0
             && process.stop.is_some()
             && readiness.as_ref().is_some_and(RuntimeReadiness::verified);
         Ok(
             json!({"agent_id":id,"pid":if pid==0 {None} else {Some(pid)},"hosted":process.stop.is_some(),
-            "available":available,"readiness":readiness,
+            "available":available,"readiness":readiness,"workspace":workspace,
             "runtime":*agent.state.lock().unwrap(),"sequence":agent.log.lock().unwrap().sequence}),
         )
     }
@@ -566,6 +588,8 @@ impl EventSubscription {
 }
 
 fn spawn(spec: &AgentSpec) -> Result<Child, HostError> {
+    let mut seat_config = spec.seat_config.clone();
+    seat_config["workspace_mode"] = serde_json::to_value(spec.workspace_mode)?;
     let mut command = Command::new(&spec.command);
     #[cfg(unix)]
     {
@@ -584,10 +608,7 @@ fn spawn(spec: &AgentSpec) -> Result<Child, HostError> {
         .arg(&spec.workspace)
         .current_dir(&spec.workspace)
         .envs(&spec.env)
-        .env(
-            "PROXY_AGENT_SEAT",
-            serde_json::to_string(&spec.seat_config)?,
-        )
+        .env("PROXY_AGENT_SEAT", serde_json::to_string(&seat_config)?)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
