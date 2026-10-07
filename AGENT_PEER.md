@@ -76,7 +76,10 @@ identity in `agent-peer.request.v1.reply`.
 
 One file per request id under the replay directory, written as pending
 **before any handler effect**, fsynced (file and directory) before the handler
-runs, and replaced with the fully-signed response frame after:
+runs, and replaced with the fully-signed response frame after. Within one
+process, the request id is also claimed exclusively for the whole
+check→admit→handle→complete sequence, so two concurrent deliveries of
+identical bytes cannot both pass the durable lookup:
 
 - **Same signed bytes arrive again, completed record exists** → the cached
   reply bytes are returned; the handler does not run a second time. This holds
@@ -84,6 +87,11 @@ runs, and replaced with the fully-signed response frame after:
 - **Same signed bytes arrive, record still Pending** (crash after admit,
   before complete) → `409 Conflict` / `PeerError::OutcomeUnknown`. An effect
   the transport cannot prove completed is never silently repeated.
+- **Same signed bytes arrive concurrently, record not yet written** → the
+  losing delivery is refused with the same `409 Conflict` outcome-unknown
+  result rather than being admitted or dispatched; the claim is released when
+  the winning request writes its record (or unwinds on panic, leaving a
+  durable Pending).
 - A `Submit` retried through a **new** envelope necessarily has a new request
   id; the runtime's own stable `input.id` remains the dedupe key for that
   second attempt, exactly as it does between two local submissions.
@@ -97,7 +105,9 @@ runs, and replaced with the fully-signed response frame after:
 `PeerEndpoint::new` rejects URL credentials, fragments and non-HTTPS schemes;
 loopback HTTP (`127.0.0.1`, `::1`, `localhost`) is allowed for local tests.
 Redirects are disabled; request timeout is 75 s; response bodies are capped at
-4 MiB. The client verifies, before surfacing anything, that the reply is
+4 MiB *while streaming* (a declared `Content-Length` over the cap is rejected
+early and an over-cap chunk is rejected before it is buffered), so a
+compromised target cannot make the client buffer an unbounded body. The client verifies, before surfacing anything, that the reply is
 well-formed, signed by the *expected target*, bound to *this request's id*,
 and addressed to *this requester*: forged, tampered, wrong-peer or
 wrong-request replies are rejected as `Unauthenticated`, and an unsigned error
@@ -143,12 +153,13 @@ work without any of that.
 loopback servers and an effect-counting fixture handler and verifies the real
 signed round trip: accepted submit/open/status/events with exact-identity
 echoes; byte-identical replay returning the cached signed reply with no second
-effect, including across a server reopen; unknown/forged/tampered/stale and
+effect, including across a server reopen; 64 concurrent deliveries of the same
+signed bytes producing exactly one effect; unknown/forged/tampered/stale and
 wrong-target requests never reaching the handler (counter stays zero); a
 crash-pending replay returning 409 with no repeat effect; a wrong-peer signed
 reply rejected client-side; traversal-bearing, oversized and undigested
-definitions rejected; and the over-limit events request refused before
-dispatch. These are protocol guarantees over fixtures — not evidence of real
+definitions rejected; an over-limit reply rejected while streaming; and the
+over-limit events request refused before dispatch. These are protocol guarantees over fixtures — not evidence of real
 model execution, guest provisioning, or any installed app behavior.
 
 Known limits: replay files grow unbounded with request volume (an

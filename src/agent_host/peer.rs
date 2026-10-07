@@ -28,8 +28,8 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::extract::{DefaultBodyLimit, State};
@@ -589,6 +589,26 @@ impl ReplayState {
     }
 }
 
+/// In-process claim on one request id, held by the request that is currently
+/// admitting or handling it. Released on drop, after the durable record is
+/// written (completed or, on panic, still pending). This closes the window
+/// between the durable `get` and `admit`: without it two concurrent deliveries
+/// of the *same* signed bytes both observe `None` and both run the handler.
+#[derive(Debug)]
+pub struct ReplayClaim<'a> {
+    in_flight: &'a Mutex<HashSet<OpId>>,
+    id: OpId,
+}
+
+impl Drop for ReplayClaim<'_> {
+    fn drop(&mut self) {
+        self.in_flight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.id);
+    }
+}
+
 /// Durable replay state: one file per request id under a private, fsynced
 /// directory leased to the server. Written only by [`PeerServer`]; read back
 /// before any handler effect.
@@ -596,6 +616,9 @@ impl ReplayState {
 pub struct ReplayStore {
     dir: PathBuf,
     _lease: std::fs::File,
+    /// Request ids currently being admitted/handled by this process, so
+    /// concurrent duplicates cannot both pass the durable `get`/`admit` gap.
+    in_flight: Mutex<HashSet<OpId>>,
 }
 
 impl ReplayStore {
@@ -619,7 +642,11 @@ impl ReplayStore {
         let lease = options.open(dir.join("replay.lock"))?;
         fs2::FileExt::try_lock_exclusive(&lease)
             .map_err(|_| PeerError::Invalid("replay store is held by another server".into()))?;
-        Ok(Self { dir, _lease: lease })
+        Ok(Self {
+            dir,
+            _lease: lease,
+            in_flight: Mutex::new(HashSet::new()),
+        })
     }
 
     fn path(&self, id: &OpId) -> PathBuf {
@@ -632,6 +659,27 @@ impl ReplayStore {
             Ok(bytes) => Ok(Some(ReplayState::decode(&bytes)?)),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Claim `id` for exclusive in-process handling. `Ok(Some(guard))` means
+    /// this caller now owns the claim and must hold the guard until its durable
+    /// record is written (released on drop, including on panic). `Ok(None)`
+    /// means another request is already admitting or handling the same bytes,
+    /// so the caller must treat it exactly like a durable `Pending` (outcome
+    /// unknown) rather than admitting or dispatching a second effect.
+    pub fn claim(&self, id: &OpId) -> Result<Option<ReplayClaim<'_>>, PeerError> {
+        let mut in_flight = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if in_flight.insert(*id) {
+            Ok(Some(ReplayClaim {
+                in_flight: &self.in_flight,
+                id: *id,
+            }))
+        } else {
+            Ok(None)
         }
     }
 
@@ -836,12 +884,18 @@ async fn handle_request<D: DeviceBook>(
     payload.command.validate()?;
 
     // 5. Durable replay: record admission before any effect. The same signed
-    //    bytes (same request id) never run the handler twice.
+    //    bytes (same request id) never run the handler twice. The in-process
+    //    claim is held for the whole check→admit→handle→complete sequence so
+    //    two concurrent deliveries of identical bytes cannot both proceed.
     match state.replays.get(&envelope.id)? {
         Some(ReplayState::Completed(reply)) => return Ok(reply),
         Some(ReplayState::Pending) => return Err(PeerError::OutcomeUnknown),
         None => {}
     }
+    let _claim = state
+        .replays
+        .claim(&envelope.id)?
+        .ok_or(PeerError::OutcomeUnknown)?;
     state.replays.admit(&envelope.id)?;
 
     // 6. Dispatch. A handler error is still a *handled* request, so record it
@@ -972,7 +1026,7 @@ impl<D: DeviceBook> PeerClient<D> {
         let envelope = seal_payload(REQUEST_STORE, &request, &self.identity)?;
         let frame = (envelope.to_bytes()?, postcard::to_allocvec(&request)?);
         let body = postcard::to_allocvec(&frame)?;
-        let response = self
+        let mut response = self
             .http
             .post(self.endpoint.url.clone())
             .header(header::CONTENT_TYPE, "application/octet-stream")
@@ -994,12 +1048,27 @@ impl<D: DeviceBook> PeerClient<D> {
             // An unsigned error page is a transport failure, never a payload.
             return Err(PeerError::Transport(format!("http status {status}")));
         }
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|e| PeerError::Transport(e.to_string()))?;
-        if bytes.len() as u64 > MAX_RESPONSE_BYTES {
+        // Enforce the cap while reading, not after: the expected target is
+        // trusted but a compromised one must not be able to make the client
+        // buffer an unbounded body before the check. `content_length`, when
+        // present, is a cheap early rejection; the loop is the real bound for
+        // chunked or lying responses.
+        if response
+            .content_length()
+            .is_some_and(|len| len > MAX_RESPONSE_BYTES)
+        {
             return Err(PeerError::Invalid("response body too large".into()));
+        }
+        let mut bytes: Vec<u8> = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|e| PeerError::Transport(e.to_string()))?
+        {
+            if bytes.len() as u64 + chunk.len() as u64 > MAX_RESPONSE_BYTES {
+                return Err(PeerError::Invalid("response body too large".into()));
+            }
+            bytes.extend_from_slice(&chunk);
         }
         self.verify_reply(&bytes, &envelope).await
     }

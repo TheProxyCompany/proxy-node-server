@@ -692,3 +692,91 @@ fn oversized_request_body_is_rejected() {
         assert_eq!(host.fixture.effect_count(), 0);
     });
 }
+
+#[test]
+fn concurrent_identical_bytes_run_the_handler_once() {
+    // Two deliveries of the *same* signed bytes must not both pass the durable
+    // get/admit gap. 64 simultaneous requests share one start barrier so the
+    // window is exercised, not merely approached.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(16)
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let caller = Arc::new(DeviceIdentity::generate());
+        let target = Arc::new(DeviceIdentity::generate());
+        let all = book(&[&caller, &target]);
+        let host = Host::boot(Arc::clone(&target), all.clone(), Duration::from_secs(120)).await;
+        let body = framed(
+            &caller,
+            target.device_id(),
+            PeerCommand::Submit {
+                agent: "jarvis".into(),
+                input: input("input-race", "same bytes").into(),
+            },
+        );
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .pool_max_idle_per_host(0)
+            .build()
+            .unwrap();
+        let barrier = Arc::new(tokio::sync::Barrier::new(64));
+        let mut handles = Vec::new();
+        for _ in 0..64 {
+            let client = client.clone();
+            let url = format!("http://127.0.0.1:{}/peer/agents", host.port);
+            let body = body.clone();
+            let barrier = Arc::clone(&barrier);
+            handles.push(tokio::spawn(async move {
+                barrier.wait().await;
+                client.post(url).body(body).send().await.unwrap().status()
+            }));
+        }
+        for handle in handles {
+            let _ = handle.await.unwrap();
+        }
+        assert_eq!(
+            host.fixture.effect_count(),
+            1,
+            "identical signed bytes ran the handler more than once"
+        );
+    });
+}
+
+#[test]
+fn oversized_reply_is_rejected_while_streaming() {
+    runtime().block_on(async {
+        let caller = Arc::new(DeviceIdentity::generate());
+        let target = Arc::new(DeviceIdentity::generate());
+        let all = book(&[&caller, &target]);
+
+        // A reply body one byte over the client's read cap, and not even a
+        // well-formed frame: the size bound must reject it before parsing.
+        let oversized =
+            vec![0u8; (proxy_node_server::agent_host::peer::MAX_RESPONSE_BYTES + 1) as usize];
+        let app = axum::Router::new().route(
+            "/peer/agents",
+            axum::routing::post(move || {
+                let oversized = oversized.clone();
+                async move { oversized }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let endpoint = PeerEndpoint::new(&format!("http://127.0.0.1:{port}")).unwrap();
+        let client = PeerClient::new(caller, all, target.device_id(), endpoint).unwrap();
+        let error = client
+            .command(PeerCommand::Status {
+                agent: "jarvis".into(),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(error, PeerError::Invalid(_)), "got {error:?}");
+        server.abort();
+    });
+}
