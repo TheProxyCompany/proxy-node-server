@@ -53,6 +53,7 @@ fn spec(root: &Path, id: &str) -> AgentSpec {
     std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
     AgentSpec {
         id: id.into(),
+        display_name: None,
         command: binary,
         args: vec![],
         agent_dir: root.join("identity"),
@@ -588,4 +589,28 @@ async fn herdr_live_reports_and_releases_only_the_supplied_test_pane() {
     let state: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert!(state["result"]["pane"].get("agent").is_none());
     println!("Herdr released: {state}");
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn native_process_uses_agent_name_in_ps() {
+    let temp = tempfile::tempdir().unwrap();
+    let host = AgentHost::open(temp.path().join("host")).unwrap();
+    let mut definition = spec(temp.path(), "dot");
+    definition.command = "/bin/sh".into();
+    definition.args = vec!["-c".into(), "while IFS= read -r line; do :; done".into()];
+    definition.display_name = Some("JarvisDot".into());
+    host.register(definition).await.unwrap();
+    host.ensure_started("dot").await.unwrap();
+    let pid = host.status("dot").await.unwrap()["pid"].as_u64().unwrap();
+    let output = tokio::process::Command::new("/bin/ps")
+        .args(["-p", &pid.to_string(), "-o", "comm=,args="])
+        .output()
+        .await
+        .unwrap();
+    assert!(output.status.success());
+    let process = String::from_utf8(output.stdout).unwrap();
+    assert!(process.trim_start().starts_with("JarvisDot"), "{process}");
+    println!("Observed native process name: {process}");
+    host.shutdown().await;
 }

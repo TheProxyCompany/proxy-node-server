@@ -52,6 +52,7 @@ pub enum HostError {
 #[derive(Clone, PartialEq)]
 pub struct AgentSpec {
     pub id: String,
+    pub display_name: Option<String>,
     pub command: PathBuf,
     pub args: Vec<String>,
     pub agent_dir: PathBuf,
@@ -251,6 +252,13 @@ impl AgentHost {
     pub async fn register(&self, spec: AgentSpec) -> Result<(), HostError> {
         if let Some(space) = &spec.space {
             space.validate()?;
+        }
+        if spec.display_name.as_ref().is_some_and(|name| {
+            name.trim().is_empty() || name.len() > 256 || name.chars().any(char::is_control)
+        }) {
+            return Err(HostError::Invalid(
+                "agent display name must be bounded and printable".into(),
+            ));
         }
         if !valid_id(&spec.id)
             || !spec.command.is_absolute()
@@ -507,6 +515,13 @@ impl EventSubscription {
 
 fn spawn(spec: &AgentSpec) -> Result<Child, HostError> {
     let mut command = Command::new(&spec.command);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command
+            .as_std_mut()
+            .arg0(spec.display_name.as_deref().unwrap_or(&spec.id));
+    }
     command
         .args(&spec.args)
         .args(["--rpc", "--agent"])
