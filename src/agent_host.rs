@@ -20,6 +20,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{Mutex as AsyncMutex, oneshot, watch};
 
+pub mod handoff;
 pub mod herdr;
 pub mod http;
 pub mod pact;
@@ -218,6 +219,7 @@ struct Agent {
     acknowledgements: Mutex<Acknowledgements>,
     state: Mutex<Value>,
     readiness: Mutex<Option<RuntimeReadiness>>,
+    handoff: Mutex<Option<handoff::HandoffState>>,
     log: Mutex<EventLog>,
     log_path: PathBuf,
     updates: watch::Sender<u64>,
@@ -367,6 +369,7 @@ impl AgentHost {
             acknowledgements: Mutex::new(HashMap::new()),
             state: Mutex::new(json!({"status":"stopped"})),
             readiness: Mutex::new(None),
+            handoff: Mutex::new(None),
             log: Mutex::new(log),
             log_path,
             updates,
@@ -426,11 +429,12 @@ impl AgentHost {
     pub async fn submit(&self, id: &str, input: AgentInput) -> Result<Value, HostError> {
         if input.id.is_empty()
             || input.id.len() > 256
-            || !matches!(input.kind.as_str(), "prompt" | "event")
+            || !matches!(input.kind.as_str(), "prompt" | "event" | "observation")
             || input.message.len() > 4 * 1024 * 1024
         {
             return Err(HostError::Invalid(
-                "stable input id, prompt/event type and bounded message are required".into(),
+                "stable input id, prompt/event/observation type and bounded message are required"
+                    .into(),
             ));
         }
         let agent = self.agent(id)?;
@@ -445,7 +449,8 @@ impl AgentHost {
             .push(sender);
         agent.inputs.lock().unwrap().insert(input.id.clone());
         let mut wire = serde_json::to_value(&input)?;
-        // The logical identity is trusted registration data. A scoped tasksn // runtime id is an implementation handle, not the agents identity.
+        // The logical identity is trusted registration data. A scoped task
+        // runtime id is an implementation handle, not the agent identity.
         {
             let spec = agent.spec.lock().unwrap();
             wire["agent_id"] = spec
@@ -455,22 +460,7 @@ impl AgentHost {
                 .unwrap_or(&spec.id)
                 .into();
         }
-        // The supervisor installs the pipe before reading stdout. It is not a
-        // client's pipe: dropping this request never closes it.
-        let write = tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                let mut stdin = agent.stdin.lock().await;
-                if let Some(stdin) = stdin.as_mut() {
-                    stdin.write_all(format!("{wire}\n").as_bytes()).await?;
-                    stdin.flush().await?;
-                    return Ok::<_, std::io::Error>(());
-                }
-                drop(stdin);
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await;
-        if !matches!(write, Ok(Ok(()))) {
+        if agent.write(&wire).await.is_err() {
             agent.acknowledgements.lock().unwrap().remove(&input.id);
             return Err(HostError::AcceptanceUnknown);
         }
@@ -506,12 +496,16 @@ impl AgentHost {
             };
             json!({"mode":spec.workspace_mode,"root":root,"space_id":spec.space.as_ref().map(|space| &space.space_id),"os_sandbox":spec.workspace_mode == WorkspaceMode::Guest && spec.space.as_ref().is_some_and(|space| !matches!(&space.isolation, SpaceIsolation::Shared))})
         };
-        let available = pid != 0
+        let handoff = agent.handoff.lock().unwrap().clone();
+        let available = handoff
+            .as_ref()
+            .is_none_or(|state| state.admission == "open")
+            && pid != 0
             && process.stop.is_some()
             && readiness.as_ref().is_some_and(RuntimeReadiness::verified);
         Ok(
             json!({"agent_id":id,"pid":if pid==0 {None} else {Some(pid)},"hosted":process.stop.is_some(),
-            "available":available,"readiness":readiness,"workspace":workspace,
+            "available":available,"readiness":readiness,"handoff":handoff,"workspace":workspace,
             "runtime":*agent.state.lock().unwrap(),"sequence":agent.log.lock().unwrap().sequence}),
         )
     }
@@ -617,6 +611,30 @@ impl EventSubscription {
     }
 }
 
+impl Agent {
+    /// The process belongs to this object, never to the attached client.
+    async fn write(&self, wire: &Value) -> Result<(), HostError> {
+        use tokio::io::AsyncWriteExt;
+        match tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let mut stdin = self.stdin.lock().await;
+                if let Some(stdin) = stdin.as_mut() {
+                    stdin.write_all(format!("{wire}\n").as_bytes()).await?;
+                    stdin.flush().await?;
+                    return Ok::<_, std::io::Error>(());
+                }
+                drop(stdin);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        {
+            Ok(Ok(())) => Ok(()),
+            _ => Err(HostError::AcceptanceUnknown),
+        }
+    }
+}
+
 fn spawn(spec: &AgentSpec) -> Result<Child, HostError> {
     let mut seat_config = spec.seat_config.clone();
     seat_config["workspace_mode"] = serde_json::to_value(spec.workspace_mode)?;
@@ -664,8 +682,15 @@ fn publish(agent: &Agent, event: Value) -> Result<(), HostError> {
     let kind = event.get("type").and_then(Value::as_str).unwrap_or("");
     if matches!(
         kind,
-        "accepted" | "agent_settled" | "root_readiness" | "host_process_exit" | "host_error"
-    ) {
+        "accepted"
+            | "agent_settled"
+            | "observation_recorded"
+            | "root_readiness"
+            | "host_process_exit"
+            | "host_error"
+    ) || kind == "handoff_state"
+        || (kind == "response" && handoff::is_command(&event))
+    {
         log.file.sync_data()?;
     }
     log.sequence = record.sequence;
@@ -678,12 +703,25 @@ fn publish(agent: &Agent, event: Value) -> Result<(), HostError> {
     } else if matches!(kind, "host_process_exit" | "host_error") {
         *agent.readiness.lock().unwrap() = None;
     }
-    let id = event
-        .get("event_id")
-        .or_else(|| event.get("id"))
-        .and_then(Value::as_str);
+    let handoff_reply = kind == "response"
+        && handoff::is_command(&event)
+        && event.get("success") == Some(&Value::Bool(true));
+    if kind == "handoff_state" || handoff_reply {
+        if let Some(data) = event.get("data") {
+            if let Ok(state) = serde_json::from_value(data.clone()) {
+                *agent.handoff.lock().unwrap() = Some(state);
+            }
+        }
+    }
+    let id = if kind == "response" {
+        event.get("id").or_else(|| event.get("event_id"))
+    } else {
+        event.get("event_id").or_else(|| event.get("id"))
+    }
+    .and_then(Value::as_str);
     if let Some(id) = id {
-        if kind == "accepted" && event.get("durable") == Some(&Value::Bool(true)) {
+        if (kind == "accepted" && event.get("durable") == Some(&Value::Bool(true))) || handoff_reply
+        {
             if let Some(waiters) = agent.acknowledgements.lock().unwrap().remove(id) {
                 for waiter in waiters {
                     let _ = waiter.send(Ok(event.clone()));
@@ -700,7 +738,7 @@ fn publish(agent: &Agent, event: Value) -> Result<(), HostError> {
                     let _ = waiter.send(Err(error.into()));
                 }
             }
-        } else if kind == "agent_settled" {
+        } else if matches!(kind, "agent_settled" | "observation_recorded") {
             agent.inputs.lock().unwrap().remove(id);
         }
     }
@@ -803,5 +841,43 @@ async fn supervise(
     let mut process = agent.process.lock().await;
     if agent.generation.load(Ordering::SeqCst) == generation {
         process.stop = None;
+    }
+}
+
+#[cfg(test)]
+mod handoff_wire_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn asynchronous_native_handoff_data_updates_availability_and_checkpoint() {
+        let root = tempfile::tempdir().unwrap();
+        let host = AgentHost::open(root.path().join("host")).unwrap();
+        host.register(AgentSpec {
+            id: "dot".into(),
+            display_name: None,
+            command: root.path().join("fixture"),
+            args: vec![],
+            agent_dir: root.path().join("definition"),
+            state_dir: root.path().join("state"),
+            workspace: root.path().into(),
+            workspace_mode: WorkspaceMode::Host,
+            seat_config: json!({}),
+            env: BTreeMap::new(),
+            space: None,
+        })
+        .await
+        .unwrap();
+        let agent = host.agent("dot").unwrap();
+        let checkpoint = json!({"handoff_id":"move-dot","admission":"paused","ready":true,
+            "durable":true,"assessment_pending":false,"reason":null,"active_input":null,"accepted_pending":0,"active_processes":0,
+            "unknown_effects":0,"cursors":{"inbox":{"bytes":0,"sha256":"a".repeat(64)},
+            "journal":{"bytes":10,"sha256":"b".repeat(64),"sequence":1,"journal_id":"dot-journal"}}});
+        publish(&agent, json!({"type":"handoff_state","data":checkpoint})).unwrap();
+        let status = host.status("dot").await.unwrap();
+        assert_eq!(status["handoff"], checkpoint);
+        assert!(!status["available"].as_bool().unwrap());
+        assert!(agent.handoff.lock().unwrap().as_ref().unwrap().verified());
+        let mut events = host.subscribe("dot", 0).unwrap();
+        assert_eq!(events.recv().await.unwrap().event["data"], checkpoint);
     }
 }
