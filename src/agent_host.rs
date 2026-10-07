@@ -161,7 +161,7 @@ impl RuntimeReadiness {
                         .is_some_and(|component| component.ready)
                 })
             && status("model", "inference_verified")
-            && status("mcp", "handshakes_complete")
+            && status("mcp", "tools_verified")
             && status("memory", "journal_and_optchat_open")
     }
 }
@@ -444,7 +444,17 @@ impl AgentHost {
             .or_default()
             .push(sender);
         agent.inputs.lock().unwrap().insert(input.id.clone());
-        let wire = serde_json::to_value(&input)?;
+        let mut wire = serde_json::to_value(&input)?;
+        // The logical identity is trusted registration data. A scoped tasksn // runtime id is an implementation handle, not the agents identity.
+        {
+            let spec = agent.spec.lock().unwrap();
+            wire["agent_id"] = spec
+                .seat_config
+                .get("agent_id")
+                .and_then(Value::as_str)
+                .unwrap_or(&spec.id)
+                .into();
+        }
         // The supervisor installs the pipe before reading stdout. It is not a
         // client's pipe: dropping this request never closes it.
         let write = tokio::time::timeout(Duration::from_secs(10), async {
@@ -534,6 +544,26 @@ impl AgentHost {
         let pipe = pipe.as_mut().ok_or(HostError::Stopped)?;
         pipe.write_all(b"{\"type\":\"abort\"}\n").await?;
         pipe.flush().await?;
+        Ok(())
+    }
+
+    /// Stop this owned process without discarding its accepted inbox or journal.
+    /// A host-placement change uses this before transferring durable state.
+    pub async fn stop(&self, id: &str) -> Result<(), HostError> {
+        let agent = self.agent(id)?;
+        let mut process = agent.process.lock().await;
+        agent.generation.fetch_add(1, Ordering::SeqCst);
+        if let Some(stop) = process.stop.take() {
+            let _ = stop.send(true);
+        }
+        if let Some(finished) = process.finished.take() {
+            let _ = finished.await;
+        }
+        agent.pid.store(0, Ordering::SeqCst);
+        *agent.stdin.lock().await = None;
+        *agent.readiness.lock().unwrap() = None;
+        *agent.state.lock().unwrap() =
+            json!({"status":"stopped","pending":agent.inputs.lock().unwrap().len()});
         Ok(())
     }
 

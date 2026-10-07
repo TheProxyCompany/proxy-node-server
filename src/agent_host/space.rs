@@ -3,6 +3,9 @@
 //! Cua CLI/core SDK are MIT; the separately installed spacesd is FSL-1.1-MIT.
 //! This module calls the installed service and does not vendor its source.
 
+#[path = "space_home.rs"]
+mod home;
+
 use super::{HostError, SpaceBinding, SpaceIsolation, private_directory, valid_id};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -72,6 +75,8 @@ struct Ownership {
 pub struct CuaSpaceManager {
     binary: PathBuf,
     root: PathBuf,
+    home: PathBuf,
+    namespace: String,
     _lease: Arc<File>,
     mutation: Arc<Mutex<()>>,
 }
@@ -98,16 +103,19 @@ impl CuaSpaceManager {
         }
         let lease = options.open(root.join("proxy-agent-owners/manager.lock"))?;
         fs2::FileExt::try_lock_exclusive(&lease).map_err(|_| HostError::Busy)?;
+        let (home, namespace) = home::open(root)?;
         Ok(Self {
             binary: binary.into(),
+            home,
+            namespace,
             root: root.into(),
             _lease: Arc::new(lease),
             mutation: Arc::new(Mutex::new(())),
         })
     }
 
-    fn name(agent: &str) -> String {
-        let hash = Sha256::digest(agent.as_bytes());
+    fn name(namespace: &str, agent: &str) -> String {
+        let hash = Sha256::digest(format!("{namespace}\0{agent}").as_bytes());
         format!(
             "proxy-agent-{}",
             hash[..12]
@@ -119,11 +127,14 @@ impl CuaSpaceManager {
     fn receipt(&self, agent: &str) -> PathBuf {
         self.root
             .join("proxy-agent-owners")
-            .join(format!("{}.json", Self::name(agent)))
+            .join(format!("{}.json", Self::name(&self.namespace, agent)))
     }
     fn load_owner(&self, agent: &str) -> Result<Ownership, HostError> {
         let owner: Ownership = serde_json::from_slice(&std::fs::read(self.receipt(agent))?)?;
-        if owner.version != 1 || owner.agent_id != agent || owner.name != Self::name(agent) {
+        if owner.version != 1
+            || owner.agent_id != agent
+            || owner.name != Self::name(&self.namespace, agent)
+        {
             return Err(HostError::Invalid(
                 "Cua Space ownership record does not match agent".into(),
             ));
@@ -140,7 +151,7 @@ impl CuaSpaceManager {
     }
     fn env(&self) -> BTreeMap<String, String> {
         BTreeMap::from([
-            ("CUA_HOME".into(), self.root.to_string_lossy().into_owned()),
+            ("CUA_HOME".into(), self.home.to_string_lossy().into_owned()),
             ("CUA_TELEMETRY".into(), "0".into()),
             ("DO_NOT_TRACK".into(), "1".into()),
         ])
@@ -225,7 +236,8 @@ impl CuaSpaceManager {
             ));
         }
         let _guard = self.mutation.lock().await;
-        let name = Self::name(agent);
+        let _shared = home::lock(&self.home).await?;
+        let name = Self::name(&self.namespace, agent);
         let exists = self.listed(&name).await?;
         let receipt = self.receipt(agent);
         if receipt.exists() {
@@ -292,7 +304,7 @@ impl CuaSpaceManager {
             let info = self.json(&["sb".into(), "info".into(), id.clone()]).await?;
             if info["state"] != "running" {
                 self.run(
-                    &["sb".into(), "start".into(), id.clone()],
+                    &["spaces".into(), "start".into(), id.clone()],
                     Duration::from_secs(300),
                 )
                 .await?;
@@ -392,9 +404,14 @@ impl CuaSpaceManager {
     /// later request resumes its files. There is deliberately no implicit delete.
     pub async fn stop_agent_space(&self, agent: &str) -> Result<(), HostError> {
         let _guard = self.mutation.lock().await;
+        let _shared = home::lock(&self.home).await?;
         let owner = self.load_owner(agent)?;
         self.run(
-            &["sb".into(), "stop".into(), format!("local:{}", owner.name)],
+            &[
+                "spaces".into(),
+                "stop".into(),
+                format!("local:{}", owner.name),
+            ],
             Duration::from_secs(120),
         )
         .await?;
@@ -410,10 +427,11 @@ mod tests {
     async fn an_unowned_existing_guest_cannot_be_adopted() {
         let temp = tempfile::tempdir().unwrap();
         let binary = temp.path().join("cua-fixture");
-        let name = CuaSpaceManager::name("proof-agent");
+        std::fs::write(&binary, "#!/bin/sh\nexit 0\n").unwrap();
+        let manager = CuaSpaceManager::open(&binary, temp.path().join("state")).unwrap();
+        let name = CuaSpaceManager::name(&manager.namespace, "proof-agent");
         std::fs::write(&binary, format!("#!/bin/sh\ncase \"$*\" in\n  *'sb ls --local --no-size') printf '%s\\n' '[{{\"name\":\"{name}\"}}]';;\n  *) exit 90;;\nesac\n")).unwrap();
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let manager = CuaSpaceManager::open(&binary, temp.path().join("state")).unwrap();
         assert!(matches!(
             manager
                 .ensure_agent_space("proof-agent", SpaceResources::default())

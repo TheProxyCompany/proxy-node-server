@@ -77,11 +77,22 @@ installed-preview evidence are separate integration gates.
 ### Local Cua Spaces
 
 `agent_host::space::CuaSpaceManager` provisions only local desktops on the
-already-selected trusted Proxy device. The application supplies a private
-`CUA_HOME` under its runtime data root and an installed absolute CLI path.
+already-selected trusted Proxy device. The application supplies its private runtime data root and an installed absolute
+CLI path. On macOS, the physically short, persistent engine home is
+`/Users/Shared/.pxc-<uid>/runtime`, owned by this OS user with mode 0700 and a
+Proxy ownership marker. Lima canonicalizes paths, so a symlink from `/tmp` to a
+long profile does not solve its Unix-socket limit. Each profile keeps its own
+`runtime-home.json` reference, sandbox registry and agent ownership records under
+its selected data root; a persistent random namespace makes equal agent ids
+use different desktops in different profiles. Profiles share only the Proxy-owned
+local engine so Docker allocates distinct ports, and a filesystem lock serializes
+provisioning across app processes. No existing `~/.cua`, Docker or Colima setup is
+adopted. VM disks and guest artifacts remain in that persistent engine home;
+profile deletion does not silently erase them.
 `ensure_agent_space(agent_id, SpaceResources::default())` creates a Linux
 container desktop in Cua's managed local Linux VM, or resumes that same owned
-guest after a restart. `MacosVm` selects the local Lume backend. Ownership is
+guest after a restart. Stop/start use Cua
+`spaces stop` and `spaces start`, retaining guest files. `MacosVm` selects the local Lume backend. Ownership is
 fsynced before creation, unknown pre-existing guests are never adopted, and an
 exclusive manager lease serializes creation. The returned binding is checked
 against the live local registry, ready state, actual isolation kind, and

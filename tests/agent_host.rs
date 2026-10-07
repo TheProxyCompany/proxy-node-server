@@ -19,7 +19,7 @@ with (state/'starts').open('a') as f: f.write(str(os.getpid())+'\n')
 def emit(v): print(json.dumps(v),flush=True)
 ready=json.loads(os.environ.get('PROXY_AGENT_SEAT','{}')).get('readiness')
 if ready:
- emit({'type':'root_readiness','ready':True,'agent_name':'fixture','checked_at':1,'components':{'model':{'ready':True,'status':'inference_verified'},'mcp':{'ready':True,'status':'handshakes_complete'},'memory':{'ready':ready!='memory_missing','status':'journal_and_optchat_open'},'memory_adapters':{'ready':True},'life_map':{'ready':True,'required':True,'status':'read'}},'work_ahead':['fixture-goal']})
+ emit({'type':'root_readiness','ready':True,'agent_name':'fixture','checked_at':1,'components':{'model':{'ready':True,'status':'inference_verified'},'mcp':{'ready':True,'status':'tools_verified'},'memory':{'ready':ready!='memory_missing','status':'journal_and_optchat_open'},'memory_adapters':{'ready':True},'life_map':{'ready':True,'required':True,'status':'read'}},'work_ahead':['fixture-goal']})
 def save(name,v):
  with (state/name).open('a') as f: f.write(json.dumps(v)+'\n'); f.flush(); os.fsync(f.fileno())
 requests=[json.loads(x) for x in (state/'inputs').read_text().splitlines()] if (state/'inputs').exists() else []
@@ -668,4 +668,75 @@ async fn availability_requires_current_verified_components_and_clears_on_reconfi
     );
     host.shutdown().await;
     assert_eq!(host.status("ready").await.unwrap()["available"], false);
+}
+
+#[test]
+fn real_native_readiness_shape_is_verified_and_failed_or_legacy_probes_are_not() {
+    use proxy_node_server::agent_host::RuntimeReadiness;
+    let mut event = json!({"ready":true,"agent_name":"Local test","checked_at":1791372309u64,
+        "components":{"model":{"ready":true,"status":"inference_verified","usage":{"input":10,"output":2}},
+        "mcp":{"ready":true,"status":"tools_verified","tools":2},
+        "memory":{"ready":true,"status":"journal_and_optchat_open"},
+        "memory_adapters":{"ready":true,"registered":["cognition"]},
+        "life_map":{"ready":true,"required":false,"status":"not_required"}},"work_ahead":""});
+    assert!(
+        serde_json::from_value::<RuntimeReadiness>(event.clone())
+            .unwrap()
+            .verified()
+    );
+    event["components"]["model"]["ready"] = json!(false);
+    assert!(
+        !serde_json::from_value::<RuntimeReadiness>(event.clone())
+            .unwrap()
+            .verified()
+    );
+    event["components"]["model"]["ready"] = json!(true);
+    event["components"]["mcp"]["status"] = json!("handshakes_complete");
+    assert!(
+        !serde_json::from_value::<RuntimeReadiness>(event)
+            .unwrap()
+            .verified()
+    );
+}
+
+#[tokio::test]
+async fn stopping_one_host_retains_accepted_work_and_stamps_logical_agent_identity() {
+    let temp = tempfile::tempdir().unwrap();
+    let host = AgentHost::open(temp.path().join("host")).unwrap();
+    let mut task = spec(temp.path(), "task-runtime");
+    task.seat_config["agent_id"] = json!("dot");
+    host.register(task).await.unwrap();
+    host.register(spec(temp.path(), "sibling")).await.unwrap();
+    host.ensure_started("sibling").await.unwrap();
+    let sibling = host.status("sibling").await.unwrap()["pid"].clone();
+    let mut events = host.subscribe("task-runtime", 0).unwrap();
+    assert_eq!(
+        host.submit("task-runtime", input("accepted-before-stop", "slow"))
+            .await
+            .unwrap()["durable"],
+        true
+    );
+    host.stop("task-runtime").await.unwrap();
+    host.stop("task-runtime").await.unwrap();
+    assert_eq!(host.status("task-runtime").await.unwrap()["hosted"], false);
+    assert_eq!(host.status("sibling").await.unwrap()["pid"], sibling);
+    let wire: Value = serde_json::from_str(
+        std::fs::read_to_string(temp.path().join("state/task-runtime/inputs"))
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(wire["agent_id"], "dot");
+    host.ensure_started("task-runtime").await.unwrap();
+    settled(&mut events, "accepted-before-stop").await;
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("state/task-runtime/inputs"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    host.shutdown().await;
 }
