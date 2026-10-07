@@ -17,6 +17,9 @@ from pathlib import Path
 state=Path(sys.argv[sys.argv.index('--state')+1]); state.mkdir(parents=True,exist_ok=True)
 with (state/'starts').open('a') as f: f.write(str(os.getpid())+'\n')
 def emit(v): print(json.dumps(v),flush=True)
+ready=json.loads(os.environ.get('PROXY_AGENT_SEAT','{}')).get('readiness')
+if ready:
+ emit({'type':'root_readiness','ready':True,'agent_name':'fixture','checked_at':1,'components':{'model':{'ready':True,'status':'inference_verified'},'mcp':{'ready':True,'status':'handshakes_complete'},'memory':{'ready':ready!='memory_missing','status':'journal_and_optchat_open'},'memory_adapters':{'ready':True},'life_map':{'ready':True,'required':True,'status':'read'}},'work_ahead':['fixture-goal']})
 def save(name,v):
  with (state/name).open('a') as f: f.write(json.dumps(v)+'\n'); f.flush(); os.fsync(f.fileno())
 requests=[json.loads(x) for x in (state/'inputs').read_text().splitlines()] if (state/'inputs').exists() else []
@@ -613,4 +616,55 @@ async fn native_process_uses_agent_name_in_ps() {
     assert!(process.trim_start().starts_with("JarvisDot"), "{process}");
     println!("Observed native process name: {process}");
     host.shutdown().await;
+}
+
+#[tokio::test]
+async fn availability_requires_current_verified_components_and_clears_on_reconfigure() {
+    let temp = tempfile::tempdir().unwrap();
+    let host = AgentHost::open(temp.path().join("host")).unwrap();
+    let mut configured = spec(temp.path(), "ready");
+    host.register(configured.clone()).await.unwrap();
+    host.ensure_started("ready").await.unwrap();
+    assert_eq!(host.status("ready").await.unwrap()["available"], false);
+    configured.seat_config = json!({"readiness":"complete"});
+    host.register(configured.clone()).await.unwrap();
+    let cursor = host.status("ready").await.unwrap()["sequence"]
+        .as_u64()
+        .unwrap();
+    let mut events = host.subscribe("ready", cursor).unwrap();
+    host.ensure_started("ready").await.unwrap();
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        if event.event["type"] == "root_readiness" {
+            break;
+        }
+    }
+    assert_eq!(host.status("ready").await.unwrap()["available"], true);
+    configured.seat_config = json!({"readiness":"memory_missing"});
+    host.register(configured).await.unwrap();
+    assert_eq!(host.status("ready").await.unwrap()["available"], false);
+    host.ensure_started("ready").await.unwrap();
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        if event.event["type"] == "root_readiness" {
+            break;
+        }
+    }
+    let status = host.status("ready").await.unwrap();
+    assert_eq!(
+        status["readiness"]["ready"], true,
+        "fixture claims ready despite a missing component"
+    );
+    assert_eq!(
+        status["available"], false,
+        "the host independently verifies all required components"
+    );
+    host.shutdown().await;
+    assert_eq!(host.status("ready").await.unwrap()["available"], false);
 }

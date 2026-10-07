@@ -113,6 +113,48 @@ impl SpaceBinding {
     }
 }
 
+/// Checked by the runtime after real inference and required tool/memory
+/// initialization. Unknown or missing components never imply availability.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RuntimeReadiness {
+    pub ready: bool,
+    pub agent_name: String,
+    pub checked_at: u64,
+    pub components: BTreeMap<String, ComponentReadiness>,
+    #[serde(default)]
+    pub work_ahead: Value,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ComponentReadiness {
+    pub ready: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(flatten)]
+    pub evidence: BTreeMap<String, Value>,
+}
+impl RuntimeReadiness {
+    pub fn verified(&self) -> bool {
+        let status = |key: &str, expected: &str| {
+            self.components.get(key).is_some_and(|component| {
+                component.ready && component.status.as_deref() == Some(expected)
+            })
+        };
+        self.ready
+            && self.checked_at > 0
+            && !self.agent_name.trim().is_empty()
+            && ["model", "mcp", "memory", "memory_adapters", "life_map"]
+                .iter()
+                .all(|key| {
+                    self.components
+                        .get(*key)
+                        .is_some_and(|component| component.ready)
+                })
+            && status("model", "inference_verified")
+            && status("mcp", "handshakes_complete")
+            && status("memory", "journal_and_optchat_open")
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentInput {
     pub id: String,
@@ -164,6 +206,7 @@ struct Agent {
     inputs: Mutex<HashSet<String>>,
     acknowledgements: Mutex<Acknowledgements>,
     state: Mutex<Value>,
+    readiness: Mutex<Option<RuntimeReadiness>>,
     log: Mutex<EventLog>,
     log_path: PathBuf,
     updates: watch::Sender<u64>,
@@ -289,6 +332,7 @@ impl AgentHost {
             }
             agent.pid.store(0, Ordering::SeqCst);
             *agent.stdin.lock().await = None;
+            *agent.readiness.lock().unwrap() = None;
             *agent.spec.lock().unwrap() = spec;
             return Ok(());
         }
@@ -311,6 +355,7 @@ impl AgentHost {
             inputs: Mutex::new(HashSet::new()),
             acknowledgements: Mutex::new(HashMap::new()),
             state: Mutex::new(json!({"status":"stopped"})),
+            readiness: Mutex::new(None),
             log: Mutex::new(log),
             log_path,
             updates,
@@ -349,6 +394,7 @@ impl AgentHost {
             return Ok(());
         }
         let spec = agent.spec.lock().unwrap().clone();
+        *agent.readiness.lock().unwrap() = None;
         let child = spawn(&spec)?;
         let generation = agent.generation.fetch_add(1, Ordering::SeqCst) + 1;
         agent.pid.store(child.id().unwrap_or(0), Ordering::SeqCst);
@@ -427,8 +473,13 @@ impl AgentHost {
         let agent = self.agent(id)?;
         let process = agent.process.lock().await;
         let pid = agent.pid.load(Ordering::SeqCst);
+        let readiness = agent.readiness.lock().unwrap().clone();
+        let available = pid != 0
+            && process.stop.is_some()
+            && readiness.as_ref().is_some_and(RuntimeReadiness::verified);
         Ok(
             json!({"agent_id":id,"pid":if pid==0 {None} else {Some(pid)},"hosted":process.stop.is_some(),
+            "available":available,"readiness":readiness,
             "runtime":*agent.state.lock().unwrap(),"sequence":agent.log.lock().unwrap().sequence}),
         )
     }
@@ -562,7 +613,7 @@ fn publish(agent: &Agent, event: Value) -> Result<(), HostError> {
     let kind = event.get("type").and_then(Value::as_str).unwrap_or("");
     if matches!(
         kind,
-        "accepted" | "agent_settled" | "host_process_exit" | "host_error"
+        "accepted" | "agent_settled" | "root_readiness" | "host_process_exit" | "host_error"
     ) {
         log.file.sync_data()?;
     }
@@ -571,6 +622,10 @@ fn publish(agent: &Agent, event: Value) -> Result<(), HostError> {
     drop(log);
     if kind == "root_state" {
         *agent.state.lock().unwrap() = event.clone();
+    } else if kind == "root_readiness" {
+        *agent.readiness.lock().unwrap() = serde_json::from_value(event.clone()).ok();
+    } else if matches!(kind, "host_process_exit" | "host_error") {
+        *agent.readiness.lock().unwrap() = None;
     }
     let id = event
         .get("event_id")
