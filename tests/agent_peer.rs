@@ -780,3 +780,119 @@ fn oversized_reply_is_rejected_while_streaming() {
         server.abort();
     });
 }
+
+#[test]
+fn tampered_reply_from_the_correct_target_is_rejected() {
+    runtime().block_on(async {
+        let caller = Arc::new(DeviceIdentity::generate());
+        let target = Arc::new(DeviceIdentity::generate());
+        let all = book(&[&caller, &target]);
+
+        // The reply is correctly signed by the *expected target*, bound to the
+        // request id and requester, but the payload bytes the client receives
+        // differ from the ones that were signed. The digest commit must catch it.
+        let app = axum::Router::new().route(
+            "/peer/agents",
+            axum::routing::post({
+                let target = Arc::clone(&target);
+                move |body: axum::body::Bytes| {
+                    let target = Arc::clone(&target);
+                    async move {
+                        let (envelope_bytes, _payload): (Vec<u8>, Vec<u8>) =
+                            postcard::from_bytes(&body).unwrap();
+                        let request_envelope =
+                            proxy_node_server::op::SignedOp::from_bytes(&envelope_bytes).unwrap();
+                        let signed = ReplyPayload {
+                            v: PROTOCOL_VERSION,
+                            request_id: request_envelope.id,
+                            requester: request_envelope.body.device,
+                            error: None,
+                            payload: Some(json!({"agent": "jarvis", "status": "ok"})),
+                        };
+                        let reply = seal_payload(REPLY_STORE, &signed, &target).unwrap();
+                        let tampered = ReplyPayload {
+                            payload: Some(json!({"agent": "jarvis", "status": "tampered"})),
+                            ..signed
+                        };
+                        frame_response(&reply, &tampered).unwrap()
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let endpoint = PeerEndpoint::new(&format!("http://127.0.0.1:{port}")).unwrap();
+        let client = PeerClient::new(caller, all, target.device_id(), endpoint).unwrap();
+        let error = client
+            .command(PeerCommand::Status {
+                agent: "jarvis".into(),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(error, PeerError::Unauthenticated), "got {error:?}");
+        server.abort();
+    });
+}
+
+#[test]
+fn wrong_request_id_reply_is_rejected() {
+    runtime().block_on(async {
+        let caller = Arc::new(DeviceIdentity::generate());
+        let target = Arc::new(DeviceIdentity::generate());
+        let all = book(&[&caller, &target]);
+
+        // Validly signed by the expected target, addressed to this requester,
+        // but bound to a *different* request id: a replayed or mismatched reply
+        // must never be surfaced as the answer to this request.
+        let app = axum::Router::new().route(
+            "/peer/agents",
+            axum::routing::post({
+                let target = Arc::clone(&target);
+                move |body: axum::body::Bytes| {
+                    let target = Arc::clone(&target);
+                    async move {
+                        let (_envelope_bytes, _payload): (Vec<u8>, Vec<u8>) =
+                            postcard::from_bytes(&body).unwrap();
+                        let payload = ReplyPayload {
+                            v: PROTOCOL_VERSION,
+                            request_id: proxy_node_server::op::OpId::from_bytes([9u8; 32]),
+                            requester: caller_device(&body),
+                            error: None,
+                            payload: Some(json!({"agent": "jarvis", "status": "stale"})),
+                        };
+                        let reply = seal_payload(REPLY_STORE, &payload, &target).unwrap();
+                        frame_response(&reply, &payload).unwrap()
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let endpoint = PeerEndpoint::new(&format!("http://127.0.0.1:{port}")).unwrap();
+        let client = PeerClient::new(caller, all, target.device_id(), endpoint).unwrap();
+        let error = client
+            .command(PeerCommand::Status {
+                agent: "jarvis".into(),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(error, PeerError::Unauthenticated), "got {error:?}");
+        server.abort();
+    });
+}
+
+fn caller_device(body: &axum::body::Bytes) -> DeviceId {
+    let (envelope_bytes, _payload): (Vec<u8>, Vec<u8>) = postcard::from_bytes(body).unwrap();
+    proxy_node_server::op::SignedOp::from_bytes(&envelope_bytes)
+        .unwrap()
+        .body
+        .device
+}

@@ -156,10 +156,11 @@ echoes; byte-identical replay returning the cached signed reply with no second
 effect, including across a server reopen; 64 concurrent deliveries of the same
 signed bytes producing exactly one effect; unknown/forged/tampered/stale and
 wrong-target requests never reaching the handler (counter stays zero); a
-crash-pending replay returning 409 with no repeat effect; a wrong-peer signed
-reply rejected client-side; traversal-bearing, oversized and undigested
-definitions rejected; an over-limit reply rejected while streaming; and the
-over-limit events request refused before dispatch. These are protocol guarantees over fixtures — not evidence of real
+crash-pending replay returning 409 with no repeat effect; wrong-peer,
+tampered (payload substituted under a valid target signature) and
+wrong-request-id signed replies all rejected client-side; traversal-bearing,
+oversized and undigested definitions rejected; an over-limit reply rejected
+while streaming; and the over-limit events request refused before dispatch. These are protocol guarantees over fixtures — not evidence of real
 model execution, guest provisioning, or any installed app behavior.
 
 Known limits: replay files grow unbounded with request volume (an
