@@ -23,6 +23,8 @@
 //!   seams, with mDNS and Tailscale providers behind their own features.
 //! - [`harness`] (feature `harness`): in-process multi-daemon test/perf harness.
 
+#[cfg(feature = "agent-host")]
+pub mod agent_host;
 #[cfg(feature = "discovery")]
 pub mod discovery;
 pub mod durable;
