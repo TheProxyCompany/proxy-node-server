@@ -25,6 +25,7 @@ pub mod herdr;
 pub mod http;
 pub mod pact;
 pub mod pact_server;
+pub mod peer;
 pub mod space;
 
 #[derive(Debug, thiserror::Error)]
