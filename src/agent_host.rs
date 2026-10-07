@@ -24,6 +24,7 @@ pub mod herdr;
 pub mod http;
 pub mod pact;
 pub mod pact_server;
+pub mod space;
 
 #[derive(Debug, thiserror::Error)]
 pub enum HostError {
@@ -73,7 +74,7 @@ pub enum SpaceIsolation {
 
 /// Issued by the application's local Cua provisioner after checking the local
 /// registry. This metadata cannot itself create isolation: the configured
-/// command must enter the provisioned guest, and its CUA MCP must target it.
+/// native tools must execute in the provisioned guest, and CUA must target it.
 /// Credentials belong only in `AgentSpec.env`, never in this value.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SpaceBinding {

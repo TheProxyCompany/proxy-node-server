@@ -73,3 +73,58 @@ cargo test --features agent-host --test agent_host herdr_live -- --ignored --noc
 
 Application OAuth/PACT mounting, real model execution, guest provisioning and
 installed-preview evidence are separate integration gates.
+
+### Local Cua Spaces
+
+`agent_host::space::CuaSpaceManager` provisions only local desktops on the
+already-selected trusted Proxy device. The application supplies a private
+`CUA_HOME` under its runtime data root and an installed absolute CLI path.
+`ensure_agent_space(agent_id, SpaceResources::default())` creates a Linux
+container desktop in Cua's managed local Linux VM, or resumes that same owned
+guest after a restart. `MacosVm` selects the local Lume backend. Ownership is
+fsynced before creation, unknown pre-existing guests are never adopted, and an
+exclusive manager lease serializes creation. The returned binding is checked
+against the live local registry, ready state, actual isolation kind, and
+loopback service endpoint. Workspace files live in the guest's own
+`$HOME/ProxyWorkspace`; no host folder is mounted by this module. A container's
+`disk_gb` must be zero because its engine controls storage; VM disk size is an
+explicit request. There is no implicit guest deletion or cloud fallback.
+
+The returned `CuaMcpLaunch` is for a trusted adapter only. **Do not expose the
+raw CLI helper to an agent:** Cua's `--sandbox` selects a default, and an MCP
+caller could otherwise override it. Grand Central's `computer::space` adapter
+registers that launch against the authenticated agent, filters the tool names,
+rejects target overrides, and injects the owned Space on every request. It
+serializes screenshot-coordinate state and revocation, never falls back to the
+host desktop, and never blindly repeats an ambiguous tool effect. A child with
+computer authority must receive a separately allocated/bound guest. Parent
+Space inheritance is not a child allocation.
+
+Space metadata alone is not process isolation. Native shell, file, and process
+tools must use the bound guest routes; a native host process cannot gain guest
+isolation by setting `PROXY_AGENT_SPACE`. Direct human screen observation and
+an agent's guest computer actions remain separate capabilities.
+
+For a reproducible macOS arm64 helper installation, run
+`scripts/install-cua-helper.sh /absolute/Proxy-owned/helper/directory`. It
+installs Cua CLI 0.4.1 from its fixed release URL only after verifying SHA-256
+and vendor code signing, with a receipt and MIT notice. Packaging can use this
+directory or bundle the verified helper under `Contents/Helpers`. Sign nested
+executables before signing the enclosing app and include `licenses/CUA-MIT.txt`
+in third-party notices. The helper only links system frameworks. Its runtime
+assets belong in the private `CUA_HOME`, not the application bundle; test data
+under a developer's temporary directory is not a shipping dependency.
+
+The core CLI/SDK, Cua Driver, and Lume are MIT at pinned source commit
+`ed22ad958a5ab6d764c98261b24d65f80f3a6f95`. The independently installed
+`cua-spacesd` service and Cua Spaces app/streaming extensions are FSL-1.1-MIT.
+This adapter does not vendor their source or relabel them as MIT. See upstream
+[license boundaries](https://github.com/trycua/cua/blob/ed22ad958a5ab6d764c98261b24d65f80f3a6f95/LICENSING.md).
+
+The `provision_agent_space` example exercises the real CLI and checks that
+repeated provisioning resumes the same owned guest. Grand Central's ignored
+`live_owned_guest_is_scoped_and_revocable` test accepts its JSON via
+`PROXY_CUA_PROOF_JSON` and verifies actual guest shell/files, a native GUI
+application and screenshot, target-override rejection, and revocation. It
+requires an explicitly supplied test guest and never opens a browser or the
+user's host desktop.
