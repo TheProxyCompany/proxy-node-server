@@ -317,8 +317,10 @@ async fn ownership_and_resource_validation_precede_any_runtime_boot() {
     assert!(!manager.receipt("agent-a").exists());
     fixture.guest(&manager, "agent-a", true);
     let owner = std::fs::read(manager.receipt("agent-a")).unwrap();
-    let mut resources = SpaceResources::default();
-    resources.cpus = 3;
+    let resources = SpaceResources {
+        cpus: 3,
+        ..SpaceResources::default()
+    };
     assert!(
         manager
             .ensure_agent_space("agent-a", resources)
