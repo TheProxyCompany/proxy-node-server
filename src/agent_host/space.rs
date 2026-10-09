@@ -1,10 +1,14 @@
 //! Local Cua provisioning. Ownership is recorded before creation so an
-//! interrupted request can recover without adopting another user's desktop.
+//! interrupted request never adopts another user's desktop. Versioned
+//! reservations can retry an initial create on a healthy backend; established
+//! guests are never replaced when they are missing after runtime recovery.
 //! Cua CLI/core SDK are MIT; the separately installed spacesd is FSL-1.1-MIT.
 //! This module calls the installed service and does not vendor its source.
 
 #[path = "space_home.rs"]
 mod home;
+#[path = "space_managed.rs"]
+mod managed;
 
 use super::{HostError, SpaceBinding, SpaceIsolation, private_directory, valid_id};
 use serde::{Deserialize, Serialize};
@@ -16,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 use tokio::sync::Mutex;
 
@@ -63,12 +67,26 @@ pub struct ProvisionedSpace {
     pub mcp: CuaMcpLaunch,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CreationState {
+    Reserved,
+    Established,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Ownership {
     version: u32,
     agent_id: String,
     name: String,
     resources: SpaceResources,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    creation: Option<CreationState>,
+}
+impl Ownership {
+    fn reserved(&self) -> bool {
+        self.version == 2 && self.creation == Some(CreationState::Reserved)
+    }
 }
 
 #[derive(Clone)]
@@ -131,7 +149,8 @@ impl CuaSpaceManager {
     }
     fn load_owner(&self, agent: &str) -> Result<Ownership, HostError> {
         let owner: Ownership = serde_json::from_slice(&std::fs::read(self.receipt(agent))?)?;
-        if owner.version != 1
+        if !matches!(owner.version, 1 | 2)
+            || (owner.version == 2 && owner.creation.is_none())
             || owner.agent_id != agent
             || owner.name != Self::name(&self.namespace, agent)
         {
@@ -140,6 +159,44 @@ impl CuaSpaceManager {
             ));
         }
         Ok(owner)
+    }
+
+    fn establish(&self, agent: &str, owner: &Ownership) -> Result<(), HostError> {
+        if !owner.reserved() {
+            return Ok(());
+        }
+        if self.load_owner(agent)? != *owner {
+            return Err(HostError::Busy);
+        }
+        let receipt = self.receipt(agent);
+        let mut updated = owner.clone();
+        updated.creation = Some(CreationState::Established);
+        use rand_core::RngCore;
+        let mut nonce = [0u8; 16];
+        rand_core::OsRng.fill_bytes(&mut nonce);
+        let nonce: String = nonce.iter().map(|byte| format!("{byte:02x}")).collect();
+        let temporary = receipt.with_extension(format!("establishing-{nonce}"));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let result = (|| {
+            use std::io::Write;
+            let mut file = options.open(&temporary)?;
+            file.write_all(&serde_json::to_vec(&updated)?)?;
+            file.sync_all()?;
+            if self.load_owner(agent)? != *owner {
+                return Err(HostError::Busy);
+            }
+            std::fs::rename(&temporary, &receipt)?;
+            File::open(receipt.parent().expect("receipt has parent"))?.sync_all()?;
+            Ok(())
+        })();
+        let _ = std::fs::remove_file(temporary);
+        result
     }
     fn base_args(&self) -> Vec<String> {
         vec![
@@ -165,36 +222,12 @@ impl CuaSpaceManager {
             .env_remove("CUA_DAEMON_TOKEN")
             .env_remove("CUA_SANDBOX")
             .env_remove("CUA_MCP_PERMISSIONS")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true);
-        let mut child = cmd.spawn()?;
-        let mut stdout = child
-            .stdout
-            .take()
-            .ok_or(HostError::Stopped)?
-            .take(4 * 1024 * 1024 + 1);
-        let result = tokio::time::timeout(timeout, async {
-            let mut bytes = Vec::new();
-            stdout.read_to_end(&mut bytes).await?;
-            if bytes.len() > 4 * 1024 * 1024 {
-                return Err(HostError::Invalid("Cua response exceeded 4 MiB".into()));
-            }
-            if !child.wait().await?.success() {
-                return Err(HostError::Invalid(
-                    "local Cua command failed; inspect Cua's local status".into(),
-                ));
-            }
-            Ok(bytes)
-        })
-        .await;
-        match result {
-            Ok(result) => result,
-            Err(_) => Err(HostError::Invalid(
-                "local Cua command timed out; inspect before retrying".into(),
-            )),
-        }
+            .stdin(Stdio::null());
+        let operation = format!(
+            "local Cua {}",
+            args.iter().take(2).cloned().collect::<Vec<_>>().join(" ")
+        );
+        run_command(cmd, timeout, &operation).await
     }
     async fn json(&self, args: &[String]) -> Result<Value, HostError> {
         Ok(serde_json::from_slice(
@@ -238,25 +271,53 @@ impl CuaSpaceManager {
         let _guard = self.mutation.lock().await;
         let _shared = home::lock(&self.home).await?;
         let name = Self::name(&self.namespace, agent);
-        let exists = self.listed(&name).await?;
         let receipt = self.receipt(agent);
-        if receipt.exists() {
-            let owner = self.load_owner(agent)?;
+        let mut owner = if receipt.try_exists()? {
+            Some(self.load_owner(agent)?)
+        } else {
+            None
+        };
+        if let Some(owner) = &owner {
             if owner.resources != resources {
                 return Err(HostError::Invalid(
                     "Space resources changed; stop and explicitly migrate the existing guest"
                         .into(),
                 ));
             }
-        } else {
+            if resources.kind == LocalSpaceKind::LinuxContainer {
+                // Cua 0.4.1 checks a guest's status before booting its engine.
+                // After an unclean host shutdown this reports "missing" even
+                // though the guest's disk is intact in the stopped managed VM.
+                managed::ensure_existing(self).await?;
+            }
+        }
+        let mut exists = self.listed(&name).await?;
+        if let Some(owner) = &owner {
+            if !exists {
+                if !owner.reserved() {
+                    return Err(HostError::Invalid(
+                        "The owned Cua guest is missing after runtime recovery; its ownership and files were preserved. Explicit recovery is required".into(),
+                    ));
+                }
+                let report = self.json(&["runtime".into(), "doctor".into()]).await?;
+                if !managed::backend_healthy(&self.home, &resources.kind, &report).await? {
+                    return Err(HostError::Invalid("Initial Cua provisioning remains reserved because its backend is not healthy enough to confirm absence; retry after runtime recovery".into()));
+                }
+                // Re-inspect after confirming engine health. A successful
+                // earlier create may have returned before its receipt advanced.
+                exists = self.listed(&name).await?;
+            }
+        }
+        if owner.is_none() {
             if exists {
                 return Err(HostError::Forbidden);
             }
-            let owner = Ownership {
-                version: 1,
+            let reservation = Ownership {
+                version: 2,
                 agent_id: agent.into(),
                 name: name.clone(),
                 resources: resources.clone(),
+                creation: Some(CreationState::Reserved),
             };
             let mut options = OpenOptions::new();
             options.write(true).create_new(true);
@@ -267,9 +328,10 @@ impl CuaSpaceManager {
             }
             let mut file = options.open(&receipt)?;
             use std::io::Write;
-            file.write_all(&serde_json::to_vec(&owner)?)?;
+            file.write_all(&serde_json::to_vec(&reservation)?)?;
             file.sync_all()?;
             File::open(receipt.parent().expect("receipt has parent"))?.sync_all()?;
+            owner = Some(reservation);
         }
         let id = format!("local:{name}");
         if !exists {
@@ -381,6 +443,9 @@ impl CuaSpaceManager {
             endpoint,
         };
         binding.validate()?;
+        // Publish established only after the same local guest is ready and its
+        // workspace is bound. Legacy v1 records remain byte-for-byte unchanged.
+        self.establish(agent, owner.as_ref().expect("ownership was recorded"))?;
         let mut args = self.base_args();
         args.extend([
             "mcp".into(),
@@ -417,6 +482,119 @@ impl CuaSpaceManager {
         .await?;
         Ok(())
     }
+}
+
+/// Cua can exit successfully with a structured failed setup step. Preserve its
+/// bounded diagnostic instead of reducing every failure to a generic message.
+async fn run_command(
+    mut command: Command,
+    timeout: Duration,
+    operation: &str,
+) -> Result<Vec<u8>, HostError> {
+    command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command.spawn()?;
+    let stdout = child.stdout.take().ok_or(HostError::Stopped)?;
+    let stderr = child.stderr.take().ok_or(HostError::Stopped)?;
+    let result = tokio::time::timeout(timeout, async {
+        tokio::try_join!(
+            bounded_output(stdout, 4 * 1024 * 1024),
+            bounded_output(stderr, 64 * 1024),
+            child.wait()
+        )
+    })
+    .await;
+    let (stdout, stderr, status) = match result {
+        Ok(Ok(output)) => output,
+        failed => {
+            let _ = child.start_kill();
+            let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+            let detail = match failed {
+                Ok(Err(error)) => error.to_string(),
+                Err(_) => "timed out; inspect before retrying".into(),
+                Ok(Ok(_)) => unreachable!(),
+            };
+            return Err(HostError::Invalid(format!("{operation}: {detail}")));
+        }
+    };
+    if !status.success() {
+        let message = String::from_utf8_lossy(&stderr);
+        let detail = diagnostic(
+            message
+                .lines()
+                .rev()
+                .find(|line| !line.trim().is_empty())
+                .unwrap_or("no diagnostic returned"),
+        );
+        return Err(HostError::Invalid(format!(
+            "{operation} failed ({status}): {detail}"
+        )));
+    }
+    if let Ok(value) = serde_json::from_slice::<Value>(&stdout) {
+        if let Some(error) = structured_failure(&value) {
+            return Err(HostError::Invalid(format!(
+                "{operation}: {}",
+                diagnostic(&error)
+            )));
+        }
+    }
+    Ok(stdout)
+}
+
+async fn bounded_output(reader: impl AsyncRead + Unpin, limit: usize) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    reader
+        .take(limit as u64 + 1)
+        .read_to_end(&mut bytes)
+        .await?;
+    if bytes.len() > limit {
+        return Err(std::io::Error::other(
+            "Cua command output exceeded its bounded limit",
+        ));
+    }
+    Ok(bytes)
+}
+
+fn diagnostic(message: &str) -> String {
+    message
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(512)
+        .collect()
+}
+
+fn structured_failure(value: &Value) -> Option<String> {
+    if let Some(steps) = value.as_array() {
+        return steps.iter().find_map(structured_failure);
+    }
+    let failed = value
+        .get("status")
+        .and_then(Value::as_str)
+        .is_some_and(|status| {
+            status.eq_ignore_ascii_case("error") || status.eq_ignore_ascii_case("failed")
+        })
+        || value.get("success").and_then(Value::as_bool) == Some(false)
+        || value
+            .get("exit_code")
+            .and_then(Value::as_i64)
+            .is_some_and(|code| code != 0)
+        || value
+            .get("error")
+            .is_some_and(|error| !error.is_null() && error.as_bool() != Some(false));
+    failed.then(|| {
+        ["detail", "message", "error", "stderr"]
+            .iter()
+            .find_map(|field| {
+                value
+                    .get(field)
+                    .and_then(Value::as_str)
+                    .filter(|text| !text.trim().is_empty())
+            })
+            .unwrap_or("Cua reported a failed operation")
+            .to_string()
+    })
 }
 
 #[cfg(all(test, unix))]

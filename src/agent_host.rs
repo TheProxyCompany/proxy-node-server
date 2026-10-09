@@ -10,8 +10,8 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -25,6 +25,7 @@ pub mod herdr;
 pub mod http;
 pub mod pact;
 pub mod pact_server;
+mod party_children;
 pub mod peer;
 pub mod space;
 
@@ -211,9 +212,14 @@ type Acknowledgements = HashMap<String, Vec<oneshot::Sender<Result<Value, String
 
 struct Agent {
     _lease: Arc<File>,
+    owner: Option<Weak<Agent>>,
+    children: Mutex<HashMap<String, Weak<Agent>>>,
+    child_launch: Mutex<Option<party_children::Launch>>,
+    controls: Mutex<HashMap<String, party_children::Pending>>,
     spec: Mutex<AgentSpec>,
     process: AsyncMutex<ProcessState>,
     generation: AtomicU64,
+    retired: AtomicBool,
     pid: AtomicU32,
     stdin: AsyncMutex<Option<ChildStdin>>,
     inputs: Mutex<HashSet<String>>,
@@ -230,6 +236,7 @@ struct Agent {
 pub struct AgentHost {
     root: PathBuf,
     agents: Arc<Mutex<HashMap<String, Arc<Agent>>>>,
+    retired_ids: Arc<Mutex<HashSet<String>>>,
     lease: Arc<File>,
 }
 
@@ -300,6 +307,7 @@ impl AgentHost {
         Ok(Self {
             root: root.as_ref().to_path_buf(),
             agents: Arc::new(Mutex::new(HashMap::new())),
+            retired_ids: Arc::new(Mutex::new(HashSet::new())),
             lease: Arc::new(lease),
         })
     }
@@ -308,6 +316,28 @@ impl AgentHost {
     /// spec. A changed idle loadout stops its old process; a busy change fails
     /// explicitly instead of silently widening tools midway through a task.
     pub async fn register(&self, spec: AgentSpec) -> Result<(), HostError> {
+        self.register_owned(spec, None).await
+    }
+
+    /// Register a Party seat whose operating-system parent is its owning PH.
+    /// Child processes are opened through that root, never launched by Node.
+    pub async fn register_party_child(
+        &self,
+        parent_id: &str,
+        spec: AgentSpec,
+    ) -> Result<(), HostError> {
+        self.check_active_id(parent_id)?;
+        let parent = self.agent(parent_id)?;
+        party_children::validate_owner(&parent, &spec)?;
+        self.register_owned(spec, Some(parent)).await
+    }
+
+    async fn register_owned(
+        &self,
+        spec: AgentSpec,
+        owner: Option<Arc<Agent>>,
+    ) -> Result<(), HostError> {
+        self.check_active_id(&spec.id)?;
         if let Some(space) = &spec.space {
             space.validate()?;
         }
@@ -330,14 +360,28 @@ impl AgentHost {
         }
         let existing = self.agents.lock().unwrap().get(&spec.id).cloned();
         if let Some(agent) = existing {
+            if !party_children::same_owner(&agent, owner.as_ref()) {
+                return Err(HostError::Invalid(
+                    "an agent cannot change its process owner".into(),
+                ));
+            }
             let mut process = agent.process.lock().await;
+            self.check_active_id(&spec.id)?;
+            agent.check_active()?;
             if *agent.spec.lock().unwrap() == spec {
                 return Ok(());
             }
-            if !agent.inputs.lock().unwrap().is_empty() {
+            if !agent.inputs.lock().unwrap().is_empty() || party_children::has_busy_children(&agent)
+            {
                 return Err(HostError::Busy);
             }
+            if agent.owner.is_some() {
+                party_children::stop(&agent).await?;
+                *agent.spec.lock().unwrap() = spec;
+                return Ok(());
+            }
             agent.generation.fetch_add(1, Ordering::SeqCst);
+            party_children::invalidate_children(&agent);
             if let Some(stop) = process.stop.take() {
                 let _ = stop.send(true);
             }
@@ -358,12 +402,17 @@ impl AgentHost {
         let id = spec.id.clone();
         let agent = Arc::new(Agent {
             _lease: Arc::clone(&self.lease),
+            owner: owner.as_ref().map(Arc::downgrade),
+            children: Mutex::new(HashMap::new()),
+            child_launch: Mutex::new(None),
+            controls: Mutex::new(HashMap::new()),
             spec: Mutex::new(spec),
             process: AsyncMutex::new(ProcessState {
                 stop: None,
                 finished: None,
             }),
             generation: AtomicU64::new(0),
+            retired: AtomicBool::new(false),
             pid: AtomicU32::new(0),
             stdin: AsyncMutex::new(None),
             inputs: Mutex::new(HashSet::new()),
@@ -377,12 +426,32 @@ impl AgentHost {
         });
         // Concurrent identical registration converges on one process owner.
         let mut agents = self.agents.lock().unwrap();
+        self.check_active_id(&id)?;
         if let Some(existing) = agents.get(&id) {
-            if *existing.spec.lock().unwrap() != *agent.spec.lock().unwrap() {
+            existing.check_active()?;
+            if !party_children::same_owner(existing, owner.as_ref())
+                || *existing.spec.lock().unwrap() != *agent.spec.lock().unwrap()
+            {
                 return Err(HostError::Busy);
             }
         } else {
+            if let Some(parent) = owner {
+                parent
+                    .children
+                    .lock()
+                    .unwrap()
+                    .insert(id.clone(), Arc::downgrade(&agent));
+            }
             agents.insert(id, agent);
+        }
+        Ok(())
+    }
+
+    fn check_active_id(&self, id: &str) -> Result<(), HostError> {
+        if self.retired_ids.lock().unwrap().contains(id) {
+            return Err(HostError::Invalid(
+                "agent handle is retired after migration".into(),
+            ));
         }
         Ok(())
     }
@@ -403,8 +472,22 @@ impl AgentHost {
     }
 
     pub async fn ensure_started(&self, id: &str) -> Result<(), HostError> {
+        self.check_active_id(id)?;
         let agent = self.agent(id)?;
+        agent.check_active()?;
+        if let Some(parent) = agent.owner.as_ref().and_then(Weak::upgrade) {
+            self.ensure_root_started(&parent).await?;
+            return party_children::ensure_started(&agent, &parent).await;
+        }
+        self.ensure_root_started(&agent).await
+    }
+
+    async fn ensure_root_started(&self, agent: &Arc<Agent>) -> Result<(), HostError> {
+        if agent.owner.is_some() {
+            return Err(HostError::Stopped);
+        }
         let mut process = agent.process.lock().await;
+        agent.check_active()?;
         if process.stop.is_some() {
             return Ok(());
         }
@@ -418,7 +501,7 @@ impl AgentHost {
         process.stop = Some(stop);
         process.finished = Some(completion);
         tokio::spawn(supervise(
-            Arc::clone(&agent),
+            Arc::clone(agent),
             child,
             stopped,
             generation,
@@ -498,14 +581,21 @@ impl AgentHost {
             json!({"mode":spec.workspace_mode,"root":root,"space_id":spec.space.as_ref().map(|space| &space.space_id),"os_sandbox":spec.workspace_mode == WorkspaceMode::Guest && spec.space.as_ref().is_some_and(|space| !matches!(&space.isolation, SpaceIsolation::Shared))})
         };
         let handoff = agent.handoff.lock().unwrap().clone();
+        let retired = agent.retired.load(Ordering::SeqCst);
+        let hosted = !retired
+            && if agent.owner.is_some() {
+                party_children::is_live(&agent)
+            } else {
+                process.stop.is_some()
+            };
         let available = handoff
             .as_ref()
             .is_none_or(|state| state.admission == "open")
             && pid != 0
-            && process.stop.is_some()
+            && hosted
             && readiness.as_ref().is_some_and(RuntimeReadiness::verified);
         Ok(
-            json!({"agent_id":id,"pid":if pid==0 {None} else {Some(pid)},"hosted":process.stop.is_some(),
+            json!({"agent_id":id,"pid":if pid==0 {None} else {Some(pid)},"hosted":hosted,"retired":retired,"party_child":party_children::status(&agent),
             "available":available,"readiness":readiness,"handoff":handoff,"workspace":workspace,
             "runtime":*agent.state.lock().unwrap(),"sequence":agent.log.lock().unwrap().sequence}),
         )
@@ -535,6 +625,10 @@ impl AgentHost {
 
     pub async fn abort(&self, id: &str) -> Result<(), HostError> {
         let agent = self.agent(id)?;
+        agent.check_active()?;
+        if agent.owner.is_some() {
+            return party_children::abort(&agent).await;
+        }
         let mut pipe = agent.stdin.lock().await;
         let pipe = pipe.as_mut().ok_or(HostError::Stopped)?;
         pipe.write_all(b"{\"type\":\"abort\"}\n").await?;
@@ -547,7 +641,15 @@ impl AgentHost {
     pub async fn stop(&self, id: &str) -> Result<(), HostError> {
         let agent = self.agent(id)?;
         let mut process = agent.process.lock().await;
+        Self::stop_locked(&agent, &mut process).await
+    }
+
+    async fn stop_locked(agent: &Arc<Agent>, process: &mut ProcessState) -> Result<(), HostError> {
+        if agent.owner.is_some() {
+            return party_children::stop(agent).await;
+        }
         agent.generation.fetch_add(1, Ordering::SeqCst);
+        party_children::invalidate_children(agent);
         if let Some(stop) = process.stop.take() {
             let _ = stop.send(true);
         }
@@ -562,10 +664,34 @@ impl AgentHost {
         Ok(())
     }
 
+    /// Permanently fence a migrated handle in this host while retaining its
+    /// journal and subscriptions. The caller verifies durable handoff or
+    /// exclusive offline ownership first. An unknown id is tombstoned without
+    /// creating any registration, state directory, or process.
+    pub async fn retire(&self, id: &str) -> Result<(), HostError> {
+        if !valid_id(id) {
+            return Err(HostError::Invalid("valid agent id is required".into()));
+        }
+        self.retired_ids.lock().unwrap().insert(id.into());
+        let agent = self.agents.lock().unwrap().get(id).cloned();
+        if let Some(agent) = agent {
+            let mut process = agent.process.lock().await;
+            agent.retired.store(true, Ordering::SeqCst);
+            Self::stop_locked(&agent, &mut process).await?;
+            publish(&agent, json!({"type":"host_retired"}))?;
+        }
+        Ok(())
+    }
+
     pub async fn shutdown(&self) {
         let agents: Vec<_> = self.agents.lock().unwrap().values().cloned().collect();
         for agent in agents {
+            if agent.owner.is_some() {
+                continue;
+            }
             let mut process = agent.process.lock().await;
+            agent.generation.fetch_add(1, Ordering::SeqCst);
+            party_children::invalidate_children(&agent);
             if let Some(stop) = process.stop.take() {
                 let _ = stop.send(true);
             }
@@ -613,12 +739,36 @@ impl EventSubscription {
 }
 
 impl Agent {
+    fn check_active(&self) -> Result<(), HostError> {
+        if self.retired.load(Ordering::SeqCst) {
+            return Err(HostError::Invalid(
+                "agent handle is retired after migration".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// The process belongs to this object, never to the attached client.
     async fn write(&self, wire: &Value) -> Result<(), HostError> {
+        self.check_active()?;
+        if self.owner.is_some() {
+            return party_children::send(self, wire).await;
+        }
+        self.write_direct(wire).await
+    }
+
+    async fn write_direct(&self, wire: &Value) -> Result<(), HostError> {
+        self.check_active()?;
         use tokio::io::AsyncWriteExt;
         match tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let mut stdin = self.stdin.lock().await;
+                if self.retired.load(Ordering::SeqCst) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "agent handle is retired",
+                    ));
+                }
                 if let Some(stdin) = stdin.as_mut() {
                     stdin.write_all(format!("{wire}\n").as_bytes()).await?;
                     stdin.flush().await?;
@@ -671,6 +821,9 @@ fn spawn(spec: &AgentSpec) -> Result<Child, HostError> {
 }
 
 fn publish(agent: &Agent, event: Value) -> Result<(), HostError> {
+    if party_children::route(agent, &event)? {
+        return Ok(());
+    }
     let mut log = agent.log.lock().unwrap();
     let record = HostEvent {
         sequence: log.sequence + 1,
@@ -688,6 +841,8 @@ fn publish(agent: &Agent, event: Value) -> Result<(), HostError> {
             | "observation_recorded"
             | "root_readiness"
             | "host_process_exit"
+            | "host_party_child_started"
+            | "host_retired"
             | "host_error"
     ) || kind == "handoff_state"
         || (kind == "response" && handoff::is_command(&event))
@@ -792,6 +947,8 @@ async fn supervise(
         let _ = output.await;
         let _ = errors.await;
         *agent.stdin.lock().await = None;
+        agent.pid.store(0, Ordering::SeqCst);
+        party_children::invalidate_children(&agent);
         let _ = publish(
             &agent,
             json!({"type":"host_process_exit","code":status.ok().and_then(|s|s.code()),"stopping":*stop.borrow()}),
