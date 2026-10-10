@@ -12,30 +12,38 @@ jobs:
   fmt:
     name: rustfmt
     runs-on: [self-hosted, ci-cd]
+    env:
+      RUSTUP_TOOLCHAIN: 1.97.1
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
+      - run: |
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          rustup toolchain install 1.97.1 --profile minimal --component rustfmt --no-self-update
       - run: cargo fmt --all -- --check
 
   msrv:
     name: msrv (1.85)
     runs-on: [self-hosted, ci-cd]
+    env:
+      RUSTUP_TOOLCHAIN: 1.85.0
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.85.0
+      - run: |
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          rustup toolchain install 1.85.0 --profile minimal --no-self-update
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --locked --all-features
 
   build-test:
     name: build + test
     runs-on: [self-hosted, ci-cd]
+    env:
+      RUSTUP_TOOLCHAIN: 1.97.1
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
+      - run: |
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          rustup toolchain install 1.97.1 --profile minimal --component clippy --no-self-update
       - uses: Swatinem/rust-cache@v2
       - name: Build (all features)
         run: cargo build --locked --all-features
