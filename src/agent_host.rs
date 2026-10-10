@@ -902,6 +902,25 @@ fn publish(agent: &Agent, event: Value) -> Result<(), HostError> {
         log.file.sync_data()?;
     }
     log.sequence = record.sequence;
+    // The agent is idle before anyone hears that it settled: a subscriber
+    // that reacts to agent_settled may change its configuration at once.
+    if matches!(kind, "agent_settled" | "observation_recorded") {
+        if let Some(id) = event
+            .get("event_id")
+            .or_else(|| event.get("id"))
+            .and_then(Value::as_str)
+        {
+            let mut inputs = agent.inputs.lock().unwrap();
+            inputs.remove(id);
+            if inputs.is_empty() {
+                let mut state = agent.state.lock().unwrap();
+                if state["input_id"].as_str() == Some(id) || state["input_id"].is_null() {
+                    state["status"] = json!("idle");
+                    state["input_id"] = Value::Null;
+                }
+            }
+        }
+    }
     agent.updates.send_replace(record.sequence);
     drop(log);
     if kind == "root_state" {
@@ -951,8 +970,6 @@ fn publish(agent: &Agent, event: Value) -> Result<(), HostError> {
                     let _ = waiter.send(Err(error.into()));
                 }
             }
-        } else if matches!(kind, "agent_settled" | "observation_recorded") {
-            agent.inputs.lock().unwrap().remove(id);
         }
     }
     Ok(())
