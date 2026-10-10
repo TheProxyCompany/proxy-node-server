@@ -4,8 +4,8 @@ Enable the `agent-host` feature to put persistent agent processes behind the
 node's existing HTTP listener. Grand Central resolves definitions, equipment and
 credentials into `AgentSpec`; HTTP callers cannot register commands or paths.
 The runtime executable receives `--rpc --agent … --state … --workspace …` and
-`PROXY_AGENT_SEAT`. A provisioned Cua binding, when present, is passed separately
-as `PROXY_AGENT_SPACE`. That binding is metadata, not virtualization: the app
+`PROXY_HARNESS_SEAT`. A provisioned Cua binding, when present, is passed separately
+as `PROXY_HARNESS_SPACE`. That binding is metadata, not virtualization: the app
 must launch into the actual guest and supply a computer MCP scoped to it.
 
 `AgentHost::open` takes an exclusive lease on its private state directory.
@@ -50,7 +50,7 @@ Herdr integration is opt-in through `HERDR_ENV`, `HERDR_BIN_PATH`,
 `HERDR_SOCKET_PATH` and `HERDR_PANE_ID`. The bridge uses the documented
 `pane report-agent` / `release-agent` CLI with monotonically increasing sequence
 numbers. Its latest-state background reporter cannot block runtime acceptance.
-An optional `PROXY_AGENT_HERDR_RESUME_ARGV` must attach to the existing host,
+An optional `PROXY_HARNESS_HERDR_RESUME_ARGV` must attach to the existing host,
 not launch a second root. Upstream: <https://herdr.dev/docs/add-herdr-support/>.
 
 ## Verification
@@ -113,7 +113,7 @@ Space inheritance is not a child allocation.
 
 Space metadata alone is not process isolation. Native shell, file, and process
 tools must use the bound guest routes; a native host process cannot gain guest
-isolation by setting `PROXY_AGENT_SPACE`. Direct human screen observation and
+isolation by setting `PROXY_HARNESS_SPACE`. Direct human screen observation and
 an agent's guest computer actions remain separate capabilities.
 
 For a reproducible macOS arm64 helper installation, run

@@ -17,7 +17,9 @@ from pathlib import Path
 state=Path(sys.argv[sys.argv.index('--state')+1]); state.mkdir(parents=True,exist_ok=True)
 with (state/'starts').open('a') as f: f.write(str(os.getpid())+'\n')
 def emit(v): print(json.dumps(v),flush=True)
-ready=json.loads(os.environ.get('PROXY_AGENT_SEAT','{}')).get('readiness')
+# Match the real runtime: initial state precedes readiness.
+emit({'type':'root_state','status':'idle','input_id':None,'queue_depth':0})
+ready=json.loads(os.environ.get('PROXY_HARNESS_SEAT','{}')).get('readiness')
 if ready:
  emit({'type':'root_readiness','ready':True,'agent_name':'fixture','checked_at':1,'components':{'model':{'ready':True,'status':'inference_verified'},'mcp':{'ready':True,'status':'tools_verified'},'memory':{'ready':ready!='memory_missing','status':'journal_and_optchat_open'},'memory_adapters':{'ready':True},'life_map':{'ready':True,'required':True,'status':'read'}},'work_ahead':['fixture-goal']})
 def save(name,v):
@@ -27,7 +29,7 @@ done=set((state/'done').read_text().splitlines()) if (state/'done').exists() els
 def finish(v):
  emit({'type':'root_state','status':'running','input_id':v['id'],'queue_depth':0})
  if v['message']=='slow': time.sleep(.3)
- model=json.loads(os.environ.get('PROXY_AGENT_SEAT','{}')).get('model','fixture')
+ model=json.loads(os.environ.get('PROXY_HARNESS_SEAT','{}')).get('model','fixture')
  emit({'type':'message_end','event_id':v['id'],'message':{'role':'assistant','content':[{'type':'text','text':v['message']+':'+model}]}})
  with (state/'done').open('a') as f: f.write(v['id']+'\n'); f.flush(); os.fsync(f.fileno())
  done.add(v['id'])
@@ -209,6 +211,95 @@ async fn event_history_reopens_after_host_restart_and_host_lease_is_exclusive() 
     settled(&mut replay, "one").await;
     assert_eq!(host.status("dot").await.unwrap()["pid"], Value::Null);
     host.shutdown().await;
+}
+
+#[tokio::test]
+async fn canonical_host_restart_recovers_admitted_work_after_a_failed_start_epoch() {
+    let temp = tempfile::tempdir().unwrap();
+    let directory = temp.path().join("host");
+    let configured = spec(temp.path(), "dot");
+    let host = AgentHost::open(&directory).unwrap();
+    host.register(configured.clone()).await.unwrap();
+    assert_eq!(
+        host.submit("dot", input("retained", "slow")).await.unwrap()["durable"],
+        true
+    );
+    host.shutdown().await;
+    drop(host);
+    tokio::task::yield_now().await;
+
+    // A previous host's invalid launch configuration is never persisted as
+    // the authority of a later host. It must not erase the runtime's inbox.
+    let failed = AgentHost::open(&directory).unwrap();
+    let mut poisoned = configured.clone();
+    poisoned.command = "/usr/bin/false".into();
+    failed.register(poisoned).await.unwrap();
+    let cursor = failed.status("dot").await.unwrap()["sequence"]
+        .as_u64()
+        .unwrap();
+    let mut exits = failed.subscribe("dot", cursor).unwrap();
+    failed.ensure_started("dot").await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if exits.recv().await.unwrap().event["type"] == "host_process_exit" {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    failed.shutdown().await;
+    drop(exits);
+    drop(failed);
+    tokio::task::yield_now().await;
+
+    let restored = AgentHost::open(&directory).unwrap();
+    restored.register(configured.clone()).await.unwrap();
+    let cursor = restored.status("dot").await.unwrap()["sequence"]
+        .as_u64()
+        .unwrap();
+    let mut recovered = restored.subscribe("dot", cursor).unwrap();
+    restored.ensure_started("dot").await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let event = recovered.recv().await.unwrap().event;
+            if event["type"] == "root_state" && event["status"] == "running" {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let mut changed = configured;
+    changed.seat_config = json!({"model":"different"});
+    assert!(matches!(
+        restored.register(changed).await,
+        Err(HostError::Busy)
+    ));
+    settled(&mut recovered, "retained").await;
+    assert_eq!(
+        restored
+            .submit("dot", input("retained", "slow"))
+            .await
+            .unwrap()["duplicate"],
+        true
+    );
+    settled(&mut recovered, "retained").await;
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("state/dot/inputs"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("state/dot/done"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    restored.shutdown().await;
 }
 
 #[tokio::test]
@@ -562,7 +653,7 @@ async fn herdr_live_reports_and_releases_only_the_supplied_test_pane() {
         binary.clone().into(),
         socket.clone(),
         pane.clone(),
-        "proxy-agent-proof".into(),
+        "proxy-harness-proof".into(),
         vec![],
     )
     .unwrap();
@@ -627,6 +718,17 @@ async fn availability_requires_current_verified_components_and_clears_on_reconfi
     host.register(configured.clone()).await.unwrap();
     host.ensure_started("ready").await.unwrap();
     assert_eq!(host.status("ready").await.unwrap()["available"], false);
+    // A spawned process is not yet known to be idle: wait for its initial state.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if host.status("ready").await.unwrap()["runtime"]["status"] == "idle" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
     configured.seat_config = json!({"readiness":"complete"});
     host.register(configured.clone()).await.unwrap();
     let cursor = host.status("ready").await.unwrap()["sequence"]

@@ -275,6 +275,7 @@ async fn reboot_restores_the_same_guest_after_booting_only_its_existing_runtime(
         "DOCKER_CONTEXT",
         "CUA_DAEMON",
         "PROXY_AGENT_API_KEY",
+        "PROXY_HARNESS_API_KEY",
     ] {
         assert!(boots[0]["env"].get(key).is_none());
     }

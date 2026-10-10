@@ -10,6 +10,11 @@ mod home;
 #[path = "space_managed.rs"]
 mod managed;
 
+// Migration identity: retain the existing lock, receipts and resource names.
+// Renaming these would allow old and new hosts to own the same logical agent.
+const LEGACY_OWNERS_DIRECTORY: &str = "proxy-agent-owners";
+const LEGACY_SPACE_PREFIX: &str = "proxy-agent-";
+
 use super::{HostError, SpaceBinding, SpaceIsolation, private_directory, valid_id};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -111,7 +116,7 @@ impl CuaSpaceManager {
             ));
         }
         private_directory(root)?;
-        private_directory(&root.join("proxy-agent-owners"))?;
+        private_directory(&root.join(LEGACY_OWNERS_DIRECTORY))?;
         let mut options = OpenOptions::new();
         options.create(true).read(true).write(true).truncate(false);
         #[cfg(unix)]
@@ -119,7 +124,7 @@ impl CuaSpaceManager {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
-        let lease = options.open(root.join("proxy-agent-owners/manager.lock"))?;
+        let lease = options.open(root.join(LEGACY_OWNERS_DIRECTORY).join("manager.lock"))?;
         fs2::FileExt::try_lock_exclusive(&lease).map_err(|_| HostError::Busy)?;
         let (home, namespace) = home::open(root)?;
         Ok(Self {
@@ -135,7 +140,7 @@ impl CuaSpaceManager {
     fn name(namespace: &str, agent: &str) -> String {
         let hash = Sha256::digest(format!("{namespace}\0{agent}").as_bytes());
         format!(
-            "proxy-agent-{}",
+            "{LEGACY_SPACE_PREFIX}{}",
             hash[..12]
                 .iter()
                 .map(|v| format!("{v:02x}"))
@@ -144,7 +149,7 @@ impl CuaSpaceManager {
     }
     fn receipt(&self, agent: &str) -> PathBuf {
         self.root
-            .join("proxy-agent-owners")
+            .join(LEGACY_OWNERS_DIRECTORY)
             .join(format!("{}.json", Self::name(&self.namespace, agent)))
     }
     fn load_owner(&self, agent: &str) -> Result<Ownership, HostError> {
@@ -521,13 +526,21 @@ async fn run_command(
     };
     if !status.success() {
         let message = String::from_utf8_lossy(&stderr);
-        let detail = diagnostic(
-            message
-                .lines()
-                .rev()
-                .find(|line| !line.trim().is_empty())
-                .unwrap_or("no diagnostic returned"),
-        );
+        let stderr_detail = message
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .map(diagnostic);
+        let stdout_detail = serde_json::from_slice::<Value>(&stdout)
+            .ok()
+            .and_then(|value| structured_failure(&value))
+            .map(|error| diagnostic(&error));
+        let detail = match (stdout_detail, stderr_detail) {
+            (Some(error), Some(stderr)) if error != stderr => format!("{error}; stderr: {stderr}"),
+            (Some(error), _) => error,
+            (_, Some(stderr)) => stderr,
+            _ => "no diagnostic returned".into(),
+        };
         return Err(HostError::Invalid(format!(
             "{operation} failed ({status}): {detail}"
         )));
@@ -569,6 +582,12 @@ fn structured_failure(value: &Value) -> Option<String> {
     if let Some(steps) = value.as_array() {
         return steps.iter().find_map(structured_failure);
     }
+    // Cua 0.4.1 wraps `spaces create --json` results, including failed rows.
+    if let Some(spaces) = value.get("spaces").and_then(Value::as_array)
+        && let Some(error) = spaces.iter().find_map(structured_failure)
+    {
+        return Some(error);
+    }
     let failed = value
         .get("status")
         .and_then(Value::as_str)
@@ -584,17 +603,116 @@ fn structured_failure(value: &Value) -> Option<String> {
             .get("error")
             .is_some_and(|error| !error.is_null() && error.as_bool() != Some(false));
     failed.then(|| {
-        ["detail", "message", "error", "stderr"]
-            .iter()
-            .find_map(|field| {
-                value
-                    .get(field)
-                    .and_then(Value::as_str)
-                    .filter(|text| !text.trim().is_empty())
-            })
+        failure_message(value)
             .unwrap_or("Cua reported a failed operation")
             .to_string()
     })
+}
+
+fn failure_message(value: &Value) -> Option<&str> {
+    ["detail", "message", "error", "stderr"]
+        .iter()
+        .find_map(|field| {
+            value
+                .get(field)
+                .and_then(Value::as_str)
+                .filter(|text| !text.trim().is_empty())
+        })
+        .or_else(|| {
+            let error = value.get("error")?.as_object()?;
+            ["detail", "message", "reason", "stderr"]
+                .iter()
+                .find_map(|field| {
+                    error
+                        .get(*field)
+                        .and_then(Value::as_str)
+                        .filter(|text| !text.trim().is_empty())
+                })
+        })
+}
+
+#[cfg(all(test, unix))]
+mod diagnostic_process_tests {
+    use super::*;
+    async fn output(stdout: Value, stderr: &str, code: &str) -> Result<Vec<u8>, HostError> {
+        let mut command = Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                "printf '%s\\n' \"$1\"; printf '%s\\n' \"$2\" >&2; exit \"$3\"",
+                "failure-output",
+            ])
+            .arg(stdout.to_string())
+            .arg(stderr)
+            .arg(code);
+        run_command(command, Duration::from_secs(5), "failure-output").await
+    }
+    #[tokio::test]
+    async fn failed_process_keeps_structured_error_and_warning_without_other_payload() {
+        let error = output(serde_json::json!({"error":{"message":"container creation refused","environment":{"TOKEN":"must-not-appear"}},"unrelated":"must-not-appear"}), "disk warning", "1").await.unwrap_err().to_string();
+        assert!(error.contains("container creation refused"));
+        assert!(error.contains("stderr: disk warning"));
+        assert!(error.contains("exit status: 1"));
+        assert!(!error.contains("must-not-appear"));
+    }
+    #[tokio::test]
+    async fn spaces_create_envelope_keeps_bounded_failure_and_accepts_successful_rows() {
+        let error = output(
+            serde_json::json!({"spaces":[
+                {"error":format!("container engine: pull failed: input/output error {}", "x".repeat(2048))}
+            ]}),
+            "WARN low disk space: free after pull 14.2 GiB",
+            "1",
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("container engine: pull failed: input/output error"));
+        assert!(error.contains("stderr: WARN low disk space: free after pull 14.2 GiB"));
+        assert!(error.contains("exit status: 1"));
+        assert!(error.len() < 1200);
+        assert!(!error.contains("\"spaces\""));
+
+        let success =
+            serde_json::json!({"spaces":[{"id":"local:ready-space","name":"ready-space"}]});
+        let bytes = output(success.clone(), "", "0").await.unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), success);
+    }
+    #[tokio::test]
+    async fn failed_process_keeps_step_failure_and_bounds_both_streams() {
+        let error = output(serde_json::json!([{"status":"ok","message":"unrelated"},{"status":"failed","detail":format!("failure {}", "x".repeat(2048))}]), &"w".repeat(2048), "1").await.unwrap_err().to_string();
+        assert!(error.contains("failure "));
+        assert!(error.contains("stderr: "));
+        assert!(error.len() < 1200);
+        assert!(!error.contains("unrelated"));
+    }
+    #[tokio::test]
+    async fn ordinary_stderr_and_successful_json_keep_existing_behavior() {
+        let error = output(
+            serde_json::json!({"unrelated":"must-not-appear"}),
+            "ordinary process error",
+            "1",
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("ordinary process error"));
+        assert!(!error.contains("must-not-appear"));
+        let success = serde_json::json!({"status":"ready","value":7});
+        let bytes = output(success.clone(), "a warning", "0").await.unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), success);
+        assert!(
+            output(
+                serde_json::json!({"success":false,"error":{"message":"failed setup step"}}),
+                "",
+                "0"
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("failed setup step")
+        );
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -628,5 +746,33 @@ mod tests {
         ));
         drop(first);
         CuaSpaceManager::open("/bin/sh", temp.path()).unwrap();
+    }
+
+    #[test]
+    fn legacy_owner_lock_and_resource_identity_survive_harness_rename() {
+        let temp = tempfile::tempdir().unwrap();
+        let owner = temp.path().join("proxy-agent-owners");
+        std::fs::create_dir_all(&owner).unwrap();
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(owner.join("manager.lock"))
+            .unwrap();
+        fs2::FileExt::try_lock_exclusive(&lock).unwrap();
+        assert!(matches!(
+            CuaSpaceManager::open("/bin/sh", temp.path()),
+            Err(HostError::Busy)
+        ));
+        drop(lock);
+        let manager = CuaSpaceManager::open("/bin/sh", temp.path()).unwrap();
+        let name = CuaSpaceManager::name(&manager.namespace, "existing-agent");
+        assert!(name.starts_with("proxy-agent-"));
+        assert_eq!(
+            manager.receipt("existing-agent"),
+            owner.join(format!("{name}.json"))
+        );
+        assert!(!temp.path().join("proxy-harness-owners").exists());
     }
 }

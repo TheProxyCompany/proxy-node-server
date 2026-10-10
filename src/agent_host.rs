@@ -371,8 +371,7 @@ impl AgentHost {
             if *agent.spec.lock().unwrap() == spec {
                 return Ok(());
             }
-            if !agent.inputs.lock().unwrap().is_empty() || party_children::has_busy_children(&agent)
-            {
+            if agent.has_pending_work() || party_children::has_busy_children(&agent) {
                 return Err(HostError::Busy);
             }
             if agent.owner.is_some() {
@@ -495,7 +494,7 @@ impl AgentHost {
         *agent.readiness.lock().unwrap() = None;
         let child = spawn(&spec)?;
         let generation = agent.generation.fetch_add(1, Ordering::SeqCst) + 1;
-        agent.pid.store(child.id().unwrap_or(0), Ordering::SeqCst);
+        agent.mark_starting(child.id().unwrap_or(0));
         let (stop, stopped) = watch::channel(false);
         let (finished, completion) = oneshot::channel();
         process.stop = Some(stop);
@@ -739,6 +738,29 @@ impl EventSubscription {
 }
 
 impl Agent {
+    fn mark_starting(&self, pid: u32) {
+        *self.state.lock().unwrap() = json!({"status":"starting"});
+        self.pid.store(pid, Ordering::SeqCst);
+    }
+
+    /// The durable runtime can recover admitted work without a new Node submit.
+    /// Its state receipt therefore also fences configuration changes. A live
+    /// process that has not reported its initial state is still starting.
+    fn has_pending_work(&self) -> bool {
+        if !self.inputs.lock().unwrap().is_empty() {
+            return true;
+        }
+        let state = self.state.lock().unwrap();
+        matches!(
+            state["status"].as_str(),
+            Some("running" | "starting" | "recovering")
+        ) || state["input_id"].as_str().is_some()
+            || state["pending"].as_u64().is_some_and(|count| count > 0)
+            || state["queue_depth"].as_u64().is_some_and(|count| count > 0)
+            || (self.pid.load(Ordering::SeqCst) != 0
+                && !matches!(state["status"].as_str(), Some("idle" | "paused")))
+    }
+
     fn check_active(&self) -> Result<(), HostError> {
         if self.retired.load(Ordering::SeqCst) {
             return Err(HostError::Invalid(
@@ -786,10 +808,40 @@ impl Agent {
     }
 }
 
+/// Persistent launch specs from an older host remain valid; canonical entries win.
+fn canonical_harness_environment(
+    environment: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    let mut canonical = BTreeMap::new();
+    for (name, value) in environment {
+        if let Some(suffix) = name.strip_prefix("PROXY_AGENT_") {
+            canonical.insert(format!("PROXY_HARNESS_{suffix}"), value.clone());
+        }
+    }
+    canonical.extend(
+        environment
+            .iter()
+            .filter(|(name, _)| !name.starts_with("PROXY_AGENT_"))
+            .map(|(name, value)| (name.clone(), value.clone())),
+    );
+    canonical
+}
+
+fn scrub_harness_environment(command: &mut Command) {
+    for (name, _) in std::env::vars_os() {
+        if name.to_str().is_some_and(|name| {
+            name.starts_with("PROXY_HARNESS_") || name.starts_with("PROXY_AGENT_")
+        }) {
+            command.env_remove(name);
+        }
+    }
+}
+
 fn spawn(spec: &AgentSpec) -> Result<Child, HostError> {
     let mut seat_config = spec.seat_config.clone();
     seat_config["workspace_mode"] = serde_json::to_value(spec.workspace_mode)?;
     let mut command = Command::new(&spec.command);
+    scrub_harness_environment(&mut command);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -806,16 +858,16 @@ fn spawn(spec: &AgentSpec) -> Result<Child, HostError> {
         .arg("--workspace")
         .arg(&spec.workspace)
         .current_dir(&spec.workspace)
-        .envs(&spec.env)
-        .env("PROXY_AGENT_SEAT", serde_json::to_string(&seat_config)?)
+        .envs(canonical_harness_environment(&spec.env))
+        .env("PROXY_HARNESS_SEAT", serde_json::to_string(&seat_config)?)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     if let Some(space) = &spec.space {
-        command.env("PROXY_AGENT_SPACE", serde_json::to_string(space)?);
+        command.env("PROXY_HARNESS_SPACE", serde_json::to_string(space)?);
     } else {
-        command.env_remove("PROXY_AGENT_SPACE");
+        command.env_remove("PROXY_HARNESS_SPACE");
     }
     Ok(command.spawn()?)
 }
@@ -858,6 +910,11 @@ fn publish(agent: &Agent, event: Value) -> Result<(), HostError> {
         *agent.readiness.lock().unwrap() = serde_json::from_value(event.clone()).ok();
     } else if matches!(kind, "host_process_exit" | "host_error") {
         *agent.readiness.lock().unwrap() = None;
+        if kind == "host_process_exit" && event["stopping"] != true {
+            // No new runtime state is known during restart backoff. Retain
+            // recovered work as an ownership fence until the next state receipt.
+            agent.state.lock().unwrap()["status"] = json!("recovering");
+        }
     }
     let handoff_reply = kind == "response"
         && handoff::is_command(&event)
@@ -976,7 +1033,7 @@ async fn supervise(
                     let _ = child.kill().await;
                     break;
                 }
-                agent.pid.store(child.id().unwrap_or(0), Ordering::SeqCst);
+                agent.mark_starting(child.id().unwrap_or(0));
             }
             Err(_) => {
                 let _ = publish(
@@ -1005,6 +1062,113 @@ async fn supervise(
 #[cfg(test)]
 mod handoff_wire_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn recovered_runtime_work_prevents_configuration_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let host = AgentHost::open(root.path().join("host")).unwrap();
+        let spec = AgentSpec {
+            id: "recovered".into(),
+            display_name: None,
+            command: "/bin/sh".into(),
+            args: vec![],
+            agent_dir: root.path().join("definition"),
+            state_dir: root.path().join("state"),
+            workspace: root.path().into(),
+            workspace_mode: WorkspaceMode::Host,
+            seat_config: json!({"model":"original"}),
+            env: BTreeMap::new(),
+            space: None,
+        };
+        host.register(spec.clone()).await.unwrap();
+        let agent = host.agent("recovered").unwrap();
+        assert!(agent.inputs.lock().unwrap().is_empty());
+        let mut changed = spec.clone();
+        changed.seat_config["model"] = json!("replacement");
+        for state in [
+            json!({"type":"root_state","status":"running","input_id":"recovered-input","queue_depth":0}),
+            json!({"type":"root_state","status":"idle","input_id":null,"queue_depth":2}),
+        ] {
+            publish(&agent, state).unwrap();
+            assert!(matches!(
+                host.register(changed.clone()).await,
+                Err(HostError::Busy)
+            ));
+            assert_eq!(agent.spec.lock().unwrap().seat_config["model"], "original");
+            host.register(spec.clone()).await.unwrap();
+        }
+        publish(
+            &agent,
+            json!({"type":"root_state","status":"idle","input_id":null,"queue_depth":0}),
+        )
+        .unwrap();
+        host.register(changed).await.unwrap();
+        assert_eq!(
+            agent.spec.lock().unwrap().seat_config["model"],
+            "replacement"
+        );
+        // Stale idle state must not survive either explicit start or automatic restart.
+        agent.mark_starting(42);
+        assert!(matches!(
+            host.register(spec.clone()).await,
+            Err(HostError::Busy)
+        ));
+        agent.pid.store(0, Ordering::SeqCst);
+        publish(
+            &agent,
+            json!({"type":"root_state","status":"idle","input_id":null,"queue_depth":0}),
+        )
+        .unwrap();
+        publish(
+            &agent,
+            json!({"type":"host_process_exit","stopping":false,"code":1}),
+        )
+        .unwrap();
+        assert!(matches!(
+            host.register(spec.clone()).await,
+            Err(HostError::Busy)
+        ));
+
+        // A child's recovered queue can be absent from Node's transient input set.
+        publish(
+            &agent,
+            json!({"type":"root_state","status":"idle","input_id":null,"queue_depth":0}),
+        )
+        .unwrap();
+        let mut child_spec = spec.clone();
+        child_spec.id = "recovered-child".into();
+        child_spec.state_dir = root.path().join("child-state");
+        host.register_party_child("recovered", child_spec)
+            .await
+            .unwrap();
+        let child = host.agent("recovered-child").unwrap();
+        assert!(child.inputs.lock().unwrap().is_empty());
+        publish(&child,json!({"type":"root_state","status":"running","input_id":"child-recovered","queue_depth":0})).unwrap();
+        assert!(matches!(
+            host.register(spec.clone()).await,
+            Err(HostError::Busy)
+        ));
+        publish(
+            &child,
+            json!({"type":"root_state","status":"idle","input_id":null,"queue_depth":0}),
+        )
+        .unwrap();
+        host.register(spec).await.unwrap();
+    }
+
+    #[test]
+    fn saved_environment_migrates_once_and_canonical_authority_wins() {
+        let canonical = canonical_harness_environment(&BTreeMap::from([
+            ("PROXY_AGENT_API_KEY".into(), "old".into()),
+            ("PROXY_HARNESS_API_KEY".into(), "new".into()),
+            ("PROXY_AGENT_SEAT".into(), "old-seat".into()),
+            ("PATH".into(), "/bin".into()),
+        ]));
+        assert_eq!(canonical.get("PROXY_HARNESS_API_KEY").unwrap(), "new");
+        assert_eq!(canonical.get("PROXY_HARNESS_SEAT").unwrap(), "old-seat");
+        assert_eq!(canonical.get("PATH").unwrap(), "/bin");
+        assert!(!canonical.keys().any(|key| key.starts_with("PROXY_AGENT_")));
+    }
 
     #[tokio::test]
     async fn asynchronous_native_handoff_data_updates_availability_and_checkpoint() {

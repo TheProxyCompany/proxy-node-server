@@ -66,7 +66,8 @@ impl HerdrBridge {
         if value("HERDR_ENV").as_deref() != Some("1") {
             return None;
         }
-        let resume = value("PROXY_AGENT_HERDR_RESUME_ARGV")
+        let resume = value("PROXY_HARNESS_HERDR_RESUME_ARGV")
+            .or_else(|| value("PROXY_AGENT_HERDR_RESUME_ARGV"))
             .and_then(|v| serde_json::from_str(&v).ok())
             .unwrap_or_default();
         Self::new(
@@ -121,13 +122,14 @@ impl HerdrBridge {
 
     fn command(&self, operation: &str) -> Command {
         let mut command = Command::new(&self.binary);
+        super::scrub_harness_environment(&mut command);
         command
             .args([
                 "pane",
                 operation,
                 &self.pane,
                 "--source",
-                &format!("proxy-agent-host:{}", self.agent),
+                &format!("proxy-harness-host:{}", self.agent),
                 "--agent",
                 &self.agent,
             ])

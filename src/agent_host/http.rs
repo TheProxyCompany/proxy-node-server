@@ -119,7 +119,7 @@ async fn attach(
     s.authority.authorize(&headers, &id, HostOperation::Read)?;
     let status = s.host.status(&id).await?;
     Ok(Json(
-        json!({"agent_id":id,"runtime":"proxy-agent","status":status,
+        json!({"agent_id":id,"runtime":"proxy-harness","status":status,
         "input":format!("/client/agents/{id}/input"),"events":format!("/client/agents/{id}/events"),
         "durable_acceptance":"accepted event after runtime journal sync",
         "disconnect":"detaches this client; the hosted process continues"}),

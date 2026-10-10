@@ -53,7 +53,7 @@ pub(super) fn has_busy_children(parent: &Agent) -> bool {
             .unwrap()
             .values()
             .filter_map(Weak::upgrade)
-            .any(|child| !child.inputs.lock().unwrap().is_empty())
+            .any(|child| child.has_pending_work())
 }
 
 pub(super) fn is_live(child: &Agent) -> bool {
