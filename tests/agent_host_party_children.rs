@@ -1,6 +1,6 @@
 #![cfg(feature = "agent-host")]
 use proxy_node_server::agent_host::{
-    AgentHost, AgentInput, AgentSpec, EventSubscription, HostError, WorkspaceMode,
+    AgentHost, AgentInput, AgentSpec, EventSubscription, WorkspaceMode,
 };
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -33,51 +33,18 @@ def request(v):
  if v['message']=='hold': pending.append(v['id']);return
  emit({'type':'message_end','event_id':v['id'],'message':{'role':'assistant','content':[{'type':'text','text':v['message']}]}})
  emit({'type':'agent_settled','event_id':v['id'],'status':'done'})
-children={}
-def envelope(c,event):
- return {'type':'party_child_event','child_id':c['id'],'instance_id':c['instance'],'pid':c['p'].pid,'parent_pid':os.getpid(),'event':event}
-def relay(c):
- for line in c['p'].stdout: emit(envelope(c,json.loads(line)))
-def stop(c):
- c['p'].terminate();c['p'].wait();c['thread'].join()
- emit(envelope(c,{'type':'host_process_exit','code':0}))
 def answer(v,data=None,error=None):
  emit({'type':'response','id':v['id'],'command':v['type'],'success':error is None,'data':data,'error':error})
 for line in sys.stdin:
  v=json.loads(line);kind=v['type']
  if kind=='party_child_open':
-  ident=v['child_id']
-  if ident not in children:
-   s=v['spec'];env=os.environ.copy();env.update(s['env'])
-   p=subprocess.Popen([sys.executable,sys.argv[0],'--child','--state',s['state_dir']],stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True,env=env)
-   c={'id':ident,'instance':uuid.uuid4().hex,'p':p};children[ident]=c
-   c['thread']=threading.Thread(target=relay,args=(c,),daemon=True)
-   answer(v,{'child_id':ident,'instance_id':c['instance'],'pid':p.pid,'parent_pid':os.getpid(),'fork_sha256':'a'*64})
-   c['thread'].start()
-  else:
-   c=children[ident];answer(v,{'child_id':ident,'instance_id':c['instance'],'pid':c['p'].pid,'parent_pid':os.getpid(),'fork_sha256':'a'*64})
- elif kind=='party_child_send':
-  ident=v['child_id'];inp=v['input'];c=children.get(ident)
-  if inp['message']=='exit-before-accept':
-   for item in children.values():stop(item)
-   os._exit(17)
-  if not c or inp['message']=='reject-parent':
-   emit({'type':'response','command':'party_child_send','child_id':ident,'id':inp['id'],'success':False,'error':'child refused by parent'});continue
-  if inp['message']=='stale':
-   stale=envelope(c,{'type':'accepted','event_id':inp['id'],'durable':True,'forged':True});stale['instance_id']='old-instance';emit(stale)
-   stale=envelope(c,{'type':'message_end','event_id':inp['id'],'text':'stale private content'});stale['pid']+=1;emit(stale)
-  c['p'].stdin.write(json.dumps(inp)+'\n');c['p'].stdin.flush()
- elif kind=='party_child_abort':
-  c=children[v['child_id']];c['p'].stdin.write(json.dumps({'type':'abort'})+'\n');c['p'].stdin.flush();answer(v,{})
- elif kind=='party_child_stop':
-  c=children.pop(v['child_id'],None)
-  if c:stop(c)
-  answer(v,{})
+  path=Path(v['spec']['state_dir']);path.mkdir(parents=True,exist_ok=True)
+  (path/'fork.json').write_text(json.dumps({'creator':os.getpid(),'child_id':v['child_id']}))
+  answer(v,{'child_id':v['child_id'],'fork_sha256':'a'*64})
  elif kind=='abort':
   for ident in pending:emit({'type':'agent_settled','event_id':ident,'status':'aborted'})
   pending=[]
  else: request(v)
-for c in children.values():stop(c)
 "#;
 
 fn spec(root: &Path, id: &str) -> AgentSpec {
@@ -141,7 +108,7 @@ fn log(root: &Path, id: &str) -> String {
 }
 
 #[tokio::test]
-async fn party_children_have_real_parent_pids_and_private_durable_streams() {
+async fn party_instances_have_independent_processes_and_private_durable_streams() {
     let temp = tempfile::tempdir().unwrap();
     let host = AgentHost::open(temp.path().join("host")).unwrap();
     host.register(spec(temp.path(), "owner")).await.unwrap();
@@ -168,18 +135,17 @@ async fn party_children_have_real_parent_pids_and_private_durable_streams() {
     let first = available(&host, "seat_a").await;
     let other = available(&host, "seat_b").await;
     let owner = available(&host, "owner").await;
-    assert_eq!(first["party_child"]["launch"]["parent_pid"], owner["pid"]);
-    assert_eq!(other["party_child"]["launch"]["parent_pid"], owner["pid"]);
+    assert_eq!(first["creator_id"], "owner");
+    assert_eq!(other["creator_id"], "owner");
+    assert_eq!(first["address"], "/client/agents/seat_a");
     assert_ne!(first["pid"], other["pid"]);
+    assert_ne!(first["pid"], owner["pid"]);
     assert_eq!(
         std::fs::read_to_string(temp.path().join("state/seat_a/ppid")).unwrap(),
-        owner["pid"].to_string()
+        std::process::id().to_string()
     );
     host.ensure_started("seat_a").await.unwrap();
-    assert_eq!(
-        host.status("seat_a").await.unwrap()["party_child"],
-        first["party_child"]
-    );
+    assert_eq!(host.status("seat_a").await.unwrap()["pid"], first["pid"]);
     assert_eq!(
         host.submit("seat_a", input("same-id", "only-seat-a"))
             .await
@@ -187,17 +153,6 @@ async fn party_children_have_real_parent_pids_and_private_durable_streams() {
         true
     );
     event(&mut a, "agent_settled", Some("same-id")).await;
-    let ack = host
-        .submit("seat_a", input("stale-check", "stale"))
-        .await
-        .unwrap();
-    assert!(ack.get("forged").is_none());
-    event(&mut a, "agent_settled", Some("stale-check")).await;
-    assert!(matches!(
-        host.submit("seat_a", input("refused", "reject-parent"))
-            .await,
-        Err(HostError::Rejected(_))
-    ));
     let la = log(temp.path(), "seat_a");
     let lb = log(temp.path(), "seat_b");
     let lr = log(temp.path(), "owner");
@@ -222,7 +177,7 @@ async fn party_children_have_real_parent_pids_and_private_durable_streams() {
 }
 
 #[tokio::test]
-async fn party_child_abort_stop_and_parent_restart_preserve_ownership() {
+async fn party_instance_survives_creator_sigkill_with_the_same_pid_and_address() {
     let temp = tempfile::tempdir().unwrap();
     let host = AgentHost::open(temp.path().join("host")).unwrap();
     host.register(spec(temp.path(), "owner")).await.unwrap();
@@ -255,40 +210,41 @@ async fn party_child_abort_stop_and_parent_restart_preserve_ownership() {
         .unwrap();
     event(&mut a, "agent_settled", Some("reopened")).await;
     let reopened = available(&host, "seat_a").await;
-    assert_ne!(
-        reopened["party_child"]["launch"]["instance_id"],
-        old_a["party_child"]["launch"]["instance_id"]
-    );
+    assert_ne!(reopened["pid"], old_a["pid"]);
     let old_owner = host.status("owner").await.unwrap()["pid"].clone();
-    assert!(matches!(
-        host.submit("seat_a", input("unknown", "exit-before-accept"))
-            .await,
-        Err(HostError::AcceptanceUnknown)
-    ));
-    assert_eq!(host.status("seat_b").await.unwrap()["available"], false);
-    host.submit("seat_b", input("after-restart", "resumed-child"))
+    let mut owner_events = host.subscribe("owner", 0).unwrap();
+    assert!(
+        std::process::Command::new("/bin/kill")
+            .args(["-KILL", &old_owner.to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    event(&mut owner_events, "host_process_exit", None).await;
+    assert_eq!(host.status("seat_b").await.unwrap()["pid"], old_b["pid"]);
+    assert_eq!(
+        host.status("seat_b").await.unwrap()["address"],
+        old_b["address"]
+    );
+    host.submit("seat_b", input("after-restart", "continued-child"))
         .await
         .unwrap();
     event(&mut b, "agent_settled", Some("after-restart")).await;
-    let final_b = available(&host, "seat_b").await;
     let final_owner = available(&host, "owner").await;
     assert_ne!(final_owner["pid"], old_owner);
-    assert_ne!(
-        final_b["party_child"]["launch"]["instance_id"],
-        old_b["party_child"]["launch"]["instance_id"]
-    );
-    assert_eq!(
-        final_b["party_child"]["launch"]["parent_pid"],
-        final_owner["pid"]
-    );
+    assert_eq!(host.status("seat_b").await.unwrap()["pid"], old_b["pid"]);
     host.stop("owner").await.unwrap();
-    assert_eq!(host.status("seat_b").await.unwrap()["hosted"], false);
-    assert_eq!(host.status("seat_b").await.unwrap()["pid"], Value::Null);
+    assert_eq!(host.status("seat_b").await.unwrap()["hosted"], true);
+    host.submit("seat_b", input("creator-stopped", "still-reachable"))
+        .await
+        .unwrap();
+    event(&mut b, "agent_settled", Some("creator-stopped")).await;
+    assert_eq!(host.status("seat_b").await.unwrap()["pid"], old_b["pid"]);
     host.shutdown().await;
 }
 
 #[tokio::test]
-async fn party_registration_rejects_reparenting_and_standalone_fallback() {
+async fn party_registration_preserves_creator_without_coupling_configuration() {
     let temp = tempfile::tempdir().unwrap();
     let host = AgentHost::open(temp.path().join("host")).unwrap();
     host.register(spec(temp.path(), "owner")).await.unwrap();
@@ -317,7 +273,7 @@ async fn party_registration_rejects_reparenting_and_standalone_fallback() {
     host.submit("seat", input("busy", "hold")).await.unwrap();
     let mut changed = spec(temp.path(), "owner");
     changed.seat_config["model"] = "new".into();
-    assert!(matches!(host.register(changed).await, Err(HostError::Busy)));
+    host.register(changed).await.unwrap();
     assert!(!temp.path().join("state/other").exists());
     host.shutdown().await;
 }
@@ -400,5 +356,53 @@ async fn retired_handles_cannot_restart_and_keep_their_read_only_receipts() {
             .await
             .is_err()
     );
+    host.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_logical_creator_needs_no_native_process_and_cannot_replace_existing_context() {
+    let temp = tempfile::tempdir().unwrap();
+    let host = AgentHost::open(temp.path().join("host")).unwrap();
+    let instance = spec(temp.path(), "standalone");
+    host.register_spawned("external-creator", instance.clone())
+        .await
+        .unwrap();
+    let mut events = host.subscribe("standalone", 0).unwrap();
+    host.submit("standalone", input("first", "standalone-context"))
+        .await
+        .unwrap();
+    event(&mut events, "agent_settled", Some("first")).await;
+    let original = host.status("standalone").await.unwrap();
+    assert_eq!(original["creator_id"], "external-creator");
+    assert!(host.status("external-creator").await.is_err());
+    assert!(!instance.state_dir.join("fork.json").exists());
+    // PH creates this journal when opening its own context, before publishing readiness.
+    std::fs::write(instance.state_dir.join("log.jsonl"), "").unwrap();
+    host.register(spec(temp.path(), "external-creator"))
+        .await
+        .unwrap();
+    host.ensure_started("standalone").await.unwrap();
+    assert_eq!(
+        host.status("standalone").await.unwrap()["pid"],
+        original["pid"]
+    );
+    host.stop("standalone").await.unwrap();
+    host.submit("standalone", input("reattached", "same-context"))
+        .await
+        .unwrap();
+    event(&mut events, "agent_settled", Some("reattached")).await;
+    assert!(!instance.state_dir.join("fork.json").exists());
+    assert_eq!(
+        host.status("external-creator").await.unwrap()["pid"],
+        Value::Null
+    );
+    host.retire("external-creator").await.unwrap();
+    host.register_spawned("external-creator", instance.clone())
+        .await
+        .unwrap();
+    host.submit("standalone", input("creator-retired", "still-independent"))
+        .await
+        .unwrap();
+    event(&mut events, "agent_settled", Some("creator-retired")).await;
     host.shutdown().await;
 }

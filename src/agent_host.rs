@@ -11,7 +11,7 @@ use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -66,6 +66,34 @@ pub struct AgentSpec {
     pub seat_config: Value,
     pub env: BTreeMap<String, String>,
     pub space: Option<SpaceBinding>,
+}
+
+// Media bindings are delivered through the live session. Updating them does not
+// change the reasoning process, its context or its persistent shell.
+fn same_runtime(left: &AgentSpec, right: &AgentSpec) -> bool {
+    fn reasoning_roles(seat: &mut Value) {
+        let thinking = seat["model_roles"]["thinking"].clone();
+        if let Some(fields) = seat.as_object_mut() {
+            fields.remove("model_roles");
+            if !thinking.is_null() {
+                fields.insert("model_roles".into(), json!({"thinking":thinking}));
+            }
+        }
+    }
+    fn reasoning_spec(spec: &AgentSpec) -> AgentSpec {
+        let mut spec = spec.clone();
+        reasoning_roles(&mut spec.seat_config);
+        for key in ["PROXY_HARNESS_SEAT", "PROXY_AGENT_SEAT"] {
+            if let Some(seat) = spec.env.get_mut(key) {
+                if let Ok(mut value) = serde_json::from_str::<Value>(seat) {
+                    reasoning_roles(&mut value);
+                    *seat = value.to_string();
+                }
+            }
+        }
+        spec
+    }
+    reasoning_spec(left) == reasoning_spec(right)
 }
 
 /// Where shell, file and process tools execute. A host workspace is an
@@ -212,9 +240,7 @@ type Acknowledgements = HashMap<String, Vec<oneshot::Sender<Result<Value, String
 
 struct Agent {
     _lease: Arc<File>,
-    owner: Option<Weak<Agent>>,
-    children: Mutex<HashMap<String, Weak<Agent>>>,
-    child_launch: Mutex<Option<party_children::Launch>>,
+    creator: Option<String>,
     controls: Mutex<HashMap<String, party_children::Pending>>,
     spec: Mutex<AgentSpec>,
     process: AsyncMutex<ProcessState>,
@@ -316,26 +342,41 @@ impl AgentHost {
     /// spec. A changed idle loadout stops its old process; a busy change fails
     /// explicitly instead of silently widening tools midway through a task.
     pub async fn register(&self, spec: AgentSpec) -> Result<(), HostError> {
-        self.register_owned(spec, None).await
+        self.register_instance(spec, None).await
     }
 
-    /// Register a Party seat whose operating-system parent is its owning PH.
-    /// Child processes are opened through that root, never launched by Node.
-    pub async fn register_party_child(
+    /// Every instance has its own process and address. A registered native creator
+    /// can prepare its initial context, but the creator relationship requires no process.
+    pub async fn register_spawned(
         &self,
-        parent_id: &str,
+        creator_id: &str,
         spec: AgentSpec,
     ) -> Result<(), HostError> {
-        self.check_active_id(parent_id)?;
-        let parent = self.agent(parent_id)?;
-        party_children::validate_owner(&parent, &spec)?;
-        self.register_owned(spec, Some(parent)).await
+        if !valid_id(creator_id) || creator_id == spec.id {
+            return Err(HostError::Invalid(
+                "a distinct creator id is required".into(),
+            ));
+        }
+        if self.agent(&spec.id).is_err() {
+            if let Ok(creator) = self.agent(creator_id) {
+                party_children::validate_creator(&creator, &spec)?;
+            }
+        }
+        self.register_instance(spec, Some(creator_id.into())).await
     }
 
-    async fn register_owned(
+    pub async fn register_party_child(
+        &self,
+        creator_id: &str,
+        spec: AgentSpec,
+    ) -> Result<(), HostError> {
+        self.register_spawned(creator_id, spec).await
+    }
+
+    async fn register_instance(
         &self,
         spec: AgentSpec,
-        owner: Option<Arc<Agent>>,
+        creator: Option<String>,
     ) -> Result<(), HostError> {
         self.check_active_id(&spec.id)?;
         if let Some(space) = &spec.space {
@@ -360,27 +401,23 @@ impl AgentHost {
         }
         let existing = self.agents.lock().unwrap().get(&spec.id).cloned();
         if let Some(agent) = existing {
-            if !party_children::same_owner(&agent, owner.as_ref()) {
+            if !party_children::same_creator(&agent, creator.as_deref()) {
                 return Err(HostError::Invalid(
-                    "an agent cannot change its process owner".into(),
+                    "an agent cannot change its recorded creator".into(),
                 ));
             }
             let mut process = agent.process.lock().await;
             self.check_active_id(&spec.id)?;
             agent.check_active()?;
-            if *agent.spec.lock().unwrap() == spec {
-                return Ok(());
-            }
-            if agent.has_pending_work() || party_children::has_busy_children(&agent) {
-                return Err(HostError::Busy);
-            }
-            if agent.owner.is_some() {
-                party_children::stop(&agent).await?;
+            if same_runtime(&agent.spec.lock().unwrap(), &spec) {
                 *agent.spec.lock().unwrap() = spec;
                 return Ok(());
             }
+            if agent.has_pending_work() || !agent.controls.lock().unwrap().is_empty() {
+                return Err(HostError::Busy);
+            }
             agent.generation.fetch_add(1, Ordering::SeqCst);
-            party_children::invalidate_children(&agent);
+            agent.controls.lock().unwrap().clear();
             if let Some(stop) = process.stop.take() {
                 let _ = stop.send(true);
             }
@@ -401,9 +438,7 @@ impl AgentHost {
         let id = spec.id.clone();
         let agent = Arc::new(Agent {
             _lease: Arc::clone(&self.lease),
-            owner: owner.as_ref().map(Arc::downgrade),
-            children: Mutex::new(HashMap::new()),
-            child_launch: Mutex::new(None),
+            creator,
             controls: Mutex::new(HashMap::new()),
             spec: Mutex::new(spec),
             process: AsyncMutex::new(ProcessState {
@@ -423,24 +458,21 @@ impl AgentHost {
             log_path,
             updates,
         });
-        // Concurrent identical registration converges on one process owner.
+        // Concurrent identical registration converges on one process creator.
         let mut agents = self.agents.lock().unwrap();
         self.check_active_id(&id)?;
         if let Some(existing) = agents.get(&id) {
             existing.check_active()?;
-            if !party_children::same_owner(existing, owner.as_ref())
-                || *existing.spec.lock().unwrap() != *agent.spec.lock().unwrap()
+            if !party_children::same_creator(existing, agent.creator.as_deref())
+                || !same_runtime(&existing.spec.lock().unwrap(), &agent.spec.lock().unwrap())
             {
                 return Err(HostError::Busy);
             }
         } else {
-            if let Some(parent) = owner {
-                parent
-                    .children
-                    .lock()
-                    .unwrap()
-                    .insert(id.clone(), Arc::downgrade(&agent));
-            }
+            publish(
+                &agent,
+                json!({"type":"host_instance_registered","instance_id":id,"creator_id":agent.creator}),
+            )?;
             agents.insert(id, agent);
         }
         Ok(())
@@ -474,17 +506,22 @@ impl AgentHost {
         self.check_active_id(id)?;
         let agent = self.agent(id)?;
         agent.check_active()?;
-        if let Some(parent) = agent.owner.as_ref().and_then(Weak::upgrade) {
-            self.ensure_root_started(&parent).await?;
-            return party_children::ensure_started(&agent, &parent).await;
+        if agent.process.lock().await.stop.is_some() {
+            return Ok(());
         }
-        self.ensure_root_started(&agent).await
+        if let Some(creator) = &agent.creator {
+            let state = agent.spec.lock().unwrap().state_dir.clone();
+            if !state.join("fork.json").is_file() && !state.join("log.jsonl").is_file() {
+                if let Ok(parent) = self.agent(creator) {
+                    self.ensure_instance_started(&parent).await?;
+                    party_children::prepare(&agent, &parent).await?;
+                }
+            }
+        }
+        self.ensure_instance_started(&agent).await
     }
 
-    async fn ensure_root_started(&self, agent: &Arc<Agent>) -> Result<(), HostError> {
-        if agent.owner.is_some() {
-            return Err(HostError::Stopped);
-        }
+    async fn ensure_instance_started(&self, agent: &Arc<Agent>) -> Result<(), HostError> {
         let mut process = agent.process.lock().await;
         agent.check_active()?;
         if process.stop.is_some() {
@@ -581,12 +618,7 @@ impl AgentHost {
         };
         let handoff = agent.handoff.lock().unwrap().clone();
         let retired = agent.retired.load(Ordering::SeqCst);
-        let hosted = !retired
-            && if agent.owner.is_some() {
-                party_children::is_live(&agent)
-            } else {
-                process.stop.is_some()
-            };
+        let hosted = !retired && process.stop.is_some();
         let available = handoff
             .as_ref()
             .is_none_or(|state| state.admission == "open")
@@ -594,7 +626,7 @@ impl AgentHost {
             && hosted
             && readiness.as_ref().is_some_and(RuntimeReadiness::verified);
         Ok(
-            json!({"agent_id":id,"pid":if pid==0 {None} else {Some(pid)},"hosted":hosted,"retired":retired,"party_child":party_children::status(&agent),
+            json!({"agent_id":id,"pid":if pid==0 {None} else {Some(pid)},"hosted":hosted,"retired":retired,"creator_id":agent.creator,"address":format!("/client/agents/{id}"),
             "available":available,"readiness":readiness,"handoff":handoff,"workspace":workspace,
             "runtime":*agent.state.lock().unwrap(),"sequence":agent.log.lock().unwrap().sequence}),
         )
@@ -625,9 +657,6 @@ impl AgentHost {
     pub async fn abort(&self, id: &str) -> Result<(), HostError> {
         let agent = self.agent(id)?;
         agent.check_active()?;
-        if agent.owner.is_some() {
-            return party_children::abort(&agent).await;
-        }
         let mut pipe = agent.stdin.lock().await;
         let pipe = pipe.as_mut().ok_or(HostError::Stopped)?;
         pipe.write_all(b"{\"type\":\"abort\"}\n").await?;
@@ -644,11 +673,8 @@ impl AgentHost {
     }
 
     async fn stop_locked(agent: &Arc<Agent>, process: &mut ProcessState) -> Result<(), HostError> {
-        if agent.owner.is_some() {
-            return party_children::stop(agent).await;
-        }
         agent.generation.fetch_add(1, Ordering::SeqCst);
-        party_children::invalidate_children(agent);
+        agent.controls.lock().unwrap().clear();
         if let Some(stop) = process.stop.take() {
             let _ = stop.send(true);
         }
@@ -685,12 +711,9 @@ impl AgentHost {
     pub async fn shutdown(&self) {
         let agents: Vec<_> = self.agents.lock().unwrap().values().cloned().collect();
         for agent in agents {
-            if agent.owner.is_some() {
-                continue;
-            }
             let mut process = agent.process.lock().await;
             agent.generation.fetch_add(1, Ordering::SeqCst);
-            party_children::invalidate_children(&agent);
+            agent.controls.lock().unwrap().clear();
             if let Some(stop) = process.stop.take() {
                 let _ = stop.send(true);
             }
@@ -773,9 +796,6 @@ impl Agent {
     /// The process belongs to this object, never to the attached client.
     async fn write(&self, wire: &Value) -> Result<(), HostError> {
         self.check_active()?;
-        if self.owner.is_some() {
-            return party_children::send(self, wire).await;
-        }
         self.write_direct(wire).await
     }
 
@@ -868,6 +888,10 @@ fn spawn(spec: &AgentSpec) -> Result<Child, HostError> {
         command.env("PROXY_HARNESS_SPACE", serde_json::to_string(space)?);
     } else {
         command.env_remove("PROXY_HARNESS_SPACE");
+    }
+    let fork = spec.state_dir.join("fork.json");
+    if fork.is_file() {
+        command.env("PROXY_HARNESS_FORK", fork);
     }
     Ok(command.spawn()?)
 }
@@ -1022,7 +1046,7 @@ async fn supervise(
         let _ = errors.await;
         *agent.stdin.lock().await = None;
         agent.pid.store(0, Ordering::SeqCst);
-        party_children::invalidate_children(&agent);
+        agent.controls.lock().unwrap().clear();
         let _ = publish(
             &agent,
             json!({"type":"host_process_exit","code":status.ok().and_then(|s|s.code()),"stopping":*stop.borrow()}),
@@ -1146,7 +1170,7 @@ mod handoff_wire_tests {
             Err(HostError::Busy)
         ));
 
-        // A child's recovered queue can be absent from Node's transient input set.
+        // A child's recovered queue does not prevent its creator from reconfiguring.
         publish(
             &agent,
             json!({"type":"root_state","status":"idle","input_id":null,"queue_depth":0}),
@@ -1161,10 +1185,7 @@ mod handoff_wire_tests {
         let child = host.agent("recovered-child").unwrap();
         assert!(child.inputs.lock().unwrap().is_empty());
         publish(&child,json!({"type":"root_state","status":"running","input_id":"child-recovered","queue_depth":0})).unwrap();
-        assert!(matches!(
-            host.register(spec.clone()).await,
-            Err(HostError::Busy)
-        ));
+        host.register(spec.clone()).await.unwrap();
         publish(
             &child,
             json!({"type":"root_state","status":"idle","input_id":null,"queue_depth":0}),
@@ -1217,6 +1238,10 @@ mod handoff_wire_tests {
         assert!(!status["available"].as_bool().unwrap());
         assert!(agent.handoff.lock().unwrap().as_ref().unwrap().verified());
         let mut events = host.subscribe("dot", 0).unwrap();
+        assert_eq!(
+            events.recv().await.unwrap().event["type"],
+            "host_instance_registered"
+        );
         assert_eq!(events.recv().await.unwrap().event["data"], checkpoint);
     }
 }
