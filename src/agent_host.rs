@@ -246,6 +246,7 @@ struct Agent {
     process: AsyncMutex<ProcessState>,
     generation: AtomicU64,
     retired: AtomicBool,
+    shutdown_confirmed: AtomicBool,
     pid: AtomicU32,
     stdin: AsyncMutex<Option<ChildStdin>>,
     inputs: Mutex<HashSet<String>>,
@@ -416,17 +417,7 @@ impl AgentHost {
             if agent.has_pending_work() || !agent.controls.lock().unwrap().is_empty() {
                 return Err(HostError::Busy);
             }
-            agent.generation.fetch_add(1, Ordering::SeqCst);
-            agent.controls.lock().unwrap().clear();
-            if let Some(stop) = process.stop.take() {
-                let _ = stop.send(true);
-            }
-            if let Some(finished) = process.finished.take() {
-                let _ = finished.await;
-            }
-            agent.pid.store(0, Ordering::SeqCst);
-            *agent.stdin.lock().await = None;
-            *agent.readiness.lock().unwrap() = None;
+            Self::stop_locked(&agent, &mut process).await?;
             *agent.spec.lock().unwrap() = spec;
             return Ok(());
         }
@@ -447,6 +438,7 @@ impl AgentHost {
             }),
             generation: AtomicU64::new(0),
             retired: AtomicBool::new(false),
+            shutdown_confirmed: AtomicBool::new(false),
             pid: AtomicU32::new(0),
             stdin: AsyncMutex::new(None),
             inputs: Mutex::new(HashSet::new()),
@@ -673,6 +665,7 @@ impl AgentHost {
     }
 
     async fn stop_locked(agent: &Arc<Agent>, process: &mut ProcessState) -> Result<(), HostError> {
+        let running = process.stop.is_some() && agent.pid.load(Ordering::SeqCst) != 0;
         agent.generation.fetch_add(1, Ordering::SeqCst);
         agent.controls.lock().unwrap().clear();
         if let Some(stop) = process.stop.take() {
@@ -686,6 +679,11 @@ impl AgentHost {
         *agent.readiness.lock().unwrap() = None;
         *agent.state.lock().unwrap() =
             json!({"status":"stopped","pending":agent.inputs.lock().unwrap().len()});
+        if running && !agent.shutdown_confirmed.load(Ordering::SeqCst) {
+            return Err(HostError::Rejected(
+                "runtime stopped without confirming shell cleanup; work outcome is unknown".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -762,6 +760,7 @@ impl EventSubscription {
 
 impl Agent {
     fn mark_starting(&self, pid: u32) {
+        self.shutdown_confirmed.store(false, Ordering::SeqCst);
         *self.state.lock().unwrap() = json!({"status":"starting"});
         self.pid.store(pid, Ordering::SeqCst);
     }
@@ -910,6 +909,11 @@ fn publish(agent: &Agent, event: Value) -> Result<(), HostError> {
     log.file.write_all(&bytes)?;
     log.file.write_all(b"\n")?;
     let kind = event.get("type").and_then(Value::as_str).unwrap_or("");
+    if kind == "response" && event["command"] == "shutdown" {
+        agent
+            .shutdown_confirmed
+            .store(event["success"] == true, Ordering::SeqCst);
+    }
     if matches!(
         kind,
         "accepted"
@@ -1040,10 +1044,31 @@ async fn supervise(
         });
         let status = tokio::select! {
             result = child.wait() => result,
-            _ = stop.changed() => { let _ = child.kill().await; child.wait().await }
+            _ = stop.changed() => {
+                // Explicit host stop gives the runtime its own scoped cleanup path.
+                // A process crash or a lost client never sends this command.
+                let _ = tokio::time::timeout(Duration::from_secs(1), async {
+                    let mut stdin = agent.stdin.lock().await;
+                    if let Some(stdin) = stdin.as_mut() {
+                        stdin.write_all(b"{\"type\":\"shutdown\"}\n").await?;
+                        stdin.flush().await?;
+                    }
+                    Ok::<_, std::io::Error>(())
+                }).await;
+                match tokio::time::timeout(Duration::from_secs(5), child.wait()).await {
+                    Ok(status) => status,
+                    Err(_) => { let _ = child.kill().await; child.wait().await }
+                }
+            }
         };
         let _ = output.await;
         let _ = errors.await;
+        if *stop.borrow() && !agent.shutdown_confirmed.load(Ordering::SeqCst) {
+            let _ = publish(
+                &agent,
+                json!({"type":"host_error","error":"runtime stopped without confirming shell cleanup; work outcome is unknown"}),
+            );
+        }
         *agent.stdin.lock().await = None;
         agent.pid.store(0, Ordering::SeqCst);
         agent.controls.lock().unwrap().clear();

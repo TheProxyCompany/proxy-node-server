@@ -39,6 +39,7 @@ for v in requests:
  if v['id'] not in done: finish(v)
 for line in sys.stdin:
  v=json.loads(line)
+ if v['type']=='shutdown': emit({'type':'response','command':'shutdown','success':'REJECT_SHUTDOWN' not in os.environ}); break
  if v['type']=='abort': emit({'type':'root_state','status':'idle'}); continue
  if v['message']=='reject': emit({'type':'response','success':False,'event_id':v['id'],'error':'refused'}); continue
  duplicate=any(x['id']==v['id'] for x in requests)
@@ -223,6 +224,16 @@ async fn canonical_host_restart_recovers_admitted_work_after_a_failed_start_epoc
     assert_eq!(
         host.submit("dot", input("retained", "slow")).await.unwrap()["durable"],
         true
+    );
+    // A crash leaves admission unresolved. An explicit shutdown now asks the
+    // runtime to cancel active work before the host closes its process.
+    let pid = host.status("dot").await.unwrap()["pid"].as_u64().unwrap();
+    assert!(
+        std::process::Command::new("/bin/kill")
+            .args(["-KILL", &pid.to_string()])
+            .status()
+            .unwrap()
+            .success()
     );
     host.shutdown().await;
     drop(host);
@@ -839,6 +850,30 @@ async fn stopping_one_host_retains_accepted_work_and_stamps_logical_agent_identi
             .lines()
             .count(),
         1
+    );
+    host.shutdown().await;
+}
+
+#[tokio::test]
+async fn unconfirmed_shell_cleanup_is_reported_when_a_process_stops() {
+    let temp = tempfile::tempdir().unwrap();
+    let host = AgentHost::open(temp.path().join("host")).unwrap();
+    let mut configured = spec(temp.path(), "uncertain");
+    configured.env.insert("REJECT_SHUTDOWN".into(), "1".into());
+    host.register(configured).await.unwrap();
+    let mut events = host.subscribe("uncertain", 0).unwrap();
+    host.submit("uncertain", input("one", "ready"))
+        .await
+        .unwrap();
+    settled(&mut events, "one").await;
+    assert!(
+        matches!(host.stop("uncertain").await,Err(HostError::Rejected(message)) if message.contains("without confirming shell cleanup"))
+    );
+    assert!(host.status("uncertain").await.unwrap()["pid"].is_null());
+    assert!(
+        std::fs::read_to_string(temp.path().join("host/uncertain/events.jsonl"))
+            .unwrap()
+            .contains("work outcome is unknown")
     );
     host.shutdown().await;
 }

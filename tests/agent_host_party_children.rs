@@ -41,6 +41,8 @@ for line in sys.stdin:
   path=Path(v['spec']['state_dir']);path.mkdir(parents=True,exist_ok=True)
   (path/'fork.json').write_text(json.dumps({'creator':os.getpid(),'child_id':v['child_id']}))
   answer(v,{'child_id':v['child_id'],'fork_sha256':'a'*64})
+ elif kind=='shutdown':
+  emit({'type':'response','command':'shutdown','success':True});break
  elif kind=='abort':
   for ident in pending:emit({'type':'agent_settled','event_id':ident,'status':'aborted'})
   pending=[]
