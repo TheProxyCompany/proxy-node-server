@@ -521,9 +521,11 @@ async fn an_exit_zero_structured_failure_is_not_reported_as_success() {
 async fn successful_boot_without_a_reachable_engine_is_not_ready() {
     let fixture = Fixture::new();
     std::fs::write(fixture.root.join("boot-no-socket"), "fail").unwrap();
+    // Starting the Python fixture can take over a second on a busy runner.
+    // This test exercises engine readiness after boot, not the boot deadline.
     let error = macos::ensure(
         &fixture.home,
-        Duration::from_secs(1),
+        Duration::from_secs(10),
         Duration::from_millis(20),
     )
     .await
