@@ -52,7 +52,7 @@ pub(super) fn route(host: &AgentHost, caller: &Arc<Agent>, generation: u64, even
         let reply = match result {
             Ok(result) => json!({"type":"host_control_result","id":id,"ok":true,"result":result}),
             Err(error) => {
-                json!({"type":"host_control_result","id":id,"ok":false,"error":public_error(&error)})
+                json!({"type":"host_control_result","id":id,"ok":false,"error":public_error(&error),"error_code":error_code(&error)})
             }
         };
         if caller.generation.load(Ordering::SeqCst) == generation {
@@ -60,6 +60,18 @@ pub(super) fn route(host: &AgentHost, caller: &Arc<Agent>, generation: u64, even
         }
     }));
     true
+}
+
+fn error_code(error: &HostError) -> &'static str {
+    match error {
+        HostError::Forbidden => "denied",
+        HostError::NotFound(_) => "not_found",
+        HostError::Busy => "busy",
+        HostError::AcceptanceUnknown => "acceptance_unknown",
+        HostError::Stopped => "stopped",
+        HostError::Invalid(_) | HostError::Json(_) => "invalid",
+        _ => "failure",
+    }
 }
 
 fn public_error(error: &HostError) -> &'static str {
@@ -222,7 +234,33 @@ fn granted(spec: &AgentSpec, op: &str) -> bool {
         .is_some_and(|value| value == "1")
         && spec.seat_config["builtins"]
             .as_array()
-            .is_some_and(|tools| tools.iter().any(|tool| tool == name))
+            .is_some_and(|tools| {
+                tools
+                    .iter()
+                    .any(|tool| tool == name || (op == "status" && tool == "spawn_agent"))
+            })
+}
+
+async fn status(host: &AgentHost, id: &str) -> Result<Value, HostError> {
+    use std::io::Read;
+    let mut status = host.status(id).await?;
+    let agent = host.agent(id)?;
+    let _log = agent.log.lock().unwrap();
+    let mut file = File::open(&agent.log_path)?;
+    let offset = file.metadata()?.len().saturating_sub(30 * 1024);
+    file.seek(SeekFrom::Start(offset))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    let start = if offset == 0 {
+        0
+    } else {
+        bytes
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(bytes.len(), |at| at + 1)
+    };
+    status["stdout"] = String::from_utf8_lossy(&bytes[start..]).into_owned().into();
+    Ok(status)
 }
 
 async fn cancel(host: &AgentHost, id: &str, timed_out: bool) -> Result<(), HostError> {
@@ -337,10 +375,10 @@ async fn handle(
             .stop_reason
             .is_some()
         {
-            return host.status(&child.instance_id).await;
+            return status(host, &child.instance_id).await;
         }
         let accepted = host.submit(&child.instance_id, child.initial_input).await?;
-        let mut status = host.status(&child.instance_id).await?;
+        let mut status = status(host, &child.instance_id).await?;
         status["accepted"] = accepted;
         return Ok(status);
     }
@@ -349,14 +387,14 @@ async fn handle(
         .ok_or_else(|| HostError::Invalid("instance_id is required".into()))?;
     descendant(host, &caller_spec.id, id)?;
     match request["op"].as_str() {
-        Some("status") => host.status(id).await,
+        Some("status") => status(host, id).await,
         Some("send") => {
             let input = serde_json::from_value(request["input"].clone())?;
             host.submit(id, input).await
         }
         Some("cancel") => {
             cancel(host, id, false).await?;
-            host.status(id).await
+            status(host, id).await
         }
         _ => Err(HostError::Invalid("unknown host control operation".into())),
     }
@@ -519,6 +557,11 @@ mod tests {
             .env
             .insert("PROXY_HARNESS_HOST_CONTROL".into(), "1".into());
         caller.spec.lock().unwrap().seat_config["builtins"] = json!(["spawn_agent"]);
+        assert_eq!(
+            handle(&host, &caller, 0, &status).await.unwrap()["agent_id"],
+            "grandchild"
+        );
+        caller.spec.lock().unwrap().seat_config["builtins"] = json!([]);
         assert!(matches!(
             handle(&host, &caller, 0, &status).await,
             Err(HostError::Forbidden)
@@ -530,6 +573,21 @@ mod tests {
             &json!({"type":"host_control","env":{"SECRET":"private-frame"}})
         ));
         tokio::task::yield_now().await;
+        let grandchild = host.agent("grandchild").unwrap();
+        for index in 0..64 {
+            publish(
+                &grandchild,
+                json!({"type":"message_update","text":"x".repeat(1024),"index":index}),
+            )
+            .unwrap();
+        }
+        let output = super::status(&host, "grandchild").await.unwrap()["stdout"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(output.len() <= 30 * 1024);
+        assert!(output.contains("\"index\":63"));
+        assert!(!output.contains("\"index\":0,"));
         let descriptor = serde_json::to_string(&host.descriptor("grandchild").unwrap()).unwrap();
         assert!(descriptor.contains("owner"));
         for id in host.registered_agents() {
