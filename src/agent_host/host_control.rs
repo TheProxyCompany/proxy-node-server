@@ -390,11 +390,33 @@ async fn handle(
     let id = request["instance_id"]
         .as_str()
         .ok_or_else(|| HostError::Invalid("instance_id is required".into()))?;
-    descendant(host, &caller_spec.id, id)?;
+    let related = descendant(host, &caller_spec.id, id).is_ok();
+    let descriptor = host.descriptor(id)?;
+    let same_conversation = caller_spec.seat_config["conversation_id"]
+        .as_str()
+        .filter(|conversation| !conversation.is_empty())
+        .is_some_and(|conversation| descriptor.conversation_id.as_deref() == Some(conversation));
+    if !related && !(request["op"] == "send" && same_conversation) {
+        return Err(HostError::Forbidden);
+    }
     match request["op"].as_str() {
         Some("status") => status(host, id).await,
         Some("send") => {
-            let input = serde_json::from_value(request["input"].clone())?;
+            let mut input: AgentInput = serde_json::from_value(request["input"].clone())?;
+            input.conversation_id = descriptor.conversation_id;
+            input.participant_id = descriptor.participant_id;
+            input.task_id = descriptor.task_id;
+            input.source = Some("agent".into());
+            let mut data = input.data.take().unwrap_or_else(|| json!({}));
+            if !data.is_object() {
+                data = json!({"payload":data});
+            }
+            data["sender_instance_id"] = caller_spec.id.clone().into();
+            data["sender_agent_id"] = caller_spec.seat_config["agent_id"]
+                .as_str()
+                .unwrap_or(&caller_spec.id)
+                .into();
+            input.data = Some(data);
             host.submit(id, input).await
         }
         Some("cancel") => {
