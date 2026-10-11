@@ -10,7 +10,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -22,6 +22,7 @@ use tokio::sync::{Mutex as AsyncMutex, oneshot, watch};
 
 pub mod handoff;
 pub mod herdr;
+mod host_control;
 pub mod http;
 pub mod pact;
 pub mod pact_server;
@@ -66,6 +67,20 @@ pub struct AgentSpec {
     pub seat_config: Value,
     pub env: BTreeMap<String, String>,
     pub space: Option<SpaceBinding>,
+}
+
+/// Registration metadata for routing and authorization, without launch credentials.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct InstanceDescriptor {
+    pub id: String,
+    pub creator_id: Option<String>,
+    pub owner_agent_id: String,
+    pub conversation_id: Option<String>,
+    pub participant_id: Option<String>,
+    pub agent_dir: PathBuf,
+    pub state_dir: PathBuf,
+    pub workspace: PathBuf,
+    pub workspace_mode: WorkspaceMode,
 }
 
 // Media bindings are delivered through the live session. Updating them does not
@@ -232,6 +247,10 @@ struct EventLog {
     bytes: u64,
     offsets: BTreeMap<u64, u64>,
     input_starts: HashMap<String, u64>,
+    deadline_at: Option<u64>,
+    deadline_configured: bool,
+    deadline_expired: bool,
+    stop_reason: Option<String>,
 }
 
 impl EventLog {
@@ -240,6 +259,17 @@ impl EventLog {
             self.offsets.insert(record.sequence, offset);
         }
         let event = &record.event;
+        if event["type"] == "host_deadline" {
+            self.deadline_configured = true;
+            self.deadline_at = event["deadline_at"].as_u64();
+        } else if event["type"] == "host_deadline_expired" {
+            self.deadline_expired = true;
+            self.stop_reason = Some("timed_out".into());
+        } else if event["type"] == "host_cancelled" {
+            self.stop_reason = Some("cancelled".into());
+        } else if event["type"] == "host_resumed" {
+            self.stop_reason = None;
+        }
         let input = event
             .get("event_id")
             .or_else(|| event.get("input_id"))
@@ -263,6 +293,8 @@ struct Agent {
     _lease: Arc<File>,
     creator: Option<String>,
     controls: Mutex<HashMap<String, party_children::Pending>>,
+    host_controls: AtomicUsize,
+    deadline: Mutex<Option<tokio::task::AbortHandle>>,
     spec: Mutex<AgentSpec>,
     process: AsyncMutex<ProcessState>,
     generation: AtomicU64,
@@ -287,6 +319,8 @@ pub struct AgentHost {
     agents: Arc<Mutex<HashMap<String, Arc<Agent>>>>,
     retired_ids: Arc<Mutex<HashSet<String>>>,
     lease: Arc<File>,
+    closing: Arc<AtomicBool>,
+    control_tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
 }
 
 fn valid_id(id: &str) -> bool {
@@ -324,6 +358,10 @@ fn open_log(path: &Path) -> Result<EventLog, HostError> {
         bytes: 0,
         offsets: BTreeMap::new(),
         input_starts: HashMap::new(),
+        deadline_at: None,
+        deadline_configured: false,
+        deadline_expired: false,
+        stop_reason: None,
     };
     let mut valid_end = 0;
     loop {
@@ -366,6 +404,8 @@ impl AgentHost {
             agents: Arc::new(Mutex::new(HashMap::new())),
             retired_ids: Arc::new(Mutex::new(HashSet::new())),
             lease: Arc::new(lease),
+            closing: Arc::new(AtomicBool::new(false)),
+            control_tasks: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
@@ -409,6 +449,9 @@ impl AgentHost {
         spec: AgentSpec,
         creator: Option<String>,
     ) -> Result<(), HostError> {
+        if self.closing.load(Ordering::SeqCst) {
+            return Err(HostError::Stopped);
+        }
         self.check_active_id(&spec.id)?;
         if let Some(space) = &spec.space {
             space.validate()?;
@@ -438,13 +481,19 @@ impl AgentHost {
                 ));
             }
             let mut process = agent.process.lock().await;
+            if self.closing.load(Ordering::SeqCst) {
+                return Err(HostError::Stopped);
+            }
             self.check_active_id(&spec.id)?;
             agent.check_active()?;
             if same_runtime(&agent.spec.lock().unwrap(), &spec) {
                 *agent.spec.lock().unwrap() = spec;
                 return Ok(());
             }
-            if agent.has_pending_work() || !agent.controls.lock().unwrap().is_empty() {
+            if agent.has_pending_work()
+                || !agent.controls.lock().unwrap().is_empty()
+                || agent.host_controls.load(Ordering::SeqCst) != 0
+            {
                 return Err(HostError::Busy);
             }
             Self::stop_locked(&agent, &mut process).await?;
@@ -455,12 +504,15 @@ impl AgentHost {
         private_directory(&directory)?;
         let log_path = directory.join("events.jsonl");
         let log = open_log(&log_path)?;
+        let state = json!({"status":log.stop_reason.as_deref().unwrap_or("stopped")});
         let (updates, _) = watch::channel(log.sequence);
         let id = spec.id.clone();
         let agent = Arc::new(Agent {
             _lease: Arc::clone(&self.lease),
             creator,
             controls: Mutex::new(HashMap::new()),
+            host_controls: AtomicUsize::new(0),
+            deadline: Mutex::new(None),
             spec: Mutex::new(spec),
             process: AsyncMutex::new(ProcessState {
                 stop: None,
@@ -474,7 +526,7 @@ impl AgentHost {
             submission: AsyncMutex::new(()),
             inputs: Mutex::new(HashSet::new()),
             acknowledgements: Mutex::new(HashMap::new()),
-            state: Mutex::new(json!({"status":"stopped"})),
+            state: Mutex::new(state),
             readiness: Mutex::new(None),
             handoff: Mutex::new(None),
             log: Mutex::new(log),
@@ -483,6 +535,9 @@ impl AgentHost {
         });
         // Concurrent identical registration converges on one process creator.
         let mut agents = self.agents.lock().unwrap();
+        if self.closing.load(Ordering::SeqCst) {
+            return Err(HostError::Stopped);
+        }
         self.check_active_id(&id)?;
         if let Some(existing) = agents.get(&id) {
             existing.check_active()?;
@@ -496,7 +551,8 @@ impl AgentHost {
                 &agent,
                 json!({"type":"host_instance_registered","instance_id":id,"creator_id":agent.creator}),
             )?;
-            agents.insert(id, agent);
+            agents.insert(id, Arc::clone(&agent));
+            host_control::resume_deadline(self, &agent);
         }
         Ok(())
     }
@@ -525,6 +581,23 @@ impl AgentHost {
         ids
     }
 
+    pub fn descriptor(&self, id: &str) -> Result<InstanceDescriptor, HostError> {
+        let agent = self.agent(id)?;
+        let spec = agent.spec.lock().unwrap();
+        let string = |key| spec.seat_config[key].as_str().map(str::to_owned);
+        Ok(InstanceDescriptor {
+            id: spec.id.clone(),
+            creator_id: agent.creator.clone(),
+            owner_agent_id: string("agent_id").unwrap_or_else(|| spec.id.clone()),
+            conversation_id: string("conversation_id"),
+            participant_id: string("participant_id"),
+            agent_dir: spec.agent_dir.clone(),
+            state_dir: spec.state_dir.clone(),
+            workspace: spec.workspace.clone(),
+            workspace_mode: spec.workspace_mode,
+        })
+    }
+
     pub async fn ensure_started(&self, id: &str) -> Result<(), HostError> {
         self.check_active_id(id)?;
         let agent = self.agent(id)?;
@@ -546,11 +619,17 @@ impl AgentHost {
 
     async fn ensure_instance_started(&self, agent: &Arc<Agent>) -> Result<(), HostError> {
         let mut process = agent.process.lock().await;
+        if self.closing.load(Ordering::SeqCst) {
+            return Err(HostError::Stopped);
+        }
         agent.check_active()?;
         if process.stop.is_some() {
             return Ok(());
         }
         let spec = agent.spec.lock().unwrap().clone();
+        if agent.log.lock().unwrap().stop_reason.is_some() {
+            publish(agent, json!({"type":"host_resumed"}))?;
+        }
         *agent.readiness.lock().unwrap() = None;
         let child = spawn(&spec)?;
         let generation = agent.generation.fetch_add(1, Ordering::SeqCst) + 1;
@@ -560,6 +639,7 @@ impl AgentHost {
         process.stop = Some(stop);
         process.finished = Some(completion);
         tokio::spawn(supervise(
+            self.clone(),
             Arc::clone(agent),
             child,
             stopped,
@@ -665,7 +745,8 @@ impl AgentHost {
         Ok(
             json!({"agent_id":id,"pid":if pid==0 {None} else {Some(pid)},"hosted":hosted,"retired":retired,"creator_id":agent.creator,"address":format!("/client/agents/{id}"),
             "available":available,"readiness":readiness,"handoff":handoff,"workspace":workspace,
-            "runtime":*agent.state.lock().unwrap(),"sequence":agent.log.lock().unwrap().sequence}),
+            "runtime":*agent.state.lock().unwrap(),"sequence":agent.log.lock().unwrap().sequence,
+            "descriptor":self.descriptor(id)?}),
         )
     }
 
@@ -769,8 +850,19 @@ impl AgentHost {
     }
 
     pub async fn shutdown(&self) {
+        self.closing.store(true, Ordering::SeqCst);
+        let controls: Vec<_> = self.control_tasks.lock().unwrap().drain(..).collect();
+        for task in &controls {
+            task.abort();
+        }
+        for task in controls {
+            let _ = task.await;
+        }
         let agents: Vec<_> = self.agents.lock().unwrap().values().cloned().collect();
         for agent in agents {
+            if let Some(deadline) = agent.deadline.lock().unwrap().take() {
+                deadline.abort();
+            }
             let mut process = agent.process.lock().await;
             agent.generation.fetch_add(1, Ordering::SeqCst);
             agent.controls.lock().unwrap().clear();
@@ -949,6 +1041,19 @@ fn spawn(spec: &AgentSpec) -> Result<Child, HostError> {
         .arg(&spec.workspace)
         .current_dir(&spec.workspace)
         .envs(canonical_harness_environment(&spec.env))
+        .env(
+            "PROXY_HARNESS_HOSTED",
+            if spec
+                .env
+                .get("PROXY_HARNESS_HOST_CONTROL")
+                .is_some_and(|capability| capability == "1")
+            {
+                "1"
+            } else {
+                "0"
+            },
+        )
+        .env("PROXY_HARNESS_INSTANCE_ID", &spec.id)
         .env("PROXY_HARNESS_SEAT", serde_json::to_string(&seat_config)?)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -995,6 +1100,10 @@ fn publish(agent: &Agent, event: Value) -> Result<(), HostError> {
             | "host_party_child_started"
             | "host_retired"
             | "host_error"
+            | "host_deadline"
+            | "host_deadline_expired"
+            | "host_cancelled"
+            | "host_resumed"
     ) || kind == "handoff_state"
         || (kind == "response" && handoff::is_command(&event))
     {
@@ -1036,6 +1145,10 @@ fn publish(agent: &Agent, event: Value) -> Result<(), HostError> {
             // recovered work as an ownership fence until the next state receipt.
             agent.state.lock().unwrap()["status"] = json!("recovering");
         }
+    } else if kind == "host_deadline_expired" {
+        agent.state.lock().unwrap()["status"] = json!("timed_out");
+    } else if kind == "host_cancelled" {
+        agent.state.lock().unwrap()["status"] = json!("cancelled");
     }
     let handoff_reply = kind == "response"
         && handoff::is_command(&event)
@@ -1078,6 +1191,7 @@ fn publish(agent: &Agent, event: Value) -> Result<(), HostError> {
 }
 
 async fn supervise(
+    host: AgentHost,
     agent: Arc<Agent>,
     mut child: Child,
     mut stop: watch::Receiver<bool>,
@@ -1095,6 +1209,7 @@ async fn supervise(
         let stdout = child.stdout.take().unwrap();
         let stderr = child.stderr.take().unwrap();
         let output_agent = Arc::clone(&agent);
+        let output_host = host.clone();
         let reporter = herdr.clone();
         let output = tokio::spawn(async move {
             let mut lines = tokio::io::BufReader::new(stdout).lines();
@@ -1102,6 +1217,9 @@ async fn supervise(
                 let event = serde_json::from_str(&line).unwrap_or_else(
                     |_| json!({"type":"host_error","error":"runtime emitted invalid JSON"}),
                 );
+                if host_control::route(&output_host, &output_agent, generation, &event) {
+                    continue;
+                }
                 if let (Some(reporter), Some(state)) = (&reporter, herdr::state_for(&event)) {
                     reporter.send_replace(Some(state));
                 }

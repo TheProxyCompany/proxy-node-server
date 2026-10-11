@@ -57,12 +57,19 @@ struct HttpState {
 }
 
 pub fn router(host: AgentHost, authority: Arc<dyn HostAuthority>) -> Router {
+    api_router(host.clone(), authority.clone()).merge(
+        Router::new()
+            .route("/{agent}", get(attach))
+            .with_state(HttpState { host, authority }),
+    )
+}
+
+pub fn api_router(host: AgentHost, authority: Arc<dyn HostAuthority>) -> Router {
     Router::new()
         .route("/client/agents/{agent}/input", post(input))
         .route("/client/agents/{agent}/status", get(status))
         .route("/client/agents/{agent}/events", get(events))
         .route("/client/agents/{agent}/abort", post(abort))
-        .route("/{agent}", get(attach))
         .layer(DefaultBodyLimit::max(4 * 1024 * 1024))
         .with_state(HttpState { host, authority })
 }
