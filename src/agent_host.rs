@@ -615,6 +615,8 @@ impl AgentHost {
             }
             if newly_pending && matches!(error, HostError::Stopped) {
                 agent.inputs.lock().unwrap().remove(&input.id);
+            } else if matches!(error, HostError::Stopped) {
+                return Err(HostError::AcceptanceUnknown);
             }
             return Err(error);
         }

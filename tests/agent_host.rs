@@ -129,7 +129,7 @@ time.sleep(60)
                 .submit("closed-pipe", input("attempt", "same uncertain input"))
                 .await
                 .unwrap_err();
-            assert!(matches!(retry, HostError::Stopped), "{retry}");
+            assert!(matches!(retry, HostError::AcceptanceUnknown), "{retry}");
         } else {
             assert!(matches!(error, HostError::Stopped), "{error}");
         }
