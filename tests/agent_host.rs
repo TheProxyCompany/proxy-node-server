@@ -88,6 +88,101 @@ fn input(id: &str, message: &str) -> AgentInput {
     }
 }
 
+#[tokio::test]
+async fn failed_pipe_admission_clears_only_inputs_with_no_written_bytes() {
+    for partial in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let host = AgentHost::open(root.path().join("host")).unwrap();
+        let mut config = spec(root.path(), "closed-pipe");
+        std::fs::write(
+            &config.command,
+            format!(
+                r#"#!/usr/bin/env python3
+import json,os,sys,time
+def emit(v): print(json.dumps(v),flush=True)
+if {partial}:
+ emit({{'type':'root_state','status':'idle','input_id':None,'queue_depth':0}})
+ os.read(0,256)
+os.close(0)
+emit({{'type':'root_state','status':'idle','input_id':None,'queue_depth':0}})
+time.sleep(60)
+"#,
+                partial = if partial { "True" } else { "False" }
+            ),
+        )
+        .unwrap();
+        host.register(config.clone()).await.unwrap();
+        let mut events = host.subscribe("closed-pipe", 0).unwrap();
+        host.ensure_started("closed-pipe").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while events.recv().await.unwrap().event["type"] != "root_state" {}
+        })
+        .await
+        .unwrap();
+        let error = host
+            .submit("closed-pipe", input("attempt", &"x".repeat(1024 * 1024)))
+            .await
+            .unwrap_err();
+        if partial {
+            assert!(matches!(error, HostError::AcceptanceUnknown), "{error}");
+            let retry = host
+                .submit("closed-pipe", input("attempt", "same uncertain input"))
+                .await
+                .unwrap_err();
+            assert!(matches!(retry, HostError::Stopped), "{retry}");
+        } else {
+            assert!(matches!(error, HostError::Stopped), "{error}");
+        }
+        config.seat_config["model"] = json!("replacement");
+        let changed = host.register(config.clone()).await;
+        if partial {
+            assert!(matches!(changed, Err(HostError::Busy)), "{changed:?}");
+        } else {
+            // The deliberately broken fixture cannot acknowledge shutdown,
+            // but no phantom input keeps the idle loadout busy.
+            assert!(!matches!(changed, Err(HostError::Busy)), "{changed:?}");
+            host.register(config).await.unwrap();
+        }
+        host.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn input_replay_starts_at_its_own_events_before_and_after_host_restart() {
+    let root = tempfile::tempdir().unwrap();
+    let config = spec(root.path(), "indexed");
+    let host_path = root.path().join("host");
+    let host = AgentHost::open(&host_path).unwrap();
+    host.register(config.clone()).await.unwrap();
+    for id in ["older", "current"] {
+        let cursor = host.input_cursor("indexed", id).unwrap();
+        let mut events = host.subscribe("indexed", cursor).unwrap();
+        host.submit("indexed", input(id, id)).await.unwrap();
+        settled(&mut events, id).await;
+    }
+    let cursor = host.input_cursor("indexed", "current").unwrap();
+    assert!(cursor > host.input_cursor("indexed", "older").unwrap());
+    let mut replay = host.subscribe("indexed", cursor).unwrap();
+    let first = replay.recv().await.unwrap();
+    assert_eq!(first.event["type"], "accepted");
+    assert_eq!(first.event["id"], "current");
+    assert_eq!(
+        host.input_cursor("indexed", "next").unwrap(),
+        host.status("indexed").await.unwrap()["sequence"]
+            .as_u64()
+            .unwrap()
+    );
+    drop(replay);
+    host.shutdown().await;
+    drop(host);
+    tokio::task::yield_now().await;
+    let host = AgentHost::open(&host_path).unwrap();
+    host.register(config).await.unwrap();
+    assert_eq!(host.input_cursor("indexed", "current").unwrap(), cursor);
+    let mut replay = host.subscribe("indexed", cursor).unwrap();
+    assert_eq!(replay.recv().await.unwrap().event["id"], "current");
+}
+
 async fn settled(sub: &mut EventSubscription, id: &str) -> Value {
     tokio::time::timeout(Duration::from_secs(8), async {
         loop {

@@ -116,7 +116,6 @@ impl Fixture {
     fn handler(this: Arc<Self>) -> impl proxy_node_server::agent_host::peer::PeerHandler {
         move |request: VerifiedRequest| {
             let this = Arc::clone(&this);
-            let this = Arc::clone(&this);
             async move {
                 this.effects.fetch_add(1, Ordering::SeqCst);
                 let agent = request.command.agent_id().to_string();
@@ -142,6 +141,9 @@ impl Fixture {
                     }
                     PeerCommand::Status { .. } => {
                         json!({"agent": agent, "by": sender, "status": "idle", "sequence": 7})
+                    }
+                    PeerCommand::InputCursor { .. } => {
+                        json!({"agent": agent, "by": sender, "sequence": 3})
                     }
                     PeerCommand::Submit { ref input, .. } => {
                         json!({

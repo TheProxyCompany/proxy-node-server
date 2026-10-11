@@ -332,6 +332,8 @@ pub enum PeerCommand {
         participant_id: String,
         definitions: Option<DefinitionBundle>,
     },
+    /// Start of a stable input in the existing durable host event log.
+    InputCursor { agent: String, input_id: String },
 }
 
 fn default_event_limit() -> u32 {
@@ -429,7 +431,8 @@ impl PeerCommand {
             | Self::Submit { agent, .. }
             | Self::Events { agent, .. }
             | Self::Abort { agent }
-            | Self::Attach { agent, .. } => agent,
+            | Self::Attach { agent, .. }
+            | Self::InputCursor { agent, .. } => agent,
         }
     }
 
@@ -480,6 +483,11 @@ impl PeerCommand {
             Self::Events { limit, .. } => {
                 if *limit == 0 || *limit > MAX_EVENTS {
                     return Err(PeerError::Invalid("event limit out of bounds".into()));
+                }
+            }
+            Self::InputCursor { input_id, .. } => {
+                if input_id.is_empty() || input_id.len() > 256 {
+                    return Err(PeerError::Invalid("invalid input cursor id".into()));
                 }
             }
             Self::Open { .. } | Self::Status { .. } | Self::Abort { .. } => {}

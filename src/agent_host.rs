@@ -229,6 +229,27 @@ pub struct HostEvent {
 struct EventLog {
     file: File,
     sequence: u64,
+    bytes: u64,
+    offsets: BTreeMap<u64, u64>,
+    input_starts: HashMap<String, u64>,
+}
+
+impl EventLog {
+    fn index(&mut self, record: &HostEvent, offset: u64) {
+        if (record.sequence - 1) % 128 == 0 {
+            self.offsets.insert(record.sequence, offset);
+        }
+        let event = &record.event;
+        let input = event
+            .get("event_id")
+            .or_else(|| event.get("input_id"))
+            .or_else(|| (event["type"] == "accepted").then(|| &event["id"]));
+        if let Some(input) = input.and_then(Value::as_str) {
+            self.input_starts
+                .entry(input.into())
+                .or_insert(record.sequence - 1);
+        }
+    }
 }
 
 struct ProcessState {
@@ -249,6 +270,7 @@ struct Agent {
     shutdown_confirmed: AtomicBool,
     pid: AtomicU32,
     stdin: AsyncMutex<Option<ChildStdin>>,
+    submission: AsyncMutex<()>,
     inputs: Mutex<HashSet<String>>,
     acknowledgements: Mutex<Acknowledgements>,
     state: Mutex<Value>,
@@ -296,7 +318,13 @@ fn open_log(path: &Path) -> Result<EventLog, HostError> {
     let file = options.open(path)?;
     let mut reader = BufReader::new(file.try_clone()?);
     let mut line = String::new();
-    let mut sequence = 0;
+    let mut log = EventLog {
+        file,
+        sequence: 0,
+        bytes: 0,
+        offsets: BTreeMap::new(),
+        input_starts: HashMap::new(),
+    };
     let mut valid_end = 0;
     loop {
         line.clear();
@@ -304,19 +332,21 @@ fn open_log(path: &Path) -> Result<EventLog, HostError> {
             break;
         }
         if !line.ends_with('\n') {
-            file.set_len(valid_end)?;
+            log.file.set_len(valid_end)?;
             break;
         }
         let event: HostEvent = serde_json::from_str(&line)?;
-        if event.sequence != sequence + 1 {
+        if event.sequence != log.sequence + 1 {
             return Err(HostError::Invalid(
                 "host event log sequence is corrupt".into(),
             ));
         }
-        sequence = event.sequence;
+        log.index(&event, valid_end);
+        log.sequence = event.sequence;
         valid_end = reader.stream_position()?;
     }
-    Ok(EventLog { file, sequence })
+    log.bytes = valid_end;
+    Ok(log)
 }
 
 impl AgentHost {
@@ -441,6 +471,7 @@ impl AgentHost {
             shutdown_confirmed: AtomicBool::new(false),
             pid: AtomicU32::new(0),
             stdin: AsyncMutex::new(None),
+            submission: AsyncMutex::new(()),
             inputs: Mutex::new(HashSet::new()),
             acknowledgements: Mutex::new(HashMap::new()),
             state: Mutex::new(json!({"status":"stopped"})),
@@ -551,6 +582,7 @@ impl AgentHost {
         }
         let agent = self.agent(id)?;
         self.ensure_started(id).await?;
+        let submission = agent.submission.lock().await;
         let (sender, response) = oneshot::channel();
         agent
             .acknowledgements
@@ -559,7 +591,7 @@ impl AgentHost {
             .entry(input.id.clone())
             .or_default()
             .push(sender);
-        agent.inputs.lock().unwrap().insert(input.id.clone());
+        let newly_pending = agent.inputs.lock().unwrap().insert(input.id.clone());
         let mut wire = serde_json::to_value(&input)?;
         // The logical identity is trusted registration data. A scoped task
         // runtime id is an implementation handle, not the agent identity.
@@ -572,10 +604,21 @@ impl AgentHost {
                 .unwrap_or(&spec.id)
                 .into();
         }
-        if agent.write(&wire).await.is_err() {
-            agent.acknowledgements.lock().unwrap().remove(&input.id);
-            return Err(HostError::AcceptanceUnknown);
+        if let Err(error) = agent.write(&wire).await {
+            drop(response);
+            let mut pending = agent.acknowledgements.lock().unwrap();
+            if let Some(waiters) = pending.get_mut(&input.id) {
+                waiters.retain(|waiter| !waiter.is_closed());
+                if waiters.is_empty() {
+                    pending.remove(&input.id);
+                }
+            }
+            if newly_pending && matches!(error, HostError::Stopped) {
+                agent.inputs.lock().unwrap().remove(&input.id);
+            }
+            return Err(error);
         }
+        drop(submission);
         let result = match tokio::time::timeout(Duration::from_secs(30), response).await {
             Ok(Ok(Ok(ack))) => Ok(ack),
             Ok(Ok(Err(error))) => Err(HostError::Rejected(error)),
@@ -636,6 +679,8 @@ impl AgentHost {
         let mut reader = BufReader::new(File::open(&agent.log_path)?);
         if after_sequence == log.sequence {
             reader.seek(SeekFrom::End(0))?;
+        } else if let Some((_, offset)) = log.offsets.range(..=after_sequence + 1).next_back() {
+            reader.seek(SeekFrom::Start(*offset))?;
         }
         drop(log);
         Ok(EventSubscription {
@@ -644,6 +689,21 @@ impl AgentHost {
             reader,
             after_sequence,
         })
+    }
+
+    /// Reattach at an input's first durable event, or at the current head when
+    /// it has not appeared yet. The existing log rebuilds this index on open.
+    pub fn input_cursor(&self, id: &str, input_id: &str) -> Result<u64, HostError> {
+        if input_id.is_empty() || input_id.len() > 256 {
+            return Err(HostError::Invalid("bounded input id is required".into()));
+        }
+        let agent = self.agent(id)?;
+        let log = agent.log.lock().unwrap();
+        Ok(log
+            .input_starts
+            .get(input_id)
+            .copied()
+            .unwrap_or(log.sequence))
     }
 
     pub async fn abort(&self, id: &str) -> Result<(), HostError> {
@@ -801,6 +861,8 @@ impl Agent {
     async fn write_direct(&self, wire: &Value) -> Result<(), HostError> {
         self.check_active()?;
         use tokio::io::AsyncWriteExt;
+        let bytes = format!("{wire}\n").into_bytes();
+        let mut written = 0;
         match tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let mut stdin = self.stdin.lock().await;
@@ -811,7 +873,13 @@ impl Agent {
                     ));
                 }
                 if let Some(stdin) = stdin.as_mut() {
-                    stdin.write_all(format!("{wire}\n").as_bytes()).await?;
+                    while written < bytes.len() {
+                        let count = stdin.write(&bytes[written..]).await?;
+                        if count == 0 {
+                            return Err(std::io::ErrorKind::WriteZero.into());
+                        }
+                        written += count;
+                    }
                     stdin.flush().await?;
                     return Ok::<_, std::io::Error>(());
                 }
@@ -822,6 +890,7 @@ impl Agent {
         .await
         {
             Ok(Ok(())) => Ok(()),
+            _ if written == 0 => Err(HostError::Stopped),
             _ => Err(HostError::AcceptanceUnknown),
         }
     }
@@ -929,6 +998,9 @@ fn publish(agent: &Agent, event: Value) -> Result<(), HostError> {
     {
         log.file.sync_data()?;
     }
+    let offset = log.bytes;
+    log.index(&record, offset);
+    log.bytes += bytes.len() as u64 + 1;
     log.sequence = record.sequence;
     // The agent is idle before anyone hears that it settled: a subscriber
     // that reacts to agent_settled may change its configuration at once.
@@ -1128,6 +1200,45 @@ async fn supervise(
 #[cfg(test)]
 mod handoff_wire_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn durable_event_replay_seeks_near_its_cursor() {
+        let root = tempfile::tempdir().unwrap();
+        let host = AgentHost::open(root.path()).unwrap();
+        host.register(AgentSpec {
+            id: "indexed".into(),
+            display_name: None,
+            command: root.path().join("unused"),
+            args: vec![],
+            agent_dir: root.path().join("identity"),
+            state_dir: root.path().join("state"),
+            workspace: root.path().into(),
+            workspace_mode: WorkspaceMode::Host,
+            seat_config: json!({}),
+            env: BTreeMap::new(),
+            space: None,
+        })
+        .await
+        .unwrap();
+        let agent = host.agent("indexed").unwrap();
+        for index in 0..1024 {
+            publish(
+                &agent,
+                json!({"type":"message_update", "event_id":format!("input-{index}")}),
+            )
+            .unwrap();
+        }
+        let cursor = host.input_cursor("indexed", "input-1000").unwrap();
+        let mut subscription = host.subscribe("indexed", cursor).unwrap();
+        let seek = subscription.reader.stream_position().unwrap();
+        assert!(
+            seek > agent.log.lock().unwrap().bytes / 2,
+            "must seek past old history"
+        );
+        let event = subscription.recv().await.unwrap();
+        assert_eq!(event.sequence, cursor + 1);
+        assert_eq!(event.event["event_id"], "input-1000");
+    }
 
     #[tokio::test]
     async fn recovered_runtime_work_prevents_configuration_replacement() {
