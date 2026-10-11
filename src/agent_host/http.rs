@@ -66,6 +66,7 @@ pub fn router(host: AgentHost, authority: Arc<dyn HostAuthority>) -> Router {
 
 pub fn api_router(host: AgentHost, authority: Arc<dyn HostAuthority>) -> Router {
     Router::new()
+        .route("/client/agents/{agent}", get(attach))
         .route("/client/agents/{agent}/input", post(input))
         .route("/client/agents/{agent}/status", get(status))
         .route("/client/agents/{agent}/events", get(events))
