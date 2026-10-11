@@ -123,16 +123,30 @@ fn child_spec(caller: &AgentSpec, child: &Spawn) -> Result<AgentSpec, HostError>
             "a computer child requires a distinct Space".into(),
         ));
     }
-    let workspace = child.workspace.canonicalize()?;
+    let workspace = match child.workspace_mode {
+        WorkspaceMode::Host => child.workspace.canonicalize()?,
+        WorkspaceMode::Guest => {
+            if !child.workspace.is_absolute()
+                || child
+                    .workspace
+                    .components()
+                    .any(|part| matches!(part, std::path::Component::ParentDir))
+            {
+                return Err(HostError::Forbidden);
+            }
+            child.workspace.clone()
+        }
+    };
     match child.workspace_mode {
         WorkspaceMode::Host if workspace != folder.join("workspace") => {
             return Err(HostError::Forbidden);
         }
         WorkspaceMode::Guest
-            if workspace != caller.workspace.canonicalize()?
-                && !child.space.as_ref().is_some_and(|space| {
-                    space.workspace_root.canonicalize().ok().as_ref() == Some(&workspace)
-                }) =>
+            if workspace != caller.workspace
+                && !child
+                    .space
+                    .as_ref()
+                    .is_some_and(|space| space.workspace_root == workspace) =>
         {
             return Err(HostError::Forbidden);
         }
@@ -505,6 +519,52 @@ mod tests {
             .err()
             .unwrap();
         assert!(!public_error(&HostError::Json(malformed)).contains("private-value"));
+    }
+
+    #[tokio::test]
+    async fn guest_workspace_stays_in_its_namespace_while_harness_starts_in_owned_state() {
+        let root = tempfile::tempdir().unwrap();
+        let mut parent = spec(root.path(), "parent");
+        parent.workspace_mode = WorkspaceMode::Guest;
+        parent.command = "/usr/bin/python3".into();
+        parent.args = vec![
+            "-c".into(),
+            "import os,sys;print(os.getcwd());print(sys.argv[-1])".into(),
+        ];
+        let folder = parent.state_dir.join("children/child");
+        for name in ["identity", "state"] {
+            std::fs::create_dir_all(folder.join(name)).unwrap();
+        }
+        std::fs::write(folder.join("state/fork.json"), "{}").unwrap();
+        let workspace = PathBuf::from("/guest-only-owned-workspace/child");
+        assert!(!workspace.exists());
+        let mut child: Spawn = serde_json::from_value(json!({
+            "instance_id":"child","identity":folder.join("identity"),"state":folder.join("state"),
+            "workspace":workspace,"workspace_mode":"guest","seat":parent.seat_config,
+            "space":{"space_id":"new-child-space","isolation":"vm","workspace_root":workspace,"endpoint":"http://127.0.0.1:9/mcp"},
+            "initial_input":{"id":"initial","message":"task"}
+        })).unwrap();
+        let registered = child_spec(&parent, &child).unwrap();
+        let output = spawn(&registered)
+            .unwrap()
+            .wait_with_output()
+            .await
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            format!(
+                "{}\n{}\n",
+                registered.state_dir.display(),
+                workspace.display()
+            )
+        );
+        child.workspace = "/guest-only-owned-workspace/../another-space".into();
+        child.space.as_mut().unwrap().workspace_root = child.workspace.clone();
+        assert!(matches!(
+            child_spec(&parent, &child),
+            Err(HostError::Forbidden)
+        ));
     }
 
     #[tokio::test]

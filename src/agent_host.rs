@@ -1044,6 +1044,11 @@ fn spawn(spec: &AgentSpec) -> Result<Child, HostError> {
     let mut seat_config = spec.seat_config.clone();
     seat_config["workspace_mode"] = serde_json::to_value(spec.workspace_mode)?;
     let mut command = Command::new(&spec.command);
+    let directory = if spec.workspace_mode == WorkspaceMode::Guest && !spec.workspace.is_dir() {
+        &spec.state_dir
+    } else {
+        &spec.workspace
+    };
     scrub_harness_environment(&mut command);
     #[cfg(unix)]
     {
@@ -1060,7 +1065,7 @@ fn spawn(spec: &AgentSpec) -> Result<Child, HostError> {
         .arg(&spec.state_dir)
         .arg("--workspace")
         .arg(&spec.workspace)
-        .current_dir(&spec.workspace)
+        .current_dir(directory)
         .envs(canonical_harness_environment(&spec.env))
         .env(
             "PROXY_HARNESS_HOSTED",
