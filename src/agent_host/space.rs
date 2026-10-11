@@ -166,6 +166,69 @@ impl CuaSpaceManager {
         Ok(owner)
     }
 
+    /// Read retained metadata without booting, starting, executing, or creating a guest.
+    pub fn recorded_binding(
+        &self,
+        agent: &str,
+        state: &Path,
+    ) -> Result<Option<SpaceBinding>, HostError> {
+        use std::io::{BufRead, BufReader};
+        if !valid_id(agent) {
+            return Err(HostError::Invalid("valid agent id is required".into()));
+        }
+        let owner = match self.load_owner(agent) {
+            Ok(owner) => owner,
+            Err(HostError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        if owner.reserved() {
+            return Ok(None);
+        }
+        let file = match File::open(state.join("inbox.jsonl")) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let mut reader = BufReader::new(file);
+        let mut line = String::new();
+        let mut authority = None;
+        loop {
+            line.clear();
+            if reader.read_line(&mut line)? == 0 || !line.ends_with('\n') {
+                break;
+            }
+            let record: Value = serde_json::from_str(&line)?;
+            if record["kind"] == "input" && record["input"]["_authority"].is_object() {
+                authority = Some(record["input"]["_authority"].clone());
+            }
+        }
+        let Some(authority) = authority.filter(|value| !value["space"].is_null()) else {
+            return Ok(None);
+        };
+        let binding: SpaceBinding = serde_json::from_value(authority["space"].clone())?;
+        binding.validate()?;
+        let endpoint = reqwest::Url::parse(&binding.endpoint)
+            .map_err(|_| HostError::Invalid("invalid recorded guest endpoint".into()))?;
+        if binding.space_id != format!("local:{}", owner.name)
+            || !matches!(
+                endpoint.host_str(),
+                Some("127.0.0.1" | "localhost" | "[::1]" | "::1")
+            )
+            || !matches!(
+                (&owner.resources.kind, &binding.isolation),
+                (LocalSpaceKind::LinuxContainer, SpaceIsolation::Container)
+                    | (LocalSpaceKind::MacosVm, SpaceIsolation::Vm)
+            )
+        {
+            return Err(HostError::Invalid(
+                "recorded guest binding does not match its owner".into(),
+            ));
+        }
+        Ok(Some(binding))
+    }
+
     fn establish(&self, agent: &str, owner: &Ownership) -> Result<(), HostError> {
         if !owner.reserved() {
             return Ok(());

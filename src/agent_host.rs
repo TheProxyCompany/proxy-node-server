@@ -253,15 +253,37 @@ struct EventLog {
     deadline_expired: bool,
     stop_reason: Option<String>,
     cleanup_confirmed: Option<bool>,
+    retired: bool,
+    admitted: bool,
+    registered: bool,
+    creator_id: Option<String>,
 }
 
 impl EventLog {
+    fn deadline_passed(&self) -> bool {
+        self.deadline_at.is_some_and(|at| {
+            at <= std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64
+        })
+    }
+
     fn index(&mut self, record: &HostEvent, offset: u64) {
         if (record.sequence - 1) % 128 == 0 {
             self.offsets.insert(record.sequence, offset);
         }
         let event = &record.event;
-        if event["type"] == "host_deadline" {
+        if event["type"] == "accepted" && event["durable"] == true {
+            self.admitted = true;
+        }
+        if event["type"] == "host_instance_registered" {
+            self.registered = true;
+            self.creator_id = event["creator_id"].as_str().map(str::to_owned);
+        }
+        if event["type"] == "host_retired" {
+            self.retired = true;
+        } else if event["type"] == "host_deadline" {
             self.deadline_configured = true;
             self.deadline_at = event["deadline_at"].as_u64();
         } else if event["type"] == "host_deadline_expired" {
@@ -331,6 +353,7 @@ struct Agent {
     generation: AtomicU64,
     retired: AtomicBool,
     shutdown_confirmed: AtomicU8,
+    restoration: Mutex<Option<Value>>,
     pid: AtomicU32,
     stdin: AsyncMutex<Option<ChildStdin>>,
     submission: AsyncMutex<()>,
@@ -372,7 +395,7 @@ fn private_directory(path: &Path) -> Result<(), HostError> {
     Ok(())
 }
 
-fn open_log(path: &Path) -> Result<EventLog, HostError> {
+fn open_log(path: &Path, id: &str) -> Result<EventLog, HostError> {
     let mut options = OpenOptions::new();
     options.create(true).read(true).append(true);
     #[cfg(unix)]
@@ -380,7 +403,10 @@ fn open_log(path: &Path) -> Result<EventLog, HostError> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let file = options.open(path)?;
+    read_log(options.open(path)?, id, true)
+}
+
+fn read_log(file: File, id: &str, repair_incomplete_tail: bool) -> Result<EventLog, HostError> {
     let mut reader = BufReader::new(file.try_clone()?);
     let mut line = String::new();
     let mut log = EventLog {
@@ -394,6 +420,10 @@ fn open_log(path: &Path) -> Result<EventLog, HostError> {
         deadline_expired: false,
         stop_reason: None,
         cleanup_confirmed: None,
+        retired: false,
+        admitted: false,
+        registered: false,
+        creator_id: None,
     };
     let mut valid_end = 0;
     loop {
@@ -402,13 +432,23 @@ fn open_log(path: &Path) -> Result<EventLog, HostError> {
             break;
         }
         if !line.ends_with('\n') {
-            log.file.set_len(valid_end)?;
+            if repair_incomplete_tail {
+                log.file.set_len(valid_end)?;
+            }
             break;
         }
         let event: HostEvent = serde_json::from_str(&line)?;
-        if event.sequence != log.sequence + 1 {
+        if event.sequence != log.sequence + 1 || event.agent_id != id {
             return Err(HostError::Invalid(
                 "host event log sequence is corrupt".into(),
+            ));
+        }
+        if event.event["type"] == "host_instance_registered"
+            && log.registered
+            && event.event["creator_id"].as_str() != log.creator_id.as_deref()
+        {
+            return Err(HostError::Invalid(
+                "recorded instance creator changed".into(),
             ));
         }
         log.index(&event, valid_end);
@@ -530,12 +570,23 @@ impl AgentHost {
             }
             Self::stop_locked(&agent, &mut process, ShutdownMode::PreserveShell).await?;
             *agent.spec.lock().unwrap() = spec;
+            *agent.restoration.lock().unwrap() = None;
             return Ok(());
         }
         let directory = self.root.join(&spec.id);
         private_directory(&directory)?;
         let log_path = directory.join("events.jsonl");
-        let log = open_log(&log_path)?;
+        let log = open_log(&log_path, &spec.id)?;
+        if log.retired {
+            return Err(HostError::Invalid(
+                "agent handle is retired after migration".into(),
+            ));
+        }
+        if log.registered && log.creator_id != creator {
+            return Err(HostError::Invalid(
+                "an agent cannot change its recorded creator".into(),
+            ));
+        }
         let state = json!({"status":log.stop_reason.as_deref().unwrap_or("stopped"),"cleanup_confirmed":log.cleanup_confirmed});
         let shutdown_confirmed = if log.cleanup_confirmed == Some(true) {
             ShutdownMode::CancelInstance as u8
@@ -558,6 +609,7 @@ impl AgentHost {
             generation: AtomicU64::new(0),
             retired: AtomicBool::new(false),
             shutdown_confirmed: AtomicU8::new(shutdown_confirmed),
+            restoration: Mutex::new(None),
             pid: AtomicU32::new(0),
             stdin: AsyncMutex::new(None),
             submission: AsyncMutex::new(()),
@@ -640,6 +692,9 @@ impl AgentHost {
         self.check_active_id(id)?;
         let agent = self.agent(id)?;
         agent.check_active()?;
+        if agent.is_restoring() {
+            return Err(HostError::Busy);
+        }
         if agent.process.lock().await.stop.is_some() {
             return Ok(());
         }
@@ -661,6 +716,9 @@ impl AgentHost {
             return Err(HostError::Stopped);
         }
         agent.check_active()?;
+        if agent.is_restoring() {
+            return Err(HostError::Busy);
+        }
         if process.stop.is_some() {
             return Ok(());
         }
@@ -683,8 +741,68 @@ impl AgentHost {
             stopped,
             generation,
             finished,
+            None,
         ));
         Ok(())
+    }
+
+    /// Recover independently admitted descendants without reopening this creator's work.
+    pub async fn restore_descendants(&self, id: &str) -> Result<Value, HostError> {
+        self.check_active_id(id)?;
+        if self.closing.load(Ordering::SeqCst) {
+            return Err(HostError::Stopped);
+        }
+        let agent = self.agent(id)?;
+        agent.check_active()?;
+        let expire = {
+            let log = agent.log.lock().unwrap();
+            log.stop_reason.is_none() && log.deadline_passed()
+        };
+        if expire {
+            if let Some(timer) = agent.deadline.lock().unwrap().take() {
+                timer.abort();
+            }
+            let _ = host_control::cancel(self, id, true).await;
+        }
+        let mut process = agent.process.lock().await;
+        if self.closing.load(Ordering::SeqCst) {
+            return Err(HostError::Stopped);
+        }
+        agent.check_active()?;
+        if agent.log.lock().unwrap().stop_reason.is_none() {
+            return Err(HostError::Invalid(
+                "restoration-only startup requires a stopped creator".into(),
+            ));
+        }
+        if process.stop.is_some() {
+            return Err(HostError::Busy);
+        }
+        if let Some(result) = agent.restoration.lock().unwrap().as_ref().filter(|value| {
+            value["success"] == true && value["refused"].as_array().is_some_and(Vec::is_empty)
+        }) {
+            return Ok(result.clone());
+        }
+        let mut spec = agent.spec.lock().unwrap().clone();
+        spec.args.push("--restore-instances-only".into());
+        let child = spawn(&spec)?;
+        *agent.restoration.lock().unwrap() = Some(json!({"status":"running"}));
+        let generation = agent.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let (stop, stopped) = watch::channel(None);
+        let (finished, completion) = oneshot::channel();
+        let (result, restored) = oneshot::channel();
+        process.stop = Some(stop);
+        process.finished = Some(completion);
+        tokio::spawn(supervise(
+            self.clone(),
+            Arc::clone(&agent),
+            child,
+            stopped,
+            generation,
+            finished,
+            Some(result),
+        ));
+        drop(process);
+        restored.await.map_err(|_| HostError::Stopped)?
     }
 
     pub async fn submit(&self, id: &str, input: AgentInput) -> Result<Value, HostError> {
@@ -755,6 +873,26 @@ impl AgentHost {
         result
     }
 
+    /// Read prior admission and terminal state without registering or starting an instance.
+    pub fn recorded_status(&self, id: &str) -> Result<Option<Value>, HostError> {
+        if !valid_id(id) {
+            return Err(HostError::Invalid("valid agent id is required".into()));
+        }
+        let file = match File::open(self.root.join(id).join("events.jsonl")) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let log = read_log(file, id, false)?;
+        let expired = log.deadline_expired || log.deadline_passed();
+        Ok(Some(
+            json!({"agent_id":id,"creator_id":log.creator_id,"admitted":log.admitted,"retired":log.retired,
+            "deadline_at":log.deadline_at,"deadline_expired":expired,
+            "runtime":{"status":log.stop_reason.as_deref().unwrap_or(if expired {"unknown"} else {"stopped"}),
+                "cleanup_confirmed":log.cleanup_confirmed}}),
+        ))
+    }
+
     pub async fn status(&self, id: &str) -> Result<Value, HostError> {
         let agent = self.agent(id)?;
         let process = agent.process.lock().await;
@@ -773,7 +911,7 @@ impl AgentHost {
         };
         let handoff = agent.handoff.lock().unwrap().clone();
         let retired = agent.retired.load(Ordering::SeqCst);
-        let hosted = !retired && process.stop.is_some();
+        let hosted = !retired && process.stop.is_some() && !agent.is_restoring();
         let available = handoff
             .as_ref()
             .is_none_or(|state| state.admission == "open")
@@ -830,6 +968,9 @@ impl AgentHost {
     pub async fn abort(&self, id: &str) -> Result<(), HostError> {
         let agent = self.agent(id)?;
         agent.check_active()?;
+        if agent.is_restoring() {
+            return Err(HostError::Busy);
+        }
         let mut pipe = agent.stdin.lock().await;
         let pipe = pipe.as_mut().ok_or(HostError::Stopped)?;
         pipe.write_all(b"{\"type\":\"abort\"}\n").await?;
@@ -869,8 +1010,11 @@ impl AgentHost {
         agent.pid.store(0, Ordering::SeqCst);
         *agent.stdin.lock().await = None;
         *agent.readiness.lock().unwrap() = None;
-        *agent.state.lock().unwrap() =
-            json!({"status":"stopped","pending":agent.inputs.lock().unwrap().len()});
+        {
+            let log = agent.log.lock().unwrap();
+            *agent.state.lock().unwrap() = json!({"status":log.stop_reason.as_deref().unwrap_or("stopped"),
+                "cleanup_confirmed":log.cleanup_confirmed,"pending":agent.inputs.lock().unwrap().len()});
+        }
         if (running || mode == ShutdownMode::CancelInstance)
             && !mode.confirmed(agent.shutdown_confirmed.load(Ordering::SeqCst))
         {
@@ -964,7 +1108,16 @@ impl EventSubscription {
 }
 
 impl Agent {
+    fn is_restoring(&self) -> bool {
+        self.restoration
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|value| value["status"] == "running")
+    }
+
     fn mark_starting(&self, pid: u32) {
+        *self.restoration.lock().unwrap() = None;
         self.shutdown_confirmed.store(0, Ordering::SeqCst);
         *self.state.lock().unwrap() = json!({"status":"starting"});
         self.pid.store(pid, Ordering::SeqCst);
@@ -974,6 +1127,9 @@ impl Agent {
     /// Its state receipt therefore also fences configuration changes. A live
     /// process that has not reported its initial state is still starting.
     fn has_pending_work(&self) -> bool {
+        if self.is_restoring() {
+            return true;
+        }
         if !self.inputs.lock().unwrap().is_empty() {
             return true;
         }
@@ -1000,6 +1156,9 @@ impl Agent {
     /// The process belongs to this object, never to the attached client.
     async fn write(&self, wire: &Value) -> Result<(), HostError> {
         self.check_active()?;
+        if self.is_restoring() {
+            return Err(HostError::Busy);
+        }
         self.write_direct(wire).await
     }
 
@@ -1170,6 +1329,7 @@ fn publish(agent: &Agent, event: Value) -> Result<(), HostError> {
             | "host_deadline_expired"
             | "host_cancelled"
             | "host_resumed"
+            | "host_restoration_complete"
     ) || kind == "handoff_state"
         || (kind == "response" && handoff::is_command(&event))
     {
@@ -1269,9 +1429,16 @@ async fn supervise(
     mut stop: watch::Receiver<Option<ShutdownMode>>,
     generation: u64,
     finished: oneshot::Sender<()>,
+    restoration: Option<oneshot::Sender<Result<Value, HostError>>>,
 ) {
     let mut failures = 0u32;
-    let herdr = {
+    let restoring = restoration.is_some();
+    let mut restoration_result = Err(HostError::Rejected(
+        "runtime did not confirm descendant restoration".into(),
+    ));
+    let herdr = if restoring {
+        None
+    } else {
         let spec = agent.spec.lock().unwrap();
         herdr::HerdrBridge::from_environment(&spec.env, &spec.id)
             .map(|bridge| Arc::new(bridge).start())
@@ -1284,12 +1451,22 @@ async fn supervise(
         let output_host = host.clone();
         let reporter = herdr.clone();
         let output = tokio::spawn(async move {
+            let mut restored = None;
             let mut lines = tokio::io::BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 let event = serde_json::from_str(&line).unwrap_or_else(
                     |_| json!({"type":"host_error","error":"runtime emitted invalid JSON"}),
                 );
                 if host_control::route(&output_host, &output_agent, generation, &event) {
+                    continue;
+                }
+                if restoring {
+                    if event["type"] == "host_restoration_complete" && event["success"] == true {
+                        restored = Some(event);
+                    } else {
+                        restored = None;
+                        break;
+                    }
                     continue;
                 }
                 if let (Some(reporter), Some(state)) = (&reporter, herdr::state_for(&event)) {
@@ -1299,6 +1476,7 @@ async fn supervise(
                     break;
                 }
             }
+            restored
         });
         // Drain stderr so a diagnostic cannot deadlock the process. It is not
         // persisted: provider errors may include secrets or request bodies.
@@ -1308,6 +1486,10 @@ async fn supervise(
         });
         let status = tokio::select! {
             result = child.wait() => result,
+            _ = tokio::time::sleep(Duration::from_secs(100)), if restoring => {
+                let _ = child.kill().await;
+                child.wait().await
+            }
             _ = stop.changed() => {
                 // Explicit host stop gives the runtime its own scoped cleanup path.
                 // A process crash or a lost client never sends this command.
@@ -1327,8 +1509,17 @@ async fn supervise(
                 }
             }
         };
-        let _ = output.await;
+        let restored = output.await.ok().flatten();
         let _ = errors.await;
+        if restoring {
+            *agent.stdin.lock().await = None;
+            if status.as_ref().is_ok_and(|status| status.success()) && stop.borrow().is_none() {
+                if let Some(result) = restored {
+                    restoration_result = publish(&agent, result.clone()).map(|_| result);
+                }
+            }
+            break;
+        }
         if stop
             .borrow()
             .is_some_and(|mode| !mode.confirmed(agent.shutdown_confirmed.load(Ordering::SeqCst)))
@@ -1391,6 +1582,10 @@ async fn supervise(
     let mut process = agent.process.lock().await;
     if agent.generation.load(Ordering::SeqCst) == generation {
         process.stop = None;
+    }
+    if let Some(restored) = restoration {
+        *agent.restoration.lock().unwrap() = restoration_result.as_ref().ok().cloned();
+        let _ = restored.send(restoration_result);
     }
 }
 

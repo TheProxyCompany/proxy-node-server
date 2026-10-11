@@ -204,6 +204,12 @@ else:
         .map(|p| std::fs::read(self.root.join(p)).unwrap())
         .into()
     }
+    fn admitted_binding(&self, agent: &str, binding: &super::super::SpaceBinding) -> PathBuf {
+        let state = self.home.join(format!("state-{agent}"));
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(state.join("inbox.jsonl"), format!("{}\n", json!({"kind":"input","input":{"id":"admitted","_authority":{"space":binding,"workspace":binding.workspace_root}}}))).unwrap();
+        state
+    }
     fn boots(&self) -> Vec<Value> {
         lines(&self.root.join("boot-calls.jsonl"))
     }
@@ -243,6 +249,24 @@ async fn reboot_restores_the_same_guest_after_booting_only_its_existing_runtime(
     let id = fixture.guest(&manager, "agent-a", true);
     let protected = fixture.protected();
     let owner = std::fs::read(manager.receipt("agent-a")).unwrap();
+    assert!(
+        manager
+            .recorded_binding("agent-a", &fixture.home.join("absent-state"))
+            .unwrap()
+            .is_none()
+    );
+    let binding = super::super::SpaceBinding {
+        space_id: id.clone(),
+        isolation: super::super::SpaceIsolation::Container,
+        workspace_root: PathBuf::from("/home/agent/ProxyWorkspace"),
+        endpoint: "http://127.0.0.1:33331".into(),
+    };
+    let state = fixture.admitted_binding("agent-a", &binding);
+    assert_eq!(
+        manager.recorded_binding("agent-a", &state).unwrap(),
+        Some(binding)
+    );
+    assert!(fixture.commands().is_empty());
     let space = manager
         .ensure_agent_space("agent-a", SpaceResources::default())
         .await
@@ -521,10 +545,16 @@ async fn an_exit_zero_structured_failure_is_not_reported_as_success() {
 #[tokio::test]
 async fn successful_boot_without_a_reachable_engine_is_not_ready() {
     let fixture = Fixture::new();
-    std::fs::write(fixture.root.join("boot-no-socket"), "fail").unwrap();
+    executable(
+        &fixture.root.join("colima-0.10.3-lima-2.2.0/bin/colima"),
+        r#"#!/bin/sh
+printf '{"pid":%s}\n' "$$" >> "$COLIMA_HOME/../boot-calls.jsonl"
+"#,
+    );
+    // Check health after the boot command exits; boot timeout has its own test.
     let error = macos::ensure(
         &fixture.home,
-        Duration::from_secs(1),
+        Duration::from_secs(5),
         Duration::from_millis(20),
     )
     .await
@@ -687,6 +717,25 @@ async fn a_failed_initial_create_remains_reserved_and_retries_on_a_healthy_backe
     let established = manager.load_owner("agent-a").unwrap();
     assert_eq!(established.creation, Some(CreationState::Established));
     assert_eq!(established.resources, reservation.resources);
+    let state = fixture.admitted_binding("agent-a", &space.binding);
+    let commands = fixture.commands();
+    let receipt = std::fs::read(manager.receipt("agent-a")).unwrap();
+    assert_eq!(
+        manager.recorded_binding("agent-a", &state).unwrap(),
+        Some(space.binding.clone())
+    );
+    assert!(
+        manager
+            .recorded_binding("never-owned", &state)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        fixture.commands(),
+        commands,
+        "recorded bindings must not invoke Cua"
+    );
+    assert_eq!(std::fs::read(manager.receipt("agent-a")).unwrap(), receipt);
     assert_eq!(
         fixture
             .commands()

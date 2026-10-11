@@ -165,6 +165,24 @@ time.sleep(60)
         })
         .await
         .unwrap();
+        if !partial {
+            // Observe the closed pipe before asserting a request writes no bytes.
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match host.abort("closed-pipe").await {
+                        Err(HostError::Io(error))
+                            if error.kind() == std::io::ErrorKind::BrokenPipe =>
+                        {
+                            break;
+                        }
+                        Ok(()) => tokio::task::yield_now().await,
+                        other => panic!("closed-pipe control returned {other:?}"),
+                    }
+                }
+            })
+            .await
+            .expect("runtime stdin pipe closed");
+        }
         let error = host
             .submit("closed-pipe", input("attempt", &"x".repeat(1024 * 1024)))
             .await

@@ -237,7 +237,7 @@ fn descendant(host: &AgentHost, caller: &str, id: &str) -> Result<Arc<Agent>, Ho
 
 fn granted(spec: &AgentSpec, op: &str) -> bool {
     let name = match op {
-        "spawn" => "spawn_agent",
+        "spawn" | "restore" => "spawn_agent",
         "status" => "agent_status",
         "send" => "agent_send",
         "cancel" => "agent_cancel",
@@ -253,6 +253,72 @@ fn granted(spec: &AgentSpec, op: &str) -> bool {
                     .iter()
                     .any(|tool| tool == name || (op == "status" && tool == "spawn_agent"))
             })
+}
+
+fn admitted_instance(host: &AgentHost, caller: &str, child: &Spawn) -> Result<(), HostError> {
+    let mut registered = false;
+    let mut accepted = false;
+    let mut reader = BufReader::new(File::open(
+        host.root.join(&child.instance_id).join("events.jsonl"),
+    )?);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 || !line.ends_with('\n') {
+            break;
+        }
+        let record: HostEvent = serde_json::from_str(&line)?;
+        if record.agent_id != child.instance_id {
+            return Err(HostError::Forbidden);
+        }
+        if record.event["type"] == "host_retired" {
+            return Err(HostError::Forbidden);
+        }
+        if record.event["type"] == "host_instance_registered" {
+            if record.event["creator_id"].as_str() != Some(caller) {
+                return Err(HostError::Forbidden);
+            }
+            registered = true;
+        }
+        if record.event["type"] == "accepted"
+            && record.event["durable"] == true
+            && record.event["id"] == child.initial_input.id
+        {
+            accepted = true;
+        }
+    }
+    if !registered || !accepted {
+        return Err(HostError::Invalid(
+            "restoration requires prior durable input acceptance".into(),
+        ));
+    }
+    let initial = serde_json::to_value(&child.initial_input)?;
+    let mut reader = BufReader::new(File::open(child.state.join("inbox.jsonl"))?);
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 || !line.ends_with('\n') {
+            break;
+        }
+        let record: Value = serde_json::from_str(&line)?;
+        if record["kind"] == "input" && record["input"]["id"] == child.initial_input.id {
+            if initial
+                .as_object()
+                .unwrap()
+                .iter()
+                .any(|(key, value)| record["input"][key] != *value)
+            {
+                return Err(HostError::Forbidden);
+            }
+            let journal = File::open(child.state.join("log.jsonl"))?;
+            if host.agent(&child.instance_id).is_err() {
+                fs2::FileExt::try_lock_exclusive(&journal).map_err(|_| HostError::Busy)?;
+            }
+            return Ok(());
+        }
+    }
+    Err(HostError::Invalid(
+        "the admitted child inbox is unavailable".into(),
+    ))
 }
 
 async fn status(host: &AgentHost, id: &str) -> Result<Value, HostError> {
@@ -277,7 +343,7 @@ async fn status(host: &AgentHost, id: &str) -> Result<Value, HostError> {
     Ok(status)
 }
 
-async fn cancel(host: &AgentHost, id: &str, timed_out: bool) -> Result<(), HostError> {
+pub(super) async fn cancel(host: &AgentHost, id: &str, timed_out: bool) -> Result<(), HostError> {
     // Creator identity is a relationship, not ownership of another instance's lifetime.
     let agent = host.agent(id)?;
     if !timed_out {
@@ -367,15 +433,24 @@ async fn handle(
         return Err(HostError::Stopped);
     }
     let caller_spec = caller.spec.lock().unwrap().clone();
+    if caller.is_restoring() && !matches!(request["op"].as_str(), Some("restore" | "status")) {
+        return Err(HostError::Forbidden);
+    }
     if !granted(&caller_spec, request["op"].as_str().unwrap_or_default()) {
         return Err(HostError::Forbidden);
     }
-    if request["op"] == "spawn" {
+    if matches!(request["op"].as_str(), Some("spawn" | "restore")) {
         let child: Spawn = serde_json::from_value(request.clone())?;
         let at = deadline_at(child.timeout_seconds)?;
         let spec = child_spec(&caller_spec, &child)?;
+        let restoring = request["op"] == "restore";
+        if restoring {
+            admitted_instance(host, &caller_spec.id, &child)?;
+        }
         host.register_instance(spec, Some(caller_spec.id)).await?;
-        deadline(host, &child.instance_id, at).await?;
+        if !restoring {
+            deadline(host, &child.instance_id, at).await?;
+        }
         if host
             .agent(&child.instance_id)?
             .log
@@ -384,6 +459,23 @@ async fn handle(
             .stop_reason
             .is_some()
         {
+            if restoring {
+                host.restore_descendants(&child.instance_id).await?;
+            }
+            return status(host, &child.instance_id).await;
+        }
+        if restoring {
+            let expired = host
+                .agent(&child.instance_id)?
+                .log
+                .lock()
+                .unwrap()
+                .deadline_passed();
+            if expired {
+                host.restore_descendants(&child.instance_id).await?;
+                return status(host, &child.instance_id).await;
+            }
+            host.ensure_started(&child.instance_id).await?;
             return status(host, &child.instance_id).await;
         }
         let accepted = host.submit(&child.instance_id, child.initial_input).await?;
@@ -452,6 +544,289 @@ mod tests {
             ]),
             space: None,
         }
+    }
+
+    #[tokio::test]
+    async fn recorded_status_reads_admission_creator_and_terminal_state_without_repair_or_registration()
+     {
+        use std::io::Write;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("host");
+        let host = AgentHost::open(&path).unwrap();
+        host.register_instance(spec(directory.path(), "child"), Some("creator".into()))
+            .await
+            .unwrap();
+        let child = host.agent("child").unwrap();
+        publish(
+            &child,
+            json!({"type":"accepted","id":"original","durable":true}),
+        )
+        .unwrap();
+        publish(
+            &child,
+            json!({"type":"host_cancelled","cleanup_confirmed":true}),
+        )
+        .unwrap();
+        host.shutdown().await;
+        drop(child);
+        drop(host);
+        let journal = path.join("child/events.jsonl");
+        OpenOptions::new()
+            .append(true)
+            .open(&journal)
+            .unwrap()
+            .write_all(b"{\"incomplete\":")
+            .unwrap();
+        let before = std::fs::read(&journal).unwrap();
+        let reopened = AgentHost::open(&path).unwrap();
+        let recorded = reopened.recorded_status("child").unwrap().unwrap();
+        assert_eq!(recorded["creator_id"], "creator");
+        assert_eq!(recorded["admitted"], true);
+        assert_eq!(recorded["runtime"]["status"], "cancelled");
+        assert_eq!(recorded["runtime"]["cleanup_confirmed"], true);
+        assert_eq!(recorded["retired"], false);
+        assert_eq!(std::fs::read(&journal).unwrap(), before);
+        assert!(reopened.registered_agents().is_empty());
+        assert!(
+            reopened
+                .recorded_status("never-admitted")
+                .unwrap()
+                .is_none()
+        );
+        assert!(!path.join("never-admitted").exists());
+        assert!(
+            reopened
+                .register_instance(
+                    spec(directory.path(), "child"),
+                    Some("different-creator".into())
+                )
+                .await
+                .is_err()
+        );
+        assert!(reopened.registered_agents().is_empty());
+        reopened.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn restoration_only_keeps_terminal_state_and_refuses_inputs_without_its_ack() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("host");
+        let host = AgentHost::open(&path).unwrap();
+        let mut config = spec(directory.path(), "creator");
+        std::fs::create_dir_all(&config.state_dir).unwrap();
+        config.command = "/usr/bin/python3".into();
+        config.args = vec!["-c".into(), r#"
+import json, pathlib, sys, time
+assert '--restore-instances-only' in sys.argv
+state = pathlib.Path(sys.argv[sys.argv.index('--state') + 1])
+with (state / 'restoration-starts').open('a') as f: f.write('started\n')
+(state / 'ready').touch()
+while not (state / 'release').exists(): time.sleep(0.01)
+print(json.dumps({'type':'host_restoration_complete','success':True,'restored':[],'refused':[]}), flush=True)
+"#.into()];
+        host.register(config.clone()).await.unwrap();
+        let agent = host.agent("creator").unwrap();
+        publish(
+            &agent,
+            json!({"type":"host_cancelled","cleanup_confirmed":true}),
+        )
+        .unwrap();
+        let restoring_host = host.clone();
+        let restoring =
+            tokio::spawn(async move { restoring_host.restore_descendants("creator").await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !config.state_dir.join("ready").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let status = host.status("creator").await.unwrap();
+        assert_eq!(status["pid"], Value::Null);
+        assert_eq!(status["hosted"], false);
+        assert_eq!(status["runtime"]["status"], "cancelled");
+        assert_eq!(status["runtime"]["cleanup_confirmed"], true);
+        let input: AgentInput =
+            serde_json::from_value(json!({"id":"must-not-run","message":"must-not-run"})).unwrap();
+        assert!(matches!(
+            host.submit("creator", input).await,
+            Err(HostError::Busy)
+        ));
+        assert!(matches!(
+            handle(
+                &host,
+                &agent,
+                agent.generation.load(Ordering::SeqCst),
+                &json!({"op":"spawn"})
+            )
+            .await,
+            Err(HostError::Forbidden)
+        ));
+        std::fs::write(config.state_dir.join("release"), "").unwrap();
+        let result = restoring.await.unwrap().unwrap();
+        assert_eq!(result["type"], "host_restoration_complete");
+        assert_eq!(host.restore_descendants("creator").await.unwrap(), result);
+        assert_eq!(
+            std::fs::read_to_string(config.state_dir.join("restoration-starts"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        assert_eq!(
+            host.status("creator").await.unwrap()["runtime"]["status"],
+            "cancelled"
+        );
+        let log = std::fs::read_to_string(&agent.log_path).unwrap();
+        assert!(!log.contains("host_resumed"));
+        assert!(!log.contains("must-not-run"));
+        for (id, output) in [
+            ("missing", ""),
+            (
+                "ordinary",
+                "print('{\"type\":\"root_state\",\"status\":\"idle\"}',flush=True)",
+            ),
+        ] {
+            let mut no_ack = spec(directory.path(), id);
+            no_ack.command = "/usr/bin/python3".into();
+            no_ack.args = vec!["-c".into(), output.into()];
+            host.register(no_ack).await.unwrap();
+            publish(
+                &host.agent(id).unwrap(),
+                json!({"type":"host_cancelled","cleanup_confirmed":true}),
+            )
+            .unwrap();
+            assert!(matches!(
+                host.restore_descendants(id).await,
+                Err(HostError::Rejected(_))
+            ));
+            assert_eq!(
+                host.status(id).await.unwrap()["runtime"]["status"],
+                "cancelled"
+            );
+        }
+        let mut expired = spec(directory.path(), "expired");
+        expired.command = config.command.clone();
+        expired.args = config.args.clone();
+        std::fs::create_dir_all(&expired.state_dir).unwrap();
+        std::fs::write(expired.state_dir.join("release"), "").unwrap();
+        host.register(expired).await.unwrap();
+        let timed = host.agent("expired").unwrap();
+        publish(
+            &timed,
+            json!({"type":"accepted","id":"before-timeout","durable":true}),
+        )
+        .unwrap();
+        publish(&timed, json!({"type":"host_deadline","deadline_at":1})).unwrap();
+        resume_deadline(&host, &timed);
+        assert_eq!(
+            host.recorded_status("expired").unwrap().unwrap()["deadline_expired"],
+            true
+        );
+        assert_eq!(
+            host.restore_descendants("expired").await.unwrap()["type"],
+            "host_restoration_complete"
+        );
+        assert_eq!(
+            host.status("expired").await.unwrap()["runtime"]["status"],
+            "unknown"
+        );
+        let timed_log = std::fs::read_to_string(&timed.log_path).unwrap();
+        assert!(timed_log.contains("host_deadline_expired"));
+        assert!(!timed_log.contains("host_resumed"));
+        drop(timed);
+        host.retire("creator").await.unwrap();
+        host.shutdown().await;
+        drop(agent);
+        drop(host);
+        let reopened = AgentHost::open(&path).unwrap();
+        assert!(
+            reopened.register(config).await.is_err(),
+            "retirement survived host reopen"
+        );
+        reopened.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn restoration_requires_matching_durable_admission_and_exclusive_journal() {
+        use std::io::Write;
+        let root = tempfile::tempdir().unwrap();
+        let host = AgentHost::open(root.path().join("host")).unwrap();
+        let parent = spec(root.path(), "parent");
+        host.register(parent.clone()).await.unwrap();
+        let caller = host.agent("parent").unwrap();
+        let folder = parent.state_dir.join("children/child");
+        for name in ["identity", "state", "workspace"] {
+            std::fs::create_dir_all(folder.join(name)).unwrap();
+        }
+        std::fs::write(folder.join("state/fork.json"), "{}").unwrap();
+        std::fs::write(folder.join("state/log.jsonl"), "").unwrap();
+        let request = json!({"op":"restore","instance_id":"child",
+            "identity":folder.join("identity"),"state":folder.join("state"),
+            "workspace":folder.join("workspace"),"workspace_mode":"host",
+            "seat":parent.seat_config,"initial_input":{"id":"first","type":"prompt","message":"original"}});
+        assert!(handle(&host, &caller, 0, &request).await.is_err());
+        assert_eq!(host.registered_agents(), vec!["parent"]);
+        assert!(!host.root.join("child").exists());
+        let child: Spawn = serde_json::from_value(request).unwrap();
+        let directory = host.root.join("child");
+        std::fs::create_dir(&directory).unwrap();
+        let mut events = File::create(directory.join("events.jsonl")).unwrap();
+        let record = |sequence, event| {
+            serde_json::to_string(&HostEvent {
+                sequence,
+                agent_id: "child".into(),
+                event,
+            })
+            .unwrap()
+        };
+        writeln!(
+            events,
+            "{}",
+            record(
+                1,
+                json!({"type":"host_instance_registered","creator_id":"parent"})
+            )
+        )
+        .unwrap();
+        assert!(admitted_instance(&host, "parent", &child).is_err());
+        writeln!(
+            events,
+            "{}",
+            record(2, json!({"type":"accepted","id":"first","durable":true}))
+        )
+        .unwrap();
+        events.sync_all().unwrap();
+        assert!(admitted_instance(&host, "parent", &child).is_err());
+        let mut inbox = File::create(child.state.join("inbox.jsonl")).unwrap();
+        writeln!(
+            inbox,
+            "{}",
+            json!({"kind":"input","input":child.initial_input})
+        )
+        .unwrap();
+        inbox.sync_all().unwrap();
+        assert!(admitted_instance(&host, "parent", &child).is_ok());
+        assert!(matches!(
+            admitted_instance(&host, "other", &child),
+            Err(HostError::Forbidden)
+        ));
+        let mut altered = child;
+        altered.initial_input.message = "different".into();
+        assert!(matches!(
+            admitted_instance(&host, "parent", &altered),
+            Err(HostError::Forbidden)
+        ));
+        altered.initial_input.message = "original".into();
+        let journal = File::open(altered.state.join("log.jsonl")).unwrap();
+        fs2::FileExt::lock_exclusive(&journal).unwrap();
+        assert!(matches!(
+            admitted_instance(&host, "parent", &altered),
+            Err(HostError::Busy)
+        ));
+        drop(journal);
+        assert!(admitted_instance(&host, "parent", &altered).is_ok());
+        host.shutdown().await;
     }
 
     #[test]
