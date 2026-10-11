@@ -251,6 +251,7 @@ struct EventLog {
     deadline_configured: bool,
     deadline_expired: bool,
     stop_reason: Option<String>,
+    cleanup_confirmed: Option<bool>,
 }
 
 impl EventLog {
@@ -264,11 +265,28 @@ impl EventLog {
             self.deadline_at = event["deadline_at"].as_u64();
         } else if event["type"] == "host_deadline_expired" {
             self.deadline_expired = true;
-            self.stop_reason = Some("timed_out".into());
+            self.cleanup_confirmed = event["cleanup_confirmed"].as_bool();
+            self.stop_reason = Some(
+                if self.cleanup_confirmed == Some(true) {
+                    "timed_out"
+                } else {
+                    "unknown"
+                }
+                .into(),
+            );
         } else if event["type"] == "host_cancelled" {
-            self.stop_reason = Some("cancelled".into());
+            self.cleanup_confirmed = event["cleanup_confirmed"].as_bool();
+            self.stop_reason = Some(
+                if self.cleanup_confirmed == Some(true) {
+                    "cancelled"
+                } else {
+                    "unknown"
+                }
+                .into(),
+            );
         } else if event["type"] == "host_resumed" {
             self.stop_reason = None;
+            self.cleanup_confirmed = None;
         }
         let input = event
             .get("event_id")
@@ -362,6 +380,7 @@ fn open_log(path: &Path) -> Result<EventLog, HostError> {
         deadline_configured: false,
         deadline_expired: false,
         stop_reason: None,
+        cleanup_confirmed: None,
     };
     let mut valid_end = 0;
     loop {
@@ -504,7 +523,7 @@ impl AgentHost {
         private_directory(&directory)?;
         let log_path = directory.join("events.jsonl");
         let log = open_log(&log_path)?;
-        let state = json!({"status":log.stop_reason.as_deref().unwrap_or("stopped")});
+        let state = json!({"status":log.stop_reason.as_deref().unwrap_or("stopped"),"cleanup_confirmed":log.cleanup_confirmed});
         let (updates, _) = watch::channel(log.sequence);
         let id = spec.id.clone();
         let agent = Arc::new(Agent {
@@ -1145,10 +1164,16 @@ fn publish(agent: &Agent, event: Value) -> Result<(), HostError> {
             // recovered work as an ownership fence until the next state receipt.
             agent.state.lock().unwrap()["status"] = json!("recovering");
         }
-    } else if kind == "host_deadline_expired" {
-        agent.state.lock().unwrap()["status"] = json!("timed_out");
-    } else if kind == "host_cancelled" {
-        agent.state.lock().unwrap()["status"] = json!("cancelled");
+    } else if matches!(kind, "host_deadline_expired" | "host_cancelled") {
+        let mut state = agent.state.lock().unwrap();
+        state["cleanup_confirmed"] = event["cleanup_confirmed"].clone();
+        state["status"] = if event["cleanup_confirmed"] != true {
+            json!("unknown")
+        } else if kind == "host_deadline_expired" {
+            json!("timed_out")
+        } else {
+            json!("cancelled")
+        };
     }
     let handoff_reply = kind == "response"
         && handoff::is_command(&event)

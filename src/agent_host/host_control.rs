@@ -276,7 +276,9 @@ async fn cancel(host: &AgentHost, id: &str, timed_out: bool) -> Result<(), HostE
                 timer.abort();
             }
         }
-        if let Err(error) = host.stop(&child).await {
+        let stopped = host.stop(&child).await;
+        let cleanup_confirmed = stopped.is_ok();
+        if let Err(error) = stopped {
             result = Err(error);
         }
         let event = if timed_out {
@@ -284,7 +286,10 @@ async fn cancel(host: &AgentHost, id: &str, timed_out: bool) -> Result<(), HostE
         } else {
             "host_cancelled"
         };
-        publish(&agent, json!({"type":event}))?;
+        publish(
+            &agent,
+            json!({"type":event,"cleanup_confirmed":cleanup_confirmed}),
+        )?;
     }
     result
 }
