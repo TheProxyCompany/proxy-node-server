@@ -10,7 +10,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -301,8 +301,20 @@ impl EventLog {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ShutdownMode {
+    PreserveShell = 1,
+    CancelInstance = 2,
+}
+impl ShutdownMode {
+    fn confirmed(self, acknowledgement: u8) -> bool {
+        acknowledgement == self as u8
+            || (self == Self::PreserveShell && acknowledgement == Self::CancelInstance as u8)
+    }
+}
+
 struct ProcessState {
-    stop: Option<watch::Sender<bool>>,
+    stop: Option<watch::Sender<Option<ShutdownMode>>>,
     finished: Option<oneshot::Receiver<()>>,
 }
 
@@ -318,7 +330,7 @@ struct Agent {
     process: AsyncMutex<ProcessState>,
     generation: AtomicU64,
     retired: AtomicBool,
-    shutdown_confirmed: AtomicBool,
+    shutdown_confirmed: AtomicU8,
     pid: AtomicU32,
     stdin: AsyncMutex<Option<ChildStdin>>,
     submission: AsyncMutex<()>,
@@ -516,7 +528,7 @@ impl AgentHost {
             {
                 return Err(HostError::Busy);
             }
-            Self::stop_locked(&agent, &mut process).await?;
+            Self::stop_locked(&agent, &mut process, ShutdownMode::PreserveShell).await?;
             *agent.spec.lock().unwrap() = spec;
             return Ok(());
         }
@@ -525,6 +537,11 @@ impl AgentHost {
         let log_path = directory.join("events.jsonl");
         let log = open_log(&log_path)?;
         let state = json!({"status":log.stop_reason.as_deref().unwrap_or("stopped"),"cleanup_confirmed":log.cleanup_confirmed});
+        let shutdown_confirmed = if log.cleanup_confirmed == Some(true) {
+            ShutdownMode::CancelInstance as u8
+        } else {
+            0
+        };
         let (updates, _) = watch::channel(log.sequence);
         let id = spec.id.clone();
         let agent = Arc::new(Agent {
@@ -540,7 +557,7 @@ impl AgentHost {
             }),
             generation: AtomicU64::new(0),
             retired: AtomicBool::new(false),
-            shutdown_confirmed: AtomicBool::new(false),
+            shutdown_confirmed: AtomicU8::new(shutdown_confirmed),
             pid: AtomicU32::new(0),
             stdin: AsyncMutex::new(None),
             submission: AsyncMutex::new(()),
@@ -655,7 +672,7 @@ impl AgentHost {
         let child = spawn(&spec)?;
         let generation = agent.generation.fetch_add(1, Ordering::SeqCst) + 1;
         agent.mark_starting(child.id().unwrap_or(0));
-        let (stop, stopped) = watch::channel(false);
+        let (stop, stopped) = watch::channel(None);
         let (finished, completion) = oneshot::channel();
         process.stop = Some(stop);
         process.finished = Some(completion);
@@ -825,15 +842,26 @@ impl AgentHost {
     pub async fn stop(&self, id: &str) -> Result<(), HostError> {
         let agent = self.agent(id)?;
         let mut process = agent.process.lock().await;
-        Self::stop_locked(&agent, &mut process).await
+        Self::stop_locked(&agent, &mut process, ShutdownMode::PreserveShell).await
     }
 
-    async fn stop_locked(agent: &Arc<Agent>, process: &mut ProcessState) -> Result<(), HostError> {
+    /// Terminal cancellation requires an acknowledgement that includes idle shell cleanup.
+    pub async fn cancel_instance(&self, id: &str) -> Result<(), HostError> {
+        let agent = self.agent(id)?;
+        let mut process = agent.process.lock().await;
+        Self::stop_locked(&agent, &mut process, ShutdownMode::CancelInstance).await
+    }
+
+    async fn stop_locked(
+        agent: &Arc<Agent>,
+        process: &mut ProcessState,
+        mode: ShutdownMode,
+    ) -> Result<(), HostError> {
         let running = process.stop.is_some() && agent.pid.load(Ordering::SeqCst) != 0;
         agent.generation.fetch_add(1, Ordering::SeqCst);
         agent.controls.lock().unwrap().clear();
         if let Some(stop) = process.stop.take() {
-            let _ = stop.send(true);
+            let _ = stop.send(Some(mode));
         }
         if let Some(finished) = process.finished.take() {
             let _ = finished.await;
@@ -843,7 +871,9 @@ impl AgentHost {
         *agent.readiness.lock().unwrap() = None;
         *agent.state.lock().unwrap() =
             json!({"status":"stopped","pending":agent.inputs.lock().unwrap().len()});
-        if running && !agent.shutdown_confirmed.load(Ordering::SeqCst) {
+        if (running || mode == ShutdownMode::CancelInstance)
+            && !mode.confirmed(agent.shutdown_confirmed.load(Ordering::SeqCst))
+        {
             return Err(HostError::Rejected(
                 "runtime stopped without confirming shell cleanup; work outcome is unknown".into(),
             ));
@@ -864,7 +894,7 @@ impl AgentHost {
         if let Some(agent) = agent {
             let mut process = agent.process.lock().await;
             agent.retired.store(true, Ordering::SeqCst);
-            Self::stop_locked(&agent, &mut process).await?;
+            Self::stop_locked(&agent, &mut process, ShutdownMode::PreserveShell).await?;
             publish(&agent, json!({"type":"host_retired"}))?;
         }
         Ok(())
@@ -888,7 +918,7 @@ impl AgentHost {
             agent.generation.fetch_add(1, Ordering::SeqCst);
             agent.controls.lock().unwrap().clear();
             if let Some(stop) = process.stop.take() {
-                let _ = stop.send(true);
+                let _ = stop.send(Some(ShutdownMode::PreserveShell));
             }
             if let Some(finished) = process.finished.take() {
                 let _ = finished.await;
@@ -935,7 +965,7 @@ impl EventSubscription {
 
 impl Agent {
     fn mark_starting(&self, pid: u32) {
-        self.shutdown_confirmed.store(false, Ordering::SeqCst);
+        self.shutdown_confirmed.store(0, Ordering::SeqCst);
         *self.state.lock().unwrap() = json!({"status":"starting"});
         self.pid.store(pid, Ordering::SeqCst);
     }
@@ -1112,9 +1142,19 @@ fn publish(agent: &Agent, event: Value) -> Result<(), HostError> {
     log.file.write_all(b"\n")?;
     let kind = event.get("type").and_then(Value::as_str).unwrap_or("");
     if kind == "response" && event["command"] == "shutdown" {
-        agent
-            .shutdown_confirmed
-            .store(event["success"] == true, Ordering::SeqCst);
+        let mode = if event["cancel_instance"] == true {
+            ShutdownMode::CancelInstance
+        } else {
+            ShutdownMode::PreserveShell
+        };
+        agent.shutdown_confirmed.store(
+            if event["success"] == true {
+                mode as u8
+            } else {
+                0
+            },
+            Ordering::SeqCst,
+        );
     }
     if matches!(
         kind,
@@ -1226,7 +1266,7 @@ async fn supervise(
     host: AgentHost,
     agent: Arc<Agent>,
     mut child: Child,
-    mut stop: watch::Receiver<bool>,
+    mut stop: watch::Receiver<Option<ShutdownMode>>,
     generation: u64,
     finished: oneshot::Sender<()>,
 ) {
@@ -1274,7 +1314,9 @@ async fn supervise(
                 let _ = tokio::time::timeout(Duration::from_secs(1), async {
                     let mut stdin = agent.stdin.lock().await;
                     if let Some(stdin) = stdin.as_mut() {
-                        stdin.write_all(b"{\"type\":\"shutdown\"}\n").await?;
+                        let cancel = *stop.borrow() == Some(ShutdownMode::CancelInstance);
+                        let command = format!("{}\n", json!({"type":"shutdown","cancel_instance":cancel}));
+                        stdin.write_all(command.as_bytes()).await?;
                         stdin.flush().await?;
                     }
                     Ok::<_, std::io::Error>(())
@@ -1287,7 +1329,10 @@ async fn supervise(
         };
         let _ = output.await;
         let _ = errors.await;
-        if *stop.borrow() && !agent.shutdown_confirmed.load(Ordering::SeqCst) {
+        if stop
+            .borrow()
+            .is_some_and(|mode| !mode.confirmed(agent.shutdown_confirmed.load(Ordering::SeqCst)))
+        {
             let _ = publish(
                 &agent,
                 json!({"type":"host_error","error":"runtime stopped without confirming shell cleanup; work outcome is unknown"}),
@@ -1298,9 +1343,9 @@ async fn supervise(
         agent.controls.lock().unwrap().clear();
         let _ = publish(
             &agent,
-            json!({"type":"host_process_exit","code":status.ok().and_then(|s|s.code()),"stopping":*stop.borrow()}),
+            json!({"type":"host_process_exit","code":status.ok().and_then(|s|s.code()),"stopping":stop.borrow().is_some()}),
         );
-        if *stop.borrow() {
+        if stop.borrow().is_some() {
             break;
         }
         failures += 1;

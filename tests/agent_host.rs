@@ -39,7 +39,9 @@ for v in requests:
  if v['id'] not in done: finish(v)
 for line in sys.stdin:
  v=json.loads(line)
- if v['type']=='shutdown': emit({'type':'response','command':'shutdown','success':'REJECT_SHUTDOWN' not in os.environ}); break
+ if v['type']=='shutdown':
+  save('shutdown',v)
+  emit({'type':'response','command':'shutdown','cancel_instance':v.get('cancel_instance',False) and 'LEGACY_SHUTDOWN' not in os.environ,'success':'REJECT_SHUTDOWN' not in os.environ}); break
  if v['type']=='abort': emit({'type':'root_state','status':'idle'}); continue
  if v['message']=='reject': emit({'type':'response','success':False,'event_id':v['id'],'error':'refused'}); continue
  duplicate=any(x['id']==v['id'] for x in requests)
@@ -85,6 +87,50 @@ fn input(id: &str, message: &str) -> AgentInput {
         conversation_id: Some("conversation".into()),
         participant_id: None,
         task_id: None,
+    }
+}
+
+#[tokio::test]
+async fn terminal_cancel_requires_specific_cleanup_ack_and_preserves_other_instances() {
+    for legacy in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let host = AgentHost::open(temp.path().join("host")).unwrap();
+        let mut parent = spec(temp.path(), "parent");
+        if legacy {
+            parent.env.insert("LEGACY_SHUTDOWN".into(), "1".into());
+        }
+        host.register(parent.clone()).await.unwrap();
+        let child = spec(temp.path(), "child");
+        std::fs::create_dir_all(&child.state_dir).unwrap();
+        std::fs::write(child.state_dir.join("fork.json"), "{}").unwrap();
+        host.register_spawned("parent", child.clone())
+            .await
+            .unwrap();
+        host.ensure_started("parent").await.unwrap();
+        host.ensure_started("child").await.unwrap();
+        let pid = host.status("child").await.unwrap()["pid"].clone();
+        assert_eq!(host.cancel_instance("parent").await.is_ok(), !legacy);
+        let request: Value = serde_json::from_str(
+            std::fs::read_to_string(parent.state_dir.join("shutdown"))
+                .unwrap()
+                .trim(),
+        )
+        .unwrap();
+        assert_eq!(request["cancel_instance"], true);
+        assert_eq!(host.status("child").await.unwrap()["pid"], pid);
+        host.stop("child").await.unwrap();
+        let request: Value = serde_json::from_str(
+            std::fs::read_to_string(child.state_dir.join("shutdown"))
+                .unwrap()
+                .trim(),
+        )
+        .unwrap();
+        assert_eq!(request["cancel_instance"], false);
+        assert!(
+            host.cancel_instance("child").await.is_err(),
+            "ordinary stop cannot prove terminal shell cleanup"
+        );
+        host.shutdown().await;
     }
 }
 
@@ -822,19 +868,20 @@ async fn availability_requires_current_verified_components_and_clears_on_reconfi
     let host = AgentHost::open(temp.path().join("host")).unwrap();
     let mut configured = spec(temp.path(), "ready");
     host.register(configured.clone()).await.unwrap();
+    let mut initial = host.subscribe("ready", 0).unwrap();
     host.ensure_started("ready").await.unwrap();
     assert_eq!(host.status("ready").await.unwrap()["available"], false);
-    // A spawned process is not yet known to be idle: wait for its initial state.
-    tokio::time::timeout(Duration::from_secs(2), async {
+    // Readiness follows the initial state event; this verifies event ordering,
+    // using the same bounded transport wait as the readiness events below.
+    tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if host.status("ready").await.unwrap()["runtime"]["status"] == "idle" {
+            if initial.recv().await.unwrap().event["type"] == "root_state" {
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
     .await
-    .unwrap();
+    .expect("fixture did not emit its initial runtime state");
     configured.seat_config = json!({"readiness":"complete"});
     host.register(configured.clone()).await.unwrap();
     let cursor = host.status("ready").await.unwrap()["sequence"]

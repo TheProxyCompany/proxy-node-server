@@ -278,34 +278,24 @@ async fn status(host: &AgentHost, id: &str) -> Result<Value, HostError> {
 }
 
 async fn cancel(host: &AgentHost, id: &str, timed_out: bool) -> Result<(), HostError> {
-    let mut children = host.registered_agents();
-    children.retain(|child| descendant(host, id, child).is_ok());
-    // Every child is independently owned, so stopping a creator does not stop
-    // its descendants. Visit every registered descendant on explicit cancel.
-    let mut result = Ok(());
-    for child in children.into_iter().chain(std::iter::once(id.to_owned())) {
-        let agent = host.agent(&child)?;
-        if child != id || !timed_out {
-            if let Some(timer) = agent.deadline.lock().unwrap().take() {
-                timer.abort();
-            }
+    // Creator identity is a relationship, not ownership of another instance's lifetime.
+    let agent = host.agent(id)?;
+    if !timed_out {
+        if let Some(timer) = agent.deadline.lock().unwrap().take() {
+            timer.abort();
         }
-        let stopped = host.stop(&child).await;
-        let cleanup_confirmed = stopped.is_ok();
-        if let Err(error) = stopped {
-            result = Err(error);
-        }
-        let event = if timed_out {
-            "host_deadline_expired"
-        } else {
-            "host_cancelled"
-        };
-        publish(
-            &agent,
-            json!({"type":event,"cleanup_confirmed":cleanup_confirmed}),
-        )?;
     }
-    result
+    let stopped = host.cancel_instance(id).await;
+    let event = if timed_out {
+        "host_deadline_expired"
+    } else {
+        "host_cancelled"
+    };
+    publish(
+        &agent,
+        json!({"type":event,"cleanup_confirmed":stopped.is_ok()}),
+    )?;
+    stopped
 }
 
 pub(super) fn resume_deadline(host: &AgentHost, agent: &Arc<Agent>) {
@@ -709,7 +699,7 @@ mod tests {
             .unwrap();
         assert_eq!(child.log.lock().unwrap().deadline_at, at);
         tokio::time::timeout(Duration::from_secs(2), async {
-            while host.status("child").await.unwrap()["runtime"]["status"] != "timed_out" {
+            while !child.log.lock().unwrap().deadline_expired {
                 tokio::task::yield_now().await;
             }
         })
@@ -732,7 +722,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             host.status("child").await.unwrap()["runtime"]["status"],
-            "timed_out"
+            "unknown"
         );
         assert_eq!(
             host.agent("child").unwrap().log.lock().unwrap().deadline_at,
@@ -752,10 +742,14 @@ mod tests {
                 .deadline_at
                 .is_none()
         );
-        cancel(&host, "unbounded", false).await.unwrap();
+        assert!(cancel(&host, "unbounded", false).await.is_err());
         assert_eq!(
             host.status("unbounded").await.unwrap()["runtime"]["status"],
-            "cancelled"
+            "unknown"
+        );
+        assert_eq!(
+            host.status("unbounded").await.unwrap()["runtime"]["cleanup_confirmed"],
+            false
         );
         assert!(deadline_at(Some(f64::NAN)).is_err());
         assert!(deadline_at(Some(-1.0)).is_err());
