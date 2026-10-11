@@ -105,6 +105,10 @@ async fn input(
     // A remote caller cannot label its payload a human decision or local UI
     // event. Grant checks happen outside message text and correlation fields.
     input.source = Some("address-client".into());
+    let descriptor = s.host.descriptor(&id)?;
+    input.conversation_id = descriptor.conversation_id;
+    input.participant_id = descriptor.participant_id;
+    input.task_id = descriptor.task_id;
     let accepted = s.host.submit(&id, input).await?;
     Ok((StatusCode::ACCEPTED, Json(accepted)).into_response())
 }
