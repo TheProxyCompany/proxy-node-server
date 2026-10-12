@@ -803,8 +803,10 @@ fn structured_failure(value: &Value) -> Option<String> {
         return steps.iter().find_map(structured_failure);
     }
     // Cua 0.4.1 wraps `spaces create --json` results, including failed rows.
-    if let Some(spaces) = value.get("spaces").and_then(Value::as_array)
-        && let Some(error) = spaces.iter().find_map(structured_failure)
+    if let Some(error) = value
+        .get("spaces")
+        .and_then(Value::as_array)
+        .and_then(|spaces| spaces.iter().find_map(structured_failure))
     {
         return Some(error);
     }

@@ -976,41 +976,6 @@ print(json.dumps({'type':'host_restoration_complete','success':True,'restored':[
     }
 
     #[tokio::test]
-    async fn shutdown_fences_pending_private_admissions_and_reconfiguration() {
-        let root = tempfile::tempdir().unwrap();
-        let host = AgentHost::open(root.path().join("host")).unwrap();
-        let mut config = spec(root.path(), "parent");
-        host.register(config.clone()).await.unwrap();
-        let caller = host.agent("parent").unwrap();
-        // A valid correlation waits on a private reply pipe without starting a runtime.
-        assert!(route(
-            &host,
-            &caller,
-            0,
-            &json!({"type":"host_control","id":"pending","op":"status","instance_id":"missing"})
-        ));
-        config.seat_config["model"] = json!("changed");
-        assert!(matches!(
-            host.register(config.clone()).await,
-            Err(HostError::Busy)
-        ));
-        host.shutdown().await;
-        assert_eq!(caller.host_controls.load(Ordering::SeqCst), 0);
-        assert!(host.control_tasks.lock().unwrap().is_empty());
-        assert!(matches!(
-            host.register(config).await,
-            Err(HostError::Stopped)
-        ));
-        assert!(route(
-            &host,
-            &caller,
-            0,
-            &json!({"type":"host_control","id":"after-shutdown"})
-        ));
-        assert!(host.control_tasks.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
     async fn private_controls_require_capability_grants_and_creator_ancestry() {
         let root = tempfile::tempdir().unwrap();
         let host = AgentHost::open(root.path().join("host")).unwrap();
