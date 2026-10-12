@@ -187,6 +187,7 @@ else:
                     name,
                     resources: SpaceResources::default(),
                     creation: None,
+                    binding: None,
                 })
                 .unwrap(),
             )
@@ -248,7 +249,6 @@ async fn reboot_restores_the_same_guest_after_booting_only_its_existing_runtime(
     let manager = fixture.manager("one");
     let id = fixture.guest(&manager, "agent-a", true);
     let protected = fixture.protected();
-    let owner = std::fs::read(manager.receipt("agent-a")).unwrap();
     assert!(
         manager
             .recorded_binding("agent-a", &fixture.home.join("absent-state"))
@@ -258,8 +258,8 @@ async fn reboot_restores_the_same_guest_after_booting_only_its_existing_runtime(
     let binding = super::super::SpaceBinding {
         space_id: id.clone(),
         isolation: super::super::SpaceIsolation::Container,
-        workspace_root: PathBuf::from("/home/agent/ProxyWorkspace"),
-        endpoint: "http://127.0.0.1:33331".into(),
+        workspace_root: Some(PathBuf::from("/home/agent/ProxyWorkspace")),
+        endpoint: Some("http://127.0.0.1:33331".into()),
     };
     let state = fixture.admitted_binding("agent-a", &binding);
     assert_eq!(
@@ -273,11 +273,10 @@ async fn reboot_restores_the_same_guest_after_booting_only_its_existing_runtime(
         .unwrap();
     assert_eq!(space.binding.space_id, id);
     assert_eq!(
-        space.binding.workspace_root,
-        Path::new("/home/agent/ProxyWorkspace")
+        space.binding.workspace_root.as_deref(),
+        Some(Path::new("/home/agent/ProxyWorkspace"))
     );
     assert_eq!(protected, fixture.protected());
-    assert_eq!(owner, std::fs::read(manager.receipt("agent-a")).unwrap());
     let registry: Value =
         serde_json::from_slice(&std::fs::read(fixture.home.join("registry.json")).unwrap())
             .unwrap();

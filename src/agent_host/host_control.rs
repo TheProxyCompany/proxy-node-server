@@ -6,7 +6,7 @@ struct Spawn {
     instance_id: String,
     identity: PathBuf,
     state: PathBuf,
-    workspace: PathBuf,
+    workspace: Option<PathBuf>,
     workspace_mode: WorkspaceMode,
     seat: Value,
     #[serde(default)]
@@ -29,9 +29,6 @@ pub(super) fn route(host: &AgentHost, caller: &Arc<Agent>, generation: u64, even
         return false;
     }
     let mut tasks = host.control_tasks.lock().unwrap();
-    if host.closing.load(Ordering::SeqCst) {
-        return true;
-    }
     tasks.retain(|task| !task.is_finished());
     let host = host.clone();
     let caller = Arc::clone(caller);
@@ -68,6 +65,7 @@ fn error_code(error: &HostError) -> &'static str {
         HostError::NotFound(_) => "not_found",
         HostError::Busy => "busy",
         HostError::AcceptanceUnknown => "acceptance_unknown",
+        HostError::Rejected(_) => "rejected",
         HostError::Stopped => "stopped",
         HostError::Invalid(_) | HostError::Json(_) => "invalid",
         _ => "failure",
@@ -80,6 +78,9 @@ fn public_error(error: &HostError) -> &'static str {
         HostError::NotFound(_) => "hosted instance not found",
         HostError::Busy => "hosted instance is busy",
         HostError::AcceptanceUnknown => "runtime acceptance is unknown; retry the same input id",
+        HostError::Rejected(_) => {
+            "runtime rejected this input; inspect its retained result before retrying"
+        }
         HostError::Stopped => "agent host or runtime stopped",
         HostError::Invalid(_) | HostError::Json(_) => "invalid host control request",
         _ => "agent host could not complete the request",
@@ -124,17 +125,33 @@ fn child_spec(caller: &AgentSpec, child: &Spawn) -> Result<AgentSpec, HostError>
         ));
     }
     let workspace = match child.workspace_mode {
-        WorkspaceMode::Host => child.workspace.canonicalize()?,
+        WorkspaceMode::Host => child
+            .workspace
+            .as_ref()
+            .ok_or(HostError::Forbidden)?
+            .canonicalize()?,
         WorkspaceMode::Guest => {
-            if !child.workspace.is_absolute()
-                || child
-                    .workspace
-                    .components()
-                    .any(|part| matches!(part, std::path::Component::ParentDir))
-            {
-                return Err(HostError::Forbidden);
+            if let Some(workspace) = &child.workspace {
+                if !workspace.is_absolute()
+                    || workspace
+                        .components()
+                        .any(|part| matches!(part, std::path::Component::ParentDir))
+                {
+                    return Err(HostError::Forbidden);
+                }
+                workspace.clone()
+            } else {
+                if child
+                    .space
+                    .as_ref()
+                    .is_none_or(|space| space.workspace_root.is_some())
+                {
+                    return Err(HostError::Forbidden);
+                }
+                // The RPC process still needs a local working directory. It is
+                // never passed to the guest as a workspace or tool authority.
+                state.clone()
             }
-            child.workspace.clone()
         }
     };
     match child.workspace_mode {
@@ -142,11 +159,12 @@ fn child_spec(caller: &AgentSpec, child: &Spawn) -> Result<AgentSpec, HostError>
             return Err(HostError::Forbidden);
         }
         WorkspaceMode::Guest
-            if workspace != caller.workspace
+            if child.workspace.is_some()
+                && workspace != caller.workspace
                 && !child
                     .space
                     .as_ref()
-                    .is_some_and(|space| space.workspace_root == workspace) =>
+                    .is_some_and(|space| space.workspace_root.as_ref() == Some(&workspace)) =>
         {
             return Err(HostError::Forbidden);
         }
@@ -205,7 +223,16 @@ fn child_spec(caller: &AgentSpec, child: &Spawn) -> Result<AgentSpec, HostError>
     let mut env = caller.env.clone();
     env.extend(child.env.clone());
     env.insert("PROXY_HARNESS_HOST_CONTROL".into(), "1".into());
-    env.remove("PROXY_HARNESS_WORKER");
+    if caller.seat_config["task_id"].is_null()
+        && seat["habit_id"].as_str().is_some_and(|id| !id.is_empty())
+    {
+        env.insert("PROXY_HARNESS_WORKER".into(), "1".into());
+    } else {
+        env.remove("PROXY_HARNESS_WORKER");
+        seat.as_object_mut()
+            .expect("validated seat")
+            .remove("habit_id");
+    }
     env.remove("PROXY_AGENT_WORKER");
     Ok(AgentSpec {
         id: child.instance_id.clone(),
@@ -432,6 +459,11 @@ async fn handle(
     if caller.generation.load(Ordering::SeqCst) != generation {
         return Err(HostError::Stopped);
     }
+    if host.closing.load(Ordering::SeqCst)
+        && !matches!(request["op"].as_str(), Some("status" | "cancel"))
+    {
+        return Err(HostError::Stopped);
+    }
     let caller_spec = caller.spec.lock().unwrap().clone();
     if caller.is_restoring() && !matches!(request["op"].as_str(), Some("restore" | "status")) {
         return Err(HostError::Forbidden);
@@ -486,6 +518,17 @@ async fn handle(
     let id = request["instance_id"]
         .as_str()
         .ok_or_else(|| HostError::Invalid("instance_id is required".into()))?;
+    if request["op"] == "status" && matches!(host.agent(id), Err(HostError::NotFound(_))) {
+        let mut recorded = host
+            .recorded_status(id)?
+            .ok_or_else(|| HostError::NotFound(id.into()))?;
+        if recorded["creator_id"].as_str() != Some(&caller_spec.id) {
+            return Err(HostError::Forbidden);
+        }
+        recorded["pid"] = Value::Null;
+        recorded["hosted"] = json!(false);
+        return Ok(recorded);
+    }
     let related = descendant(host, &caller_spec.id, id).is_ok();
     let descriptor = host.descriptor(id)?;
     let same_conversation = caller_spec.seat_config["conversation_id"]
@@ -869,12 +912,12 @@ print(json.dumps({'type':'host_restoration_complete','success':True,'restored':[
             child_spec(&guest, &child),
             Err(HostError::Forbidden)
         ));
-        child.workspace = root.path().into();
+        child.workspace = Some(root.path().into());
         assert!(matches!(
             child_spec(&parent, &child),
             Err(HostError::Forbidden)
         ));
-        child.workspace = folder.join("workspace");
+        child.workspace = Some(folder.join("workspace"));
         child.identity = parent.state_dir.clone();
         assert!(matches!(
             child_spec(&parent, &child),
@@ -924,7 +967,7 @@ print(json.dumps({'type':'host_restoration_complete','success':True,'restored':[
                 workspace.display()
             )
         );
-        child.workspace = "/guest-only-owned-workspace/../another-space".into();
+        child.workspace = Some("/guest-only-owned-workspace/../another-space".into());
         child.space.as_mut().unwrap().workspace_root = child.workspace.clone();
         assert!(matches!(
             child_spec(&parent, &child),

@@ -72,6 +72,39 @@ pub struct ProvisionedSpace {
     pub mcp: CuaMcpLaunch,
 }
 
+pub struct StoppedSpace {
+    runtime: String,
+    namespace: String,
+    space_id: String,
+    provisioned: bool,
+}
+
+impl StoppedSpace {
+    pub(super) fn owns_child(&self, creator: &super::AgentSpec, child: &str) -> bool {
+        self.runtime == CuaSpaceManager::child_runtime(&creator.id, child)
+            && creator.space.as_ref().is_some_and(|parent| {
+                parent.space_id
+                    == format!(
+                        "local:{}",
+                        CuaSpaceManager::name(&self.namespace, &creator.id)
+                    )
+            })
+            && self.space_id
+                == format!(
+                    "local:{}",
+                    CuaSpaceManager::name(&self.namespace, &self.runtime)
+                )
+    }
+
+    pub fn space_id(&self) -> &str {
+        &self.space_id
+    }
+
+    pub fn was_provisioned(&self) -> bool {
+        self.provisioned
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum CreationState {
@@ -87,6 +120,8 @@ struct Ownership {
     resources: SpaceResources,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     creation: Option<CreationState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    binding: Option<SpaceBinding>,
 }
 impl Ownership {
     fn reserved(&self) -> bool {
@@ -105,6 +140,15 @@ pub struct CuaSpaceManager {
 }
 
 impl CuaSpaceManager {
+    pub fn child_runtime(parent: &str, child: &str) -> String {
+        let hash = Sha256::digest(format!("{parent}\0{child}").as_bytes());
+        format!(
+            "child-{}",
+            hash.iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        )
+    }
     /// Use a Proxy-owned data directory, never the user's global ~/.cua.
     /// No cloud account, relay registration, or host desktop is selected.
     pub fn open(binary: impl AsRef<Path>, root: impl AsRef<Path>) -> Result<Self, HostError> {
@@ -152,6 +196,60 @@ impl CuaSpaceManager {
             .join(LEGACY_OWNERS_DIRECTORY)
             .join(format!("{}.json", Self::name(&self.namespace, agent)))
     }
+
+    pub fn deferred_binding(
+        &self,
+        agent: &str,
+        resources: &SpaceResources,
+    ) -> Result<SpaceBinding, HostError> {
+        if !valid_id(agent) {
+            return Err(HostError::Invalid("valid agent id is required".into()));
+        }
+        Ok(SpaceBinding {
+            space_id: format!("local:{}", Self::name(&self.namespace, agent)),
+            isolation: match resources.kind {
+                LocalSpaceKind::LinuxContainer => SpaceIsolation::Container,
+                LocalSpaceKind::MacosVm => SpaceIsolation::Vm,
+            },
+            workspace_root: None,
+            endpoint: None,
+        })
+    }
+
+    /// Read preparation state without creating, starting, or executing in a guest.
+    pub fn space_status(&self, agent: &str, declared: &SpaceBinding) -> Result<Value, HostError> {
+        match self.load_owner(agent) {
+            Ok(owner) => {
+                let binding = owner.binding.as_ref().unwrap_or(declared);
+                binding.validate()?;
+                if binding.space_id != format!("local:{}", owner.name)
+                    || !matches!(
+                        (&owner.resources.kind, &binding.isolation),
+                        (LocalSpaceKind::LinuxContainer, SpaceIsolation::Container)
+                            | (LocalSpaceKind::MacosVm, SpaceIsolation::Vm)
+                    )
+                {
+                    return Err(HostError::Invalid(
+                        "recorded guest binding does not match its owner".into(),
+                    ));
+                }
+                let resource_state = if binding.workspace_root.is_some() {
+                    "prepared"
+                } else if owner.reserved() {
+                    "reserved"
+                } else {
+                    "unknown"
+                };
+                Ok(serde_json::json!({
+                    "space": binding,"provisioned":true,"resource_state":resource_state,
+                }))
+            }
+            Err(HostError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(
+                serde_json::json!({"space":declared,"provisioned":false,"resource_state":"absent"}),
+            ),
+            Err(error) => Err(error),
+        }
+    }
     fn load_owner(&self, agent: &str) -> Result<Ownership, HostError> {
         let owner: Ownership = serde_json::from_slice(&std::fs::read(self.receipt(agent))?)?;
         if !matches!(owner.version, 1 | 2)
@@ -176,16 +274,6 @@ impl CuaSpaceManager {
         if !valid_id(agent) {
             return Err(HostError::Invalid("valid agent id is required".into()));
         }
-        let owner = match self.load_owner(agent) {
-            Ok(owner) => owner,
-            Err(HostError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(None);
-            }
-            Err(error) => return Err(error),
-        };
-        if owner.reserved() {
-            return Ok(None);
-        }
         let file = match File::open(state.join("inbox.jsonl")) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -209,7 +297,18 @@ impl CuaSpaceManager {
         };
         let binding: SpaceBinding = serde_json::from_value(authority["space"].clone())?;
         binding.validate()?;
-        let endpoint = reqwest::Url::parse(&binding.endpoint)
+        if binding.space_id != format!("local:{}", Self::name(&self.namespace, agent)) {
+            return Err(HostError::Invalid(
+                "recorded guest binding does not match its owner".into(),
+            ));
+        }
+        let Some(endpoint) = &binding.endpoint else {
+            // Keep the original admission immutable after a deferred guest is
+            // prepared. Its current path is available through space_status.
+            return Ok(Some(binding));
+        };
+        let owner = self.load_owner(agent)?;
+        let endpoint = reqwest::Url::parse(endpoint)
             .map_err(|_| HostError::Invalid("invalid recorded guest endpoint".into()))?;
         if binding.space_id != format!("local:{}", owner.name)
             || !matches!(
@@ -229,8 +328,13 @@ impl CuaSpaceManager {
         Ok(Some(binding))
     }
 
-    fn establish(&self, agent: &str, owner: &Ownership) -> Result<(), HostError> {
-        if !owner.reserved() {
+    fn establish(
+        &self,
+        agent: &str,
+        owner: &Ownership,
+        binding: &SpaceBinding,
+    ) -> Result<(), HostError> {
+        if !owner.reserved() && owner.binding.as_ref() == Some(binding) {
             return Ok(());
         }
         if self.load_owner(agent)? != *owner {
@@ -238,7 +342,10 @@ impl CuaSpaceManager {
         }
         let receipt = self.receipt(agent);
         let mut updated = owner.clone();
-        updated.creation = Some(CreationState::Established);
+        if updated.version == 2 {
+            updated.creation = Some(CreationState::Established);
+        }
+        updated.binding = Some(binding.clone());
         use rand_core::RngCore;
         let mut nonce = [0u8; 16];
         rand_core::OsRng.fill_bytes(&mut nonce);
@@ -386,6 +493,7 @@ impl CuaSpaceManager {
                 name: name.clone(),
                 resources: resources.clone(),
                 creation: Some(CreationState::Reserved),
+                binding: None,
             };
             let mut options = OpenOptions::new();
             options.write(true).create_new(true);
@@ -507,13 +615,16 @@ impl CuaSpaceManager {
         let binding = SpaceBinding {
             space_id: id.clone(),
             isolation,
-            workspace_root,
-            endpoint,
+            workspace_root: Some(workspace_root),
+            endpoint: Some(endpoint),
         };
         binding.validate()?;
-        // Publish established only after the same local guest is ready and its
-        // workspace is bound. Legacy v1 records remain byte-for-byte unchanged.
-        self.establish(agent, owner.as_ref().expect("ownership was recorded"))?;
+        // Publish the actual binding only after this guest and workspace are ready.
+        self.establish(
+            agent,
+            owner.as_ref().expect("ownership was recorded"),
+            &binding,
+        )?;
         let mut args = self.base_args();
         args.extend([
             "mcp".into(),
@@ -535,10 +646,38 @@ impl CuaSpaceManager {
 
     /// Stop only a previously provisioned guest. Ownership is retained so a
     /// later request resumes its files. There is deliberately no implicit delete.
-    pub async fn stop_agent_space(&self, agent: &str) -> Result<(), HostError> {
+    pub async fn stop_agent_space(&self, agent: &str) -> Result<StoppedSpace, HostError> {
         let _guard = self.mutation.lock().await;
         let _shared = home::lock(&self.home).await?;
-        let owner = self.load_owner(agent)?;
+        let owner = match self.load_owner(agent) {
+            Ok(owner) => owner,
+            Err(HostError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(StoppedSpace {
+                    runtime: agent.into(),
+                    namespace: self.namespace.clone(),
+                    space_id: format!("local:{}", Self::name(&self.namespace, agent)),
+                    provisioned: false,
+                });
+            }
+            Err(error) => return Err(error),
+        };
+        if owner.reserved() && owner.binding.is_none() && !self.listed(&owner.name).await? {
+            let report = self.json(&["runtime".into(), "doctor".into()]).await?;
+            if !managed::backend_healthy(&self.home, &owner.resources.kind, &report).await? {
+                return Err(HostError::Invalid(
+                    "Cua could not confirm the reserved guest is absent; its lease was retained"
+                        .into(),
+                ));
+            }
+            if !self.listed(&owner.name).await? {
+                return Ok(StoppedSpace {
+                    runtime: agent.into(),
+                    namespace: self.namespace.clone(),
+                    space_id: format!("local:{}", owner.name),
+                    provisioned: false,
+                });
+            }
+        }
         self.run(
             &[
                 "spaces".into(),
@@ -548,7 +687,25 @@ impl CuaSpaceManager {
             Duration::from_secs(120),
         )
         .await?;
-        Ok(())
+        let info = self
+            .json(&["sb".into(), "info".into(), format!("local:{}", owner.name)])
+            .await?;
+        if info["id"] != format!("local:{}", owner.name)
+            || !matches!(
+                info["state"].as_str(),
+                Some("stopped" | "suspended" | "paused")
+            )
+        {
+            return Err(HostError::Invalid(
+                "Cua did not confirm the owned guest stopped; its lease was retained".into(),
+            ));
+        }
+        Ok(StoppedSpace {
+            runtime: agent.into(),
+            namespace: self.namespace.clone(),
+            space_id: format!("local:{}", owner.name),
+            provisioned: true,
+        })
     }
 }
 

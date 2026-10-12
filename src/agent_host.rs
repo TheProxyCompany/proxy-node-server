@@ -122,7 +122,7 @@ pub enum WorkspaceMode {
     Host,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SpaceIsolation {
     Vm,
@@ -130,16 +130,15 @@ pub enum SpaceIsolation {
     Shared,
 }
 
-/// Issued by the application's local Cua provisioner after checking the local
-/// registry. This metadata cannot itself create isolation: the configured
-/// native tools must execute in the provisioned guest, and CUA must target it.
+/// Issued by the application's local Cua provisioner. The guest identity is
+/// fixed before admission; its paths and endpoint appear after first use.
 /// Credentials belong only in `AgentSpec.env`, never in this value.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpaceBinding {
     pub space_id: String,
     pub isolation: SpaceIsolation,
-    pub workspace_root: PathBuf,
-    pub endpoint: String,
+    pub workspace_root: Option<PathBuf>,
+    pub endpoint: Option<String>,
 }
 
 impl SpaceBinding {
@@ -147,15 +146,25 @@ impl SpaceBinding {
         if self.space_id.is_empty()
             || self.space_id.len() > 256
             || self.space_id.chars().any(char::is_control)
-            || !self.workspace_root.is_absolute()
-            || self.endpoint.is_empty()
-            || self.endpoint.len() > 2048
+            || self.workspace_root.is_some() != self.endpoint.is_some()
+            || self
+                .workspace_root
+                .as_ref()
+                .is_some_and(|root| !root.is_absolute())
         {
             return Err(HostError::Invalid(
                 "invalid provisioned Cua Space binding".into(),
             ));
         }
-        let endpoint = reqwest::Url::parse(&self.endpoint)
+        let Some(endpoint) = &self.endpoint else {
+            return Ok(());
+        };
+        if endpoint.is_empty() || endpoint.len() > 2048 {
+            return Err(HostError::Invalid(
+                "invalid provisioned Cua endpoint".into(),
+            ));
+        }
+        let endpoint = reqwest::Url::parse(endpoint)
             .map_err(|_| HostError::Invalid("invalid Cua endpoint".into()))?;
         if !endpoint.username().is_empty()
             || endpoint.password().is_some()
@@ -253,6 +262,9 @@ struct EventLog {
     deadline_expired: bool,
     stop_reason: Option<String>,
     cleanup_confirmed: Option<bool>,
+    work_stopped: bool,
+    resource_stopped: bool,
+    work_outcome: Option<String>,
     retired: bool,
     admitted: bool,
     registered: bool,
@@ -260,6 +272,28 @@ struct EventLog {
 }
 
 impl EventLog {
+    fn append(
+        &mut self,
+        agent_id: &str,
+        event: &Value,
+        durable: bool,
+    ) -> Result<HostEvent, HostError> {
+        let record = HostEvent {
+            sequence: self.sequence + 1,
+            agent_id: agent_id.into(),
+            event: event.clone(),
+        };
+        let bytes = serde_json::to_vec(&record)?;
+        self.file.write_all(&bytes)?;
+        self.file.write_all(b"\n")?;
+        if durable {
+            self.file.sync_data()?;
+        }
+        self.index(&record, self.bytes);
+        self.bytes += bytes.len() as u64 + 1;
+        self.sequence = record.sequence;
+        Ok(record)
+    }
     fn deadline_passed(&self) -> bool {
         self.deadline_at.is_some_and(|at| {
             at <= std::time::SystemTime::now()
@@ -288,6 +322,7 @@ impl EventLog {
             self.deadline_at = event["deadline_at"].as_u64();
         } else if event["type"] == "host_deadline_expired" {
             self.deadline_expired = true;
+            self.work_stopped = true;
             self.cleanup_confirmed = event["cleanup_confirmed"].as_bool();
             self.stop_reason = Some(
                 if self.cleanup_confirmed == Some(true) {
@@ -298,6 +333,14 @@ impl EventLog {
                 .into(),
             );
         } else if event["type"] == "host_cancelled" {
+            self.work_stopped = true;
+            if event["resource_stopped"] == true {
+                self.resource_stopped = true;
+                self.work_outcome = Some("unknown".into());
+                if self.creator_id.is_none() {
+                    self.creator_id = event["creator_id"].as_str().map(str::to_owned);
+                }
+            }
             self.cleanup_confirmed = event["cleanup_confirmed"].as_bool();
             self.stop_reason = Some(
                 if self.cleanup_confirmed == Some(true) {
@@ -307,9 +350,19 @@ impl EventLog {
                 }
                 .into(),
             );
+        } else if event["type"] == "host_worker_completed" && event["cleanup_confirmed"] == true {
+            self.cleanup_confirmed = Some(true);
+            self.work_stopped = true;
+            self.stop_reason = Some("completed".into());
+        } else if event["type"] == "host_error" && event["work_stopped"] == true {
+            self.work_stopped = true;
+            self.stop_reason = Some("unknown".into());
         } else if event["type"] == "host_resumed" {
             self.stop_reason = None;
             self.cleanup_confirmed = None;
+            self.work_stopped = false;
+            self.resource_stopped = false;
+            self.work_outcome = None;
         }
         let input = event
             .get("event_id")
@@ -420,6 +473,9 @@ fn read_log(file: File, id: &str, repair_incomplete_tail: bool) -> Result<EventL
         deadline_expired: false,
         stop_reason: None,
         cleanup_confirmed: None,
+        work_stopped: false,
+        resource_stopped: false,
+        work_outcome: None,
         retired: false,
         admitted: false,
         registered: false,
@@ -587,7 +643,8 @@ impl AgentHost {
                 "an agent cannot change its recorded creator".into(),
             ));
         }
-        let state = json!({"status":log.stop_reason.as_deref().unwrap_or("stopped"),"cleanup_confirmed":log.cleanup_confirmed});
+        let state = json!({"status":log.stop_reason.as_deref().unwrap_or("stopped"),"cleanup_confirmed":log.cleanup_confirmed,
+            "work_stopped":log.work_stopped,"resource_stopped":log.resource_stopped,"work_outcome":log.work_outcome});
         let shutdown_confirmed = if log.cleanup_confirmed == Some(true) {
             ShutdownMode::CancelInstance as u8
         } else {
@@ -692,6 +749,9 @@ impl AgentHost {
         self.check_active_id(id)?;
         let agent = self.agent(id)?;
         agent.check_active()?;
+        if agent.log.lock().unwrap().stop_reason.as_deref() == Some("completed") {
+            return Err(HostError::Stopped);
+        }
         if agent.is_restoring() {
             return Err(HostError::Busy);
         }
@@ -716,6 +776,9 @@ impl AgentHost {
             return Err(HostError::Stopped);
         }
         agent.check_active()?;
+        if agent.log.lock().unwrap().stop_reason.as_deref() == Some("completed") {
+            return Err(HostError::Stopped);
+        }
         if agent.is_restoring() {
             return Err(HostError::Busy);
         }
@@ -727,7 +790,16 @@ impl AgentHost {
             publish(agent, json!({"type":"host_resumed"}))?;
         }
         *agent.readiness.lock().unwrap() = None;
-        let child = spawn(&spec)?;
+        let child = match spawn(&spec) {
+            Ok(child) => child,
+            Err(error) => {
+                publish(
+                    agent,
+                    json!({"type":"host_error","work_stopped":true,"error":"runtime start failed"}),
+                )?;
+                return Err(error);
+            }
+        };
         let generation = agent.generation.fetch_add(1, Ordering::SeqCst) + 1;
         agent.mark_starting(child.id().unwrap_or(0));
         let (stop, stopped) = watch::channel(None);
@@ -819,6 +891,9 @@ impl AgentHost {
         let agent = self.agent(id)?;
         self.ensure_started(id).await?;
         let submission = agent.submission.lock().await;
+        if agent.log.lock().unwrap().stop_reason.as_deref() == Some("completed") {
+            return Err(HostError::Stopped);
+        }
         let (sender, response) = oneshot::channel();
         agent
             .acknowledgements
@@ -886,11 +961,118 @@ impl AgentHost {
         let log = read_log(file, id, false)?;
         let expired = log.deadline_expired || log.deadline_passed();
         Ok(Some(
-            json!({"agent_id":id,"creator_id":log.creator_id,"admitted":log.admitted,"retired":log.retired,
+            json!({"agent_id":id,"creator_id":log.creator_id,"registered":log.registered,"admitted":log.admitted,"retired":log.retired,
             "deadline_at":log.deadline_at,"deadline_expired":expired,
             "runtime":{"status":log.stop_reason.as_deref().unwrap_or(if expired {"unknown"} else {"stopped"}),
-                "cleanup_confirmed":log.cleanup_confirmed}}),
+                "cleanup_confirmed":log.cleanup_confirmed,"work_stopped":log.work_stopped,
+                "resource_stopped":log.resource_stopped,"work_outcome":log.work_outcome}}),
         ))
+    }
+
+    /// A stopped habit resource can be cancelled without claiming that its
+    /// earlier effects succeeded. The provisioner supplies an actual stop receipt.
+    pub async fn confirm_stopped_habit(
+        &self,
+        creator: &str,
+        id: &str,
+        state: &Path,
+        stopped: &space::StoppedSpace,
+    ) -> Result<bool, HostError> {
+        if !self.closing.load(Ordering::SeqCst) {
+            return Err(HostError::Busy);
+        }
+        if !valid_id(id) {
+            return Err(HostError::Invalid("valid child id is required".into()));
+        }
+        let parent = self.agent(creator)?;
+        let parent_spec = parent.spec.lock().unwrap().clone();
+        let expected = parent_spec
+            .state_dir
+            .join("children")
+            .join(id)
+            .join("state");
+        if state.canonicalize()? != expected.canonicalize()?
+            || !stopped.owns_child(&parent_spec, id)
+        {
+            return Err(HostError::Forbidden);
+        }
+        let fork: Value = serde_json::from_slice(&std::fs::read(state.join("fork.json"))?)?;
+        if fork["parent_context"]["source"] != "habit" {
+            return Ok(false);
+        }
+        let agent = self.agents.lock().unwrap().get(id).cloned();
+        let _process = match &agent {
+            Some(agent) => {
+                if agent.creator.as_deref() != Some(creator) {
+                    return Err(HostError::Forbidden);
+                }
+                let process = agent.process.lock().await;
+                if agent.pid.load(Ordering::SeqCst) != 0 {
+                    return Err(HostError::Busy);
+                }
+                Some(process)
+            }
+            None if self.closing.load(Ordering::SeqCst) => None,
+            None => return Err(HostError::Busy),
+        };
+        let prior = self.recorded_status(id)?;
+        if prior.as_ref().is_some_and(|status| {
+            status["creator_id"]
+                .as_str()
+                .is_some_and(|owner| owner != creator)
+        }) {
+            return Err(HostError::Forbidden);
+        }
+        let journal = match File::open(state.join("log.jsonl")) {
+            Ok(file) => {
+                fs2::FileExt::try_lock_exclusive(&file).map_err(|_| HostError::Busy)?;
+                Some(file)
+            }
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    && self.closing.load(Ordering::SeqCst)
+                    && prior
+                        .as_ref()
+                        .is_none_or(|status| status["admitted"] != true) =>
+            {
+                None
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if prior
+            .as_ref()
+            .is_some_and(|status| status["runtime"]["cleanup_confirmed"] == true)
+        {
+            return Ok(true);
+        }
+        let event = json!({
+            "type":"host_cancelled","creator_id":creator,"cleanup_confirmed":true,
+            "resource_stopped":true,"space_id":stopped.space_id(),"work_outcome":"unknown",
+            "resource_was_provisioned":stopped.was_provisioned(),
+            "native_process_absence":if journal.is_some(){"state_journal_lock"}else{"host_shutdown_unadmitted"}
+        });
+        if let Some(agent) = agent.as_ref() {
+            publish(agent, event)?;
+        } else {
+            let directory = self.root.join(id);
+            private_directory(&directory)?;
+            let mut options = OpenOptions::new();
+            options.create(true).read(true).append(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let file = options.open(directory.join("events.jsonl"))?;
+            let mut log = read_log(file, id, false)?;
+            if log.file.metadata()?.len() != log.bytes {
+                return Err(HostError::Invalid(
+                    "incomplete host journal was retained; cancellation was not recorded".into(),
+                ));
+            }
+            log.append(id, &event, true)?;
+        }
+        Ok(true)
     }
 
     pub async fn status(&self, id: &str) -> Result<Value, HostError> {
@@ -905,7 +1087,7 @@ impl AgentHost {
                 WorkspaceMode::Guest => spec
                     .space
                     .as_ref()
-                    .map(|space| space.workspace_root.clone()),
+                    .and_then(|space| space.workspace_root.clone()),
             };
             json!({"mode":spec.workspace_mode,"root":root,"space_id":spec.space.as_ref().map(|space| &space.space_id),"os_sandbox":spec.workspace_mode == WorkspaceMode::Guest && spec.space.as_ref().is_some_and(|space| !matches!(&space.isolation, SpaceIsolation::Shared))})
         };
@@ -918,10 +1100,16 @@ impl AgentHost {
             && pid != 0
             && hosted
             && readiness.as_ref().is_some_and(RuntimeReadiness::verified);
+        let (runtime, sequence) = {
+            let log = agent.log.lock().unwrap();
+            let mut runtime = agent.state.lock().unwrap().clone();
+            runtime["work_stopped"] = json!(log.work_stopped);
+            (runtime, log.sequence)
+        };
         Ok(
             json!({"agent_id":id,"pid":if pid==0 {None} else {Some(pid)},"hosted":hosted,"retired":retired,"creator_id":agent.creator,"address":format!("/client/agents/{id}"),
             "available":available,"readiness":readiness,"handoff":handoff,"workspace":workspace,
-            "runtime":*agent.state.lock().unwrap(),"sequence":agent.log.lock().unwrap().sequence,
+            "runtime":runtime,"sequence":sequence,
             "descriptor":self.descriptor(id)?}),
         )
     }
@@ -1013,7 +1201,9 @@ impl AgentHost {
         {
             let log = agent.log.lock().unwrap();
             *agent.state.lock().unwrap() = json!({"status":log.stop_reason.as_deref().unwrap_or("stopped"),
-                "cleanup_confirmed":log.cleanup_confirmed,"pending":agent.inputs.lock().unwrap().len()});
+                "cleanup_confirmed":log.cleanup_confirmed,"work_stopped":log.work_stopped,
+                "resource_stopped":log.resource_stopped,"work_outcome":log.work_outcome,
+                "pending":agent.inputs.lock().unwrap().len()});
         }
         if (running || mode == ShutdownMode::CancelInstance)
             && !mode.confirmed(agent.shutdown_confirmed.load(Ordering::SeqCst))
@@ -1046,27 +1236,26 @@ impl AgentHost {
 
     pub async fn shutdown(&self) {
         self.closing.store(true, Ordering::SeqCst);
-        let controls: Vec<_> = self.control_tasks.lock().unwrap().drain(..).collect();
-        for task in &controls {
-            task.abort();
-        }
-        for task in controls {
-            let _ = task.await;
-        }
         let agents: Vec<_> = self.agents.lock().unwrap().values().cloned().collect();
-        for agent in agents {
+        futures_util::future::join_all(agents.into_iter().map(|agent| async move {
             if let Some(deadline) = agent.deadline.lock().unwrap().take() {
                 deadline.abort();
             }
             let mut process = agent.process.lock().await;
-            agent.generation.fetch_add(1, Ordering::SeqCst);
-            agent.controls.lock().unwrap().clear();
             if let Some(stop) = process.stop.take() {
                 let _ = stop.send(Some(ShutdownMode::PreserveShell));
             }
             if let Some(finished) = process.finished.take() {
                 let _ = finished.await;
             }
+        }))
+        .await;
+        let controls: Vec<_> = self.control_tasks.lock().unwrap().drain(..).collect();
+        for task in &controls {
+            task.abort();
+        }
+        for task in controls {
+            let _ = task.await;
         }
     }
 }
@@ -1252,8 +1441,6 @@ fn spawn(spec: &AgentSpec) -> Result<Child, HostError> {
         .arg(&spec.agent_dir)
         .arg("--state")
         .arg(&spec.state_dir)
-        .arg("--workspace")
-        .arg(&spec.workspace)
         .current_dir(directory)
         .envs(canonical_harness_environment(&spec.env))
         .env(
@@ -1274,6 +1461,14 @@ fn spawn(spec: &AgentSpec) -> Result<Child, HostError> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    if spec.workspace_mode == WorkspaceMode::Host
+        || spec
+            .space
+            .as_ref()
+            .is_some_and(|space| space.workspace_root.is_some())
+    {
+        command.arg("--workspace").arg(&spec.workspace);
+    }
     if let Some(space) = &spec.space {
         command.env("PROXY_HARNESS_SPACE", serde_json::to_string(space)?);
     } else {
@@ -1286,19 +1481,35 @@ fn spawn(spec: &AgentSpec) -> Result<Child, HostError> {
     Ok(command.spawn()?)
 }
 
+fn validate_worker_completion(agent: &Agent, event: &Value) -> Result<(), HostError> {
+    if event["cleanup_confirmed"] != true
+        || event["admission_closed"] != true
+        || agent
+            .spec
+            .lock()
+            .unwrap()
+            .env
+            .get("PROXY_HARNESS_WORKER")
+            .is_none_or(|value| value != "1")
+    {
+        return Err(HostError::Invalid(
+            "only a drained finite worker can confirm completion".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn publish(agent: &Agent, event: Value) -> Result<(), HostError> {
+    if event["type"] == "host_worker_completed" {
+        validate_worker_completion(agent, &event)?;
+        if !agent.inputs.lock().unwrap().is_empty() {
+            return Err(HostError::AcceptanceUnknown);
+        }
+    }
     if party_children::route(agent, &event)? {
         return Ok(());
     }
     let mut log = agent.log.lock().unwrap();
-    let record = HostEvent {
-        sequence: log.sequence + 1,
-        agent_id: agent.spec.lock().unwrap().id.clone(),
-        event: event.clone(),
-    };
-    let bytes = serde_json::to_vec(&record)?;
-    log.file.write_all(&bytes)?;
-    log.file.write_all(b"\n")?;
     let kind = event.get("type").and_then(Value::as_str).unwrap_or("");
     if kind == "response" && event["command"] == "shutdown" {
         let mode = if event["cancel_instance"] == true {
@@ -1315,7 +1526,7 @@ fn publish(agent: &Agent, event: Value) -> Result<(), HostError> {
             Ordering::SeqCst,
         );
     }
-    if matches!(
+    let durable = matches!(
         kind,
         "accepted"
             | "agent_settled"
@@ -1330,15 +1541,10 @@ fn publish(agent: &Agent, event: Value) -> Result<(), HostError> {
             | "host_cancelled"
             | "host_resumed"
             | "host_restoration_complete"
+            | "host_worker_completed"
     ) || kind == "handoff_state"
-        || (kind == "response" && handoff::is_command(&event))
-    {
-        log.file.sync_data()?;
-    }
-    let offset = log.bytes;
-    log.index(&record, offset);
-    log.bytes += bytes.len() as u64 + 1;
-    log.sequence = record.sequence;
+        || (kind == "response" && handoff::is_command(&event));
+    let record = log.append(&agent.spec.lock().unwrap().id, &event, durable)?;
     // The agent is idle before anyone hears that it settled: a subscriber
     // that reacts to agent_settled may change its configuration at once.
     if matches!(kind, "agent_settled" | "observation_recorded") {
@@ -1366,14 +1572,29 @@ fn publish(agent: &Agent, event: Value) -> Result<(), HostError> {
         *agent.readiness.lock().unwrap() = serde_json::from_value(event.clone()).ok();
     } else if matches!(kind, "host_process_exit" | "host_error") {
         *agent.readiness.lock().unwrap() = None;
-        if kind == "host_process_exit" && event["stopping"] != true {
+        if kind == "host_error" && event["work_stopped"] == true {
+            agent.state.lock().unwrap()["status"] = json!("unknown");
+        } else if kind == "host_process_exit"
+            && event["stopping"] != true
+            && agent.log.lock().unwrap().stop_reason.is_none()
+        {
             // No new runtime state is known during restart backoff. Retain
             // recovered work as an ownership fence until the next state receipt.
             agent.state.lock().unwrap()["status"] = json!("recovering");
         }
+    } else if kind == "host_worker_completed" {
+        if let Some(deadline) = agent.deadline.lock().unwrap().take() {
+            deadline.abort();
+        }
+        agent
+            .shutdown_confirmed
+            .store(ShutdownMode::CancelInstance as u8, Ordering::SeqCst);
+        *agent.state.lock().unwrap() = json!({"status":"completed","cleanup_confirmed":true});
     } else if matches!(kind, "host_deadline_expired" | "host_cancelled") {
         let mut state = agent.state.lock().unwrap();
         state["cleanup_confirmed"] = event["cleanup_confirmed"].clone();
+        state["resource_stopped"] = event["resource_stopped"].clone();
+        state["work_outcome"] = event["work_outcome"].clone();
         state["status"] = if event["cleanup_confirmed"] != true {
             json!("unknown")
         } else if kind == "host_deadline_expired" {
@@ -1418,6 +1639,73 @@ fn publish(agent: &Agent, event: Value) -> Result<(), HostError> {
                 }
             }
         }
+    }
+    Ok(())
+}
+
+fn reconcile_worker_inputs(agent: &Agent) -> Result<(), HostError> {
+    let pending = agent.inputs.lock().unwrap().clone();
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let state = agent.spec.lock().unwrap().state_dir.clone();
+    let mut reader = BufReader::new(File::open(state.join("inbox.jsonl"))?);
+    let mut line = String::new();
+    let mut admitted = HashSet::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
+        if !line.ends_with('\n') {
+            return Err(HostError::AcceptanceUnknown);
+        }
+        let record: Value = serde_json::from_str(&line)?;
+        if record["kind"] == "input"
+            && record["input"]["id"]
+                .as_str()
+                .is_some_and(|id| pending.contains(id))
+        {
+            admitted.insert(record["input"]["id"].as_str().unwrap().to_string());
+        }
+    }
+    let mut settled = HashSet::new();
+    if !admitted.is_empty() {
+        let mut reader = BufReader::new(File::open(state.join("log.jsonl"))?);
+        loop {
+            line.clear();
+            if reader.read_line(&mut line)? == 0 {
+                break;
+            }
+            if !line.ends_with('\n') {
+                return Err(HostError::AcceptanceUnknown);
+            }
+            let record: Value = serde_json::from_str(&line)?;
+            if record["kind"] == "input_done" {
+                if let Some(id) = record["id"].as_str().filter(|id| admitted.contains(*id)) {
+                    settled.insert(id.to_string());
+                }
+            }
+        }
+        if admitted != settled {
+            return Err(HostError::Invalid(
+                "finite worker still has an admitted input without a settlement receipt".into(),
+            ));
+        }
+    }
+    for id in pending {
+        let error = if settled.contains(&id) {
+            "input already settled before finite worker closed; inspect the retained input result"
+        } else {
+            "finite worker closed admission before accepting this input"
+        };
+        publish(
+            agent,
+            json!({
+                "type":"response","command":"prompt","id":id,"success":false,
+                "error":error
+            }),
+        )?;
     }
     Ok(())
 }
@@ -1472,7 +1760,19 @@ async fn supervise(
                 if let (Some(reporter), Some(state)) = (&reporter, herdr::state_for(&event)) {
                     reporter.send_replace(Some(state));
                 }
-                if publish(&output_agent, event).is_err() {
+                let result = if event["type"] == "host_worker_completed" {
+                    let _admission = output_agent.submission.lock().await;
+                    validate_worker_completion(&output_agent, &event)
+                        .and_then(|()| reconcile_worker_inputs(&output_agent))
+                        .and_then(|()| publish(&output_agent, event))
+                } else {
+                    publish(&output_agent, event)
+                };
+                if let Err(error) = result {
+                    let _ = publish(
+                        &output_agent,
+                        json!({"type":"host_error","error":error.to_string()}),
+                    );
                     break;
                 }
             }
@@ -1536,14 +1836,16 @@ async fn supervise(
             &agent,
             json!({"type":"host_process_exit","code":status.ok().and_then(|s|s.code()),"stopping":stop.borrow().is_some()}),
         );
-        if stop.borrow().is_some() {
+        if stop.borrow().is_some()
+            || agent.log.lock().unwrap().stop_reason.as_deref() == Some("completed")
+        {
             break;
         }
         failures += 1;
         if failures >= 5 {
             let _ = publish(
                 &agent,
-                json!({"type":"host_error","error":"runtime repeatedly exited; explicit retry required"}),
+                json!({"type":"host_error","work_stopped":true,"error":"runtime repeatedly exited; explicit retry required"}),
             );
             break;
         }
@@ -1564,7 +1866,7 @@ async fn supervise(
             Err(_) => {
                 let _ = publish(
                     &agent,
-                    json!({"type":"host_error","error":"runtime restart failed"}),
+                    json!({"type":"host_error","work_stopped":true,"error":"runtime restart failed"}),
                 );
                 break;
             }
