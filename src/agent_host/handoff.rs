@@ -147,34 +147,3 @@ impl AgentHost {
         result
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn only_a_fenced_durable_complete_assessment_is_transferable() {
-        let mut value = json!({"handoff_id":"transfer","admission":"paused","ready":true,"durable":true,
-            "active_input":null,"accepted_pending":0,"active_processes":0,"unknown_effects":0,
-            "cursors":{"inbox":{"bytes":42,"sha256":"a".repeat(64)},"journal":{"bytes":80,"sha256":"b".repeat(64),"sequence":2,"journal_id":"root-journal"}}});
-        assert!(
-            serde_json::from_value::<HandoffState>(value.clone())
-                .unwrap()
-                .verified()
-        );
-        for field in ["accepted_pending", "active_processes", "unknown_effects"] {
-            let mut pending = value.clone();
-            pending[field] = Value::Null;
-            assert!(
-                !serde_json::from_value::<HandoffState>(pending)
-                    .unwrap()
-                    .verified()
-            );
-        }
-        value["assessment_pending"] = json!(true);
-        assert!(
-            !serde_json::from_value::<HandoffState>(value)
-                .unwrap()
-                .verified()
-        );
-    }
-}

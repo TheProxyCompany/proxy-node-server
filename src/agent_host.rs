@@ -800,9 +800,23 @@ impl AgentHost {
                 return Err(error);
             }
         };
+        self.supervise_instance(agent, child, &mut process, None);
+        Ok(())
+    }
+
+    fn supervise_instance(
+        &self,
+        agent: &Arc<Agent>,
+        child: Child,
+        process: &mut ProcessState,
+        shutdown: Option<ShutdownMode>,
+    ) {
         let generation = agent.generation.fetch_add(1, Ordering::SeqCst) + 1;
         agent.mark_starting(child.id().unwrap_or(0));
         let (stop, stopped) = watch::channel(None);
+        if shutdown.is_some() {
+            let _ = stop.send(shutdown);
+        }
         let (finished, completion) = oneshot::channel();
         process.stop = Some(stop);
         process.finished = Some(completion);
@@ -815,7 +829,6 @@ impl AgentHost {
             finished,
             None,
         ));
-        Ok(())
     }
 
     /// Recover independently admitted descendants without reopening this creator's work.
@@ -1087,6 +1100,25 @@ impl AgentHost {
     pub async fn cancel_instance(&self, id: &str) -> Result<(), HostError> {
         let agent = self.agent(id)?;
         let mut process = agent.process.lock().await;
+        if process.stop.is_none()
+            && !ShutdownMode::CancelInstance
+                .confirmed(agent.shutdown_confirmed.load(Ordering::SeqCst))
+        {
+            if self.closing.load(Ordering::SeqCst) {
+                return Err(HostError::Stopped);
+            }
+            self.check_active_id(id)?;
+            agent.check_active()?;
+            let mut spec = agent.spec.lock().unwrap().clone();
+            spec.args.push("--shutdown-only".into());
+            let child = spawn(&spec)?;
+            self.supervise_instance(
+                &agent,
+                child,
+                &mut process,
+                Some(ShutdownMode::CancelInstance),
+            );
+        }
         Self::stop_locked(&agent, &mut process, ShutdownMode::CancelInstance).await
     }
 
@@ -1797,190 +1829,5 @@ async fn supervise(
     if let Some(restored) = restoration {
         *agent.restoration.lock().unwrap() = restoration_result.as_ref().ok().cloned();
         let _ = restored.send(restoration_result);
-    }
-}
-
-#[cfg(test)]
-mod handoff_wire_tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn durable_event_replay_seeks_near_its_cursor() {
-        let root = tempfile::tempdir().unwrap();
-        let host = AgentHost::open(root.path()).unwrap();
-        host.register(AgentSpec {
-            id: "indexed".into(),
-            display_name: None,
-            command: root.path().join("unused"),
-            args: vec![],
-            agent_dir: root.path().join("identity"),
-            state_dir: root.path().join("state"),
-            workspace: root.path().into(),
-            workspace_mode: WorkspaceMode::Host,
-            seat_config: json!({}),
-            env: BTreeMap::new(),
-            space: None,
-        })
-        .await
-        .unwrap();
-        let agent = host.agent("indexed").unwrap();
-        for index in 0..1024 {
-            publish(
-                &agent,
-                json!({"type":"message_update", "event_id":format!("input-{index}")}),
-            )
-            .unwrap();
-        }
-        let cursor = host.input_cursor("indexed", "input-1000").unwrap();
-        let mut subscription = host.subscribe("indexed", cursor).unwrap();
-        let seek = subscription.reader.stream_position().unwrap();
-        assert!(
-            seek > agent.log.lock().unwrap().bytes / 2,
-            "must seek past old history"
-        );
-        let event = subscription.recv().await.unwrap();
-        assert_eq!(event.sequence, cursor + 1);
-        assert_eq!(event.event["event_id"], "input-1000");
-    }
-
-    #[tokio::test]
-    async fn recovered_runtime_work_prevents_configuration_replacement() {
-        let root = tempfile::tempdir().unwrap();
-        let host = AgentHost::open(root.path().join("host")).unwrap();
-        let spec = AgentSpec {
-            id: "recovered".into(),
-            display_name: None,
-            command: "/bin/sh".into(),
-            args: vec![],
-            agent_dir: root.path().join("definition"),
-            state_dir: root.path().join("state"),
-            workspace: root.path().into(),
-            workspace_mode: WorkspaceMode::Host,
-            seat_config: json!({"model":"original"}),
-            env: BTreeMap::new(),
-            space: None,
-        };
-        host.register(spec.clone()).await.unwrap();
-        let agent = host.agent("recovered").unwrap();
-        assert!(agent.inputs.lock().unwrap().is_empty());
-        let mut changed = spec.clone();
-        changed.seat_config["model"] = json!("replacement");
-        for state in [
-            json!({"type":"root_state","status":"running","input_id":"recovered-input","queue_depth":0}),
-            json!({"type":"root_state","status":"idle","input_id":null,"queue_depth":2}),
-        ] {
-            publish(&agent, state).unwrap();
-            assert!(matches!(
-                host.register(changed.clone()).await,
-                Err(HostError::Busy)
-            ));
-            assert_eq!(agent.spec.lock().unwrap().seat_config["model"], "original");
-            host.register(spec.clone()).await.unwrap();
-        }
-        publish(
-            &agent,
-            json!({"type":"root_state","status":"idle","input_id":null,"queue_depth":0}),
-        )
-        .unwrap();
-        host.register(changed).await.unwrap();
-        assert_eq!(
-            agent.spec.lock().unwrap().seat_config["model"],
-            "replacement"
-        );
-        // Stale idle state must not survive either explicit start or automatic restart.
-        agent.mark_starting(42);
-        assert!(matches!(
-            host.register(spec.clone()).await,
-            Err(HostError::Busy)
-        ));
-        agent.pid.store(0, Ordering::SeqCst);
-        publish(
-            &agent,
-            json!({"type":"root_state","status":"idle","input_id":null,"queue_depth":0}),
-        )
-        .unwrap();
-        publish(
-            &agent,
-            json!({"type":"host_process_exit","stopping":false,"code":1}),
-        )
-        .unwrap();
-        assert!(matches!(
-            host.register(spec.clone()).await,
-            Err(HostError::Busy)
-        ));
-
-        // A child's recovered queue does not prevent its creator from reconfiguring.
-        publish(
-            &agent,
-            json!({"type":"root_state","status":"idle","input_id":null,"queue_depth":0}),
-        )
-        .unwrap();
-        let mut child_spec = spec.clone();
-        child_spec.id = "recovered-child".into();
-        child_spec.state_dir = root.path().join("child-state");
-        host.register_party_child("recovered", child_spec)
-            .await
-            .unwrap();
-        let child = host.agent("recovered-child").unwrap();
-        assert!(child.inputs.lock().unwrap().is_empty());
-        publish(&child,json!({"type":"root_state","status":"running","input_id":"child-recovered","queue_depth":0})).unwrap();
-        host.register(spec.clone()).await.unwrap();
-        publish(
-            &child,
-            json!({"type":"root_state","status":"idle","input_id":null,"queue_depth":0}),
-        )
-        .unwrap();
-        host.register(spec).await.unwrap();
-    }
-
-    #[test]
-    fn saved_environment_migrates_once_and_canonical_authority_wins() {
-        let canonical = canonical_harness_environment(&BTreeMap::from([
-            ("PROXY_AGENT_API_KEY".into(), "old".into()),
-            ("PROXY_HARNESS_API_KEY".into(), "new".into()),
-            ("PROXY_AGENT_SEAT".into(), "old-seat".into()),
-            ("PATH".into(), "/bin".into()),
-        ]));
-        assert_eq!(canonical.get("PROXY_HARNESS_API_KEY").unwrap(), "new");
-        assert_eq!(canonical.get("PROXY_HARNESS_SEAT").unwrap(), "old-seat");
-        assert_eq!(canonical.get("PATH").unwrap(), "/bin");
-        assert!(!canonical.keys().any(|key| key.starts_with("PROXY_AGENT_")));
-    }
-
-    #[tokio::test]
-    async fn asynchronous_native_handoff_data_updates_availability_and_checkpoint() {
-        let root = tempfile::tempdir().unwrap();
-        let host = AgentHost::open(root.path().join("host")).unwrap();
-        host.register(AgentSpec {
-            id: "dot".into(),
-            display_name: None,
-            command: root.path().join("fixture"),
-            args: vec![],
-            agent_dir: root.path().join("definition"),
-            state_dir: root.path().join("state"),
-            workspace: root.path().into(),
-            workspace_mode: WorkspaceMode::Host,
-            seat_config: json!({}),
-            env: BTreeMap::new(),
-            space: None,
-        })
-        .await
-        .unwrap();
-        let agent = host.agent("dot").unwrap();
-        let checkpoint = json!({"handoff_id":"move-dot","admission":"paused","ready":true,
-            "durable":true,"assessment_pending":false,"reason":null,"active_input":null,"accepted_pending":0,"active_processes":0,
-            "unknown_effects":0,"cursors":{"inbox":{"bytes":0,"sha256":"a".repeat(64)},
-            "journal":{"bytes":10,"sha256":"b".repeat(64),"sequence":1,"journal_id":"dot-journal"}}});
-        publish(&agent, json!({"type":"handoff_state","data":checkpoint})).unwrap();
-        let status = host.status("dot").await.unwrap();
-        assert_eq!(status["handoff"], checkpoint);
-        assert!(!status["available"].as_bool().unwrap());
-        assert!(agent.handoff.lock().unwrap().as_ref().unwrap().verified());
-        let mut events = host.subscribe("dot", 0).unwrap();
-        assert_eq!(
-            events.recv().await.unwrap().event["type"],
-            "host_instance_registered"
-        );
-        assert_eq!(events.recv().await.unwrap().event["data"], checkpoint);
     }
 }

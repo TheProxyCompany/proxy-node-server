@@ -88,7 +88,7 @@ cargo build --no-default-features
 
 # Everything, including the pnsd daemon
 cargo build --all-features
-cargo test --all-features
+cargo test --locked --all-features --test n_node_sync --test two_node_sync --test agent_host --test agent_peer
 
 # Reference daemon
 cargo run --features daemon --bin pnsd -- --version

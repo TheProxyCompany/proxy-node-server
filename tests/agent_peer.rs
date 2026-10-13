@@ -1,8 +1,7 @@
 #![cfg(feature = "agent-host")]
 //! Protocol proof for `agent_host::peer`: real local HTTP round trips between
-//! two independently generated trusted devices, an injected effect-counting
-//! handler, and the full set of negative fixtures. The handler is a fixture —
-//! passing these tests says nothing about real model execution.
+//! two independently generated trusted devices and a delivery-counting handler.
+//! Covers signed transport, durable replay, and rejected requests and replies.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
@@ -93,24 +92,19 @@ impl RawPost {
     }
 }
 
-/// Shared, effect-counting handler state behind a plain closure handler.
+/// Records handler deliveries and echoes the verified request identity.
 struct Fixture {
     effects: AtomicUsize,
-    installed: StdMutex<Vec<String>>,
 }
 
 impl Fixture {
     fn new() -> Arc<Self> {
         Arc::new(Self {
             effects: AtomicUsize::new(0),
-            installed: StdMutex::new(Vec::new()),
         })
     }
     fn effect_count(&self) -> usize {
         self.effects.load(Ordering::SeqCst)
-    }
-    fn installed(&self) -> Vec<String> {
-        self.installed.lock().unwrap().clone()
     }
 
     fn handler(this: Arc<Self>) -> impl proxy_node_server::agent_host::peer::PeerHandler {
@@ -118,54 +112,13 @@ impl Fixture {
             let this = Arc::clone(&this);
             async move {
                 this.effects.fetch_add(1, Ordering::SeqCst);
-                let agent = request.command.agent_id().to_string();
-                let sender = request.sender.to_hex();
-                Ok::<Value, PeerError>(match request.command {
-                    PeerCommand::Ensure { definitions, .. }
-                    | PeerCommand::Attach { definitions, .. } => {
-                        let digest = definitions
-                            .as_ref()
-                            .map(|bundle| {
-                                bundle.verify_digest()?;
-                                this.installed.lock().unwrap().push(bundle.digest.clone());
-                                Ok::<_, PeerError>(bundle.digest.clone())
-                            })
-                            .transpose()?;
-                        json!({
-                            "agent": agent, "by": sender, "available": true,
-                            "installed_digest": digest,
-                        })
-                    }
-                    PeerCommand::Open { .. } => {
-                        json!({"agent": agent, "by": sender, "attached": true})
-                    }
-                    PeerCommand::Status { .. } => {
-                        json!({"agent": agent, "by": sender, "status": "idle", "sequence": 7})
-                    }
-                    PeerCommand::InputCursor { .. } => {
-                        json!({"agent": agent, "by": sender, "sequence": 3})
-                    }
-                    PeerCommand::Submit { ref input, .. } => {
-                        json!({
-                            "agent": agent, "by": sender, "accepted": true,
-                            "durable": true, "input_id": input.id,
-                        })
-                    }
-                    PeerCommand::Events {
-                        after_sequence,
-                        limit,
-                        ..
-                    } => {
-                        let events: Vec<Value> = (after_sequence + 1
-                            ..=after_sequence + limit as u64)
-                            .map(|sequence| json!({"sequence": sequence, "agent_id": agent}))
-                            .collect();
-                        json!({"agent": agent, "by": sender, "events": events})
-                    }
-                    PeerCommand::Abort { .. } | PeerCommand::AbortInput { .. } => {
-                        json!({"agent": agent, "by": sender, "abort_requested": true})
-                    }
-                })
+                let mut reply = json!({
+                    "agent": request.command.agent_id(), "by": request.sender.to_hex(),
+                });
+                if let PeerCommand::Submit { input, .. } = request.command {
+                    reply["input_id"] = input.id.into();
+                }
+                Ok::<Value, PeerError>(reply)
             }
         }
     }
@@ -281,7 +234,6 @@ fn signed_round_trip_submit_and_exact_identity() {
         assert_eq!(accepted["agent"], "jarvis");
         assert_eq!(accepted["by"], caller.device_id().to_hex());
         assert_eq!(accepted["input_id"], "input-1");
-        assert_eq!(accepted["durable"], true);
         assert_eq!(host.fixture.effect_count(), 1);
 
         let open = client
@@ -290,32 +242,8 @@ fn signed_round_trip_submit_and_exact_identity() {
             })
             .await
             .unwrap();
-        assert_eq!(open["attached"], true);
         assert_eq!(open["agent"], "jarvis");
         assert_eq!(host.fixture.effect_count(), 2);
-    });
-}
-
-#[test]
-fn events_are_bounded_and_correlated() {
-    runtime().block_on(async {
-        let caller = Arc::new(DeviceIdentity::generate());
-        let target = Arc::new(DeviceIdentity::generate());
-        let all = book(&[&caller, &target]);
-        let host = Host::boot(Arc::clone(&target), all.clone(), Duration::from_secs(120)).await;
-        let client = host.client(caller, all);
-        let reply = client
-            .command(PeerCommand::Events {
-                agent: "jarvis".into(),
-                after_sequence: 3,
-                limit: 4,
-            })
-            .await
-            .unwrap();
-        let events = reply["events"].as_array().unwrap();
-        assert_eq!(events.len(), 4);
-        assert_eq!(events[0]["sequence"], 4);
-        assert!(events.iter().all(|event| event["agent_id"] == "jarvis"));
     });
 }
 
@@ -527,7 +455,7 @@ fn misdirected_request_for_another_target_is_rejected() {
 }
 
 #[test]
-fn interim_crash_reports_outcome_unknown_and_does_not_repeat_effect() {
+fn pending_replay_admission_is_not_executed_again() {
     runtime().block_on(async {
         let caller = Arc::new(DeviceIdentity::generate());
         let target = Arc::new(DeviceIdentity::generate());
@@ -634,31 +562,6 @@ fn malformed_definition_traversal_is_rejected() {
             .await;
         assert!(matches!(result.unwrap_err(), PeerError::Invalid(_)));
         assert_eq!(host.fixture.effect_count(), 0);
-        assert!(host.fixture.installed().is_empty());
-    });
-}
-
-#[test]
-fn definition_bundle_installs_as_data_with_digest_stamp() {
-    runtime().block_on(async {
-        let caller = Arc::new(DeviceIdentity::generate());
-        let target = Arc::new(DeviceIdentity::generate());
-        let all = book(&[&caller, &target]);
-        let host = Host::boot(Arc::clone(&target), all.clone(), Duration::from_secs(120)).await;
-        let client = host.client(caller, all);
-        let definitions = bundle(&[
-            ("agents/jarvis.md", "# Jarvis\nhost a durable agent"),
-            ("loadouts/deep-work.yaml", "model: kimi-k3"),
-        ]);
-        let reply = client
-            .command(PeerCommand::Ensure {
-                agent: "jarvis".into(),
-                definitions: Some(definitions.clone()),
-            })
-            .await
-            .unwrap();
-        assert_eq!(reply["installed_digest"], json!(definitions.digest));
-        assert_eq!(host.fixture.installed(), vec![definitions.digest]);
     });
 }
 

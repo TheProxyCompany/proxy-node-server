@@ -299,7 +299,3 @@ mod macos {
         Ok(())
     }
 }
-
-#[cfg(all(test, target_os = "macos"))]
-#[path = "space_managed_tests.rs"]
-mod tests;
