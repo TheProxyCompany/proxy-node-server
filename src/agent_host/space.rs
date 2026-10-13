@@ -72,39 +72,6 @@ pub struct ProvisionedSpace {
     pub mcp: CuaMcpLaunch,
 }
 
-pub struct StoppedSpace {
-    runtime: String,
-    namespace: String,
-    space_id: String,
-    provisioned: bool,
-}
-
-impl StoppedSpace {
-    pub(super) fn owns_child(&self, creator: &super::AgentSpec, child: &str) -> bool {
-        self.runtime == CuaSpaceManager::child_runtime(&creator.id, child)
-            && creator.space.as_ref().is_some_and(|parent| {
-                parent.space_id
-                    == format!(
-                        "local:{}",
-                        CuaSpaceManager::name(&self.namespace, &creator.id)
-                    )
-            })
-            && self.space_id
-                == format!(
-                    "local:{}",
-                    CuaSpaceManager::name(&self.namespace, &self.runtime)
-                )
-    }
-
-    pub fn space_id(&self) -> &str {
-        &self.space_id
-    }
-
-    pub fn was_provisioned(&self) -> bool {
-        self.provisioned
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum CreationState {
@@ -646,18 +613,13 @@ impl CuaSpaceManager {
 
     /// Stop only a previously provisioned guest. Ownership is retained so a
     /// later request resumes its files. There is deliberately no implicit delete.
-    pub async fn stop_agent_space(&self, agent: &str) -> Result<StoppedSpace, HostError> {
+    pub async fn stop_agent_space(&self, agent: &str) -> Result<bool, HostError> {
         let _guard = self.mutation.lock().await;
         let _shared = home::lock(&self.home).await?;
         let owner = match self.load_owner(agent) {
             Ok(owner) => owner,
             Err(HostError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(StoppedSpace {
-                    runtime: agent.into(),
-                    namespace: self.namespace.clone(),
-                    space_id: format!("local:{}", Self::name(&self.namespace, agent)),
-                    provisioned: false,
-                });
+                return Ok(false);
             }
             Err(error) => return Err(error),
         };
@@ -670,12 +632,7 @@ impl CuaSpaceManager {
                 ));
             }
             if !self.listed(&owner.name).await? {
-                return Ok(StoppedSpace {
-                    runtime: agent.into(),
-                    namespace: self.namespace.clone(),
-                    space_id: format!("local:{}", owner.name),
-                    provisioned: false,
-                });
+                return Ok(false);
             }
         }
         self.run(
@@ -700,12 +657,7 @@ impl CuaSpaceManager {
                 "Cua did not confirm the owned guest stopped; its lease was retained".into(),
             ));
         }
-        Ok(StoppedSpace {
-            runtime: agent.into(),
-            namespace: self.namespace.clone(),
-            space_id: format!("local:{}", owner.name),
-            provisioned: true,
-        })
+        Ok(true)
     }
 }
 
