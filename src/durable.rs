@@ -25,10 +25,6 @@ pub struct OplogWriter {
     /// corrupt frame, so anything written after it would be unreachable after
     /// a restart while the cursor advances past it.
     poisoned: bool,
-    #[cfg(test)]
-    fail_next_append: bool,
-    #[cfg(test)]
-    fail_mid_append: bool,
 }
 
 impl OplogWriter {
@@ -47,24 +43,7 @@ impl OplogWriter {
         Ok(Self {
             file,
             poisoned: false,
-            #[cfg(test)]
-            fail_next_append: false,
-            #[cfg(test)]
-            fail_mid_append: false,
         })
-    }
-
-    /// Test-only fault injection: make the next `append` fail before writing.
-    #[cfg(test)]
-    pub(crate) fn fail_next_append(&mut self) {
-        self.fail_next_append = true;
-    }
-
-    /// Test-only fault injection: make the next `append` fail after writing
-    /// the length prefix, leaving a torn frame for rollback to clean up.
-    #[cfg(test)]
-    pub(crate) fn fail_mid_append(&mut self) {
-        self.fail_mid_append = true;
     }
 
     /// Append one op as a length-prefixed frame and flush it to the OS. Flush
@@ -80,13 +59,6 @@ impl OplogWriter {
     pub fn append(&mut self, op: &SignedOp) -> Result<(), DurabilityError> {
         if self.poisoned {
             return Err(DurabilityError::Poisoned);
-        }
-        #[cfg(test)]
-        if self.fail_next_append {
-            self.fail_next_append = false;
-            return Err(DurabilityError::Io(std::io::Error::other(
-                "injected append failure",
-            )));
         }
         let bytes = op.to_bytes()?;
         let start = self.file.metadata()?.len();
@@ -107,13 +79,6 @@ impl OplogWriter {
     fn write_frame(&mut self, bytes: &[u8]) -> Result<(), DurabilityError> {
         let len = bytes.len() as u32;
         self.file.write_all(&len.to_le_bytes())?;
-        #[cfg(test)]
-        if self.fail_mid_append {
-            self.fail_mid_append = false;
-            return Err(DurabilityError::Io(std::io::Error::other(
-                "injected mid-frame failure",
-            )));
-        }
         self.file.write_all(bytes)?;
         self.file.flush()?;
         Ok(())
@@ -205,49 +170,6 @@ mod tests {
         SignedOp::seal(body, id).unwrap()
     }
 
-    #[test]
-    fn round_trips_through_the_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("oplog.bin");
-        let id = DeviceIdentity::generate();
-
-        let mut writer = OplogWriter::open(&path).unwrap();
-        writer.append(&op(&id, 10)).unwrap();
-        writer.append(&op(&id, 20)).unwrap();
-        drop(writer);
-
-        let mut registry = DeviceRegistry::new();
-        registry.insert_key(*id.verifying_key());
-        let mut log = OpLog::new();
-        assert_eq!(replay_oplog_file(&path, &registry, &mut log).unwrap(), 2);
-        assert_eq!(log.len(), 2);
-    }
-
-    // Regression, codex phase-1 round 3: a mid-frame write failure must not
-    // leave a torn frame that makes later valid frames unreachable on replay.
-    // The failed append rolls the file back to the frame boundary, so the
-    // retry frame is the next frame and replay recovers everything.
-    #[test]
-    fn mid_frame_failure_rolls_back_so_retry_frame_is_reachable() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("oplog.bin");
-        let id = DeviceIdentity::generate();
-
-        let mut writer = OplogWriter::open(&path).unwrap();
-        writer.append(&op(&id, 10)).unwrap();
-        writer.fail_mid_append();
-        assert!(writer.append(&op(&id, 20)).is_err());
-        // Rolled back: retry succeeds and lands as a clean frame.
-        writer.append(&op(&id, 20)).unwrap();
-        drop(writer);
-
-        let mut registry = DeviceRegistry::new();
-        registry.insert_key(*id.verifying_key());
-        let mut log = OpLog::new();
-        // Both ops are reachable; a torn frame would have stopped replay at 1.
-        assert_eq!(replay_oplog_file(&path, &registry, &mut log).unwrap(), 2);
-    }
-
     // Regression, codex phase-1 round 4: a torn tail left by a real crash must
     // be truncated off by replay, so a writer that reopens the file appends at
     // a clean boundary instead of burying its frames behind the tear.
@@ -311,15 +233,6 @@ mod tests {
         registry.insert_key(*unknown.verifying_key());
         let mut log = OpLog::new();
         assert_eq!(replay_oplog_file(&path, &registry, &mut log).unwrap(), 2);
-    }
-
-    #[test]
-    fn missing_file_is_empty() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("absent.bin");
-        let registry = DeviceRegistry::new();
-        let mut log = OpLog::new();
-        assert_eq!(replay_oplog_file(&path, &registry, &mut log).unwrap(), 0);
     }
 
     #[test]

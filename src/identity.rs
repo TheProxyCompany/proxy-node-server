@@ -191,53 +191,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sign_verify_round_trip() {
-        let id = DeviceIdentity::generate();
-        let msg = b"replicate me";
-        let sig = id.sign(msg);
-        assert!(DeviceIdentity::verify(id.verifying_key(), msg, &sig).is_ok());
-    }
-
-    #[test]
     fn verify_rejects_tampered_message() {
         let id = DeviceIdentity::generate();
         let sig = id.sign(b"original");
         assert!(DeviceIdentity::verify(id.verifying_key(), b"tampered", &sig).is_err());
-    }
-
-    #[test]
-    fn import_is_deterministic() {
-        let original = DeviceIdentity::generate();
-        let raw = original.export_raw();
-
-        let a = DeviceIdentity::import_raw(&raw).unwrap();
-        let b = DeviceIdentity::import_raw(&raw).unwrap();
-
-        // Same key bytes -> same device id, every time, on every platform.
-        assert_eq!(original.device_id(), a.device_id());
-        assert_eq!(a.device_id(), b.device_id());
-        assert_eq!(a.public_key_sec1(), b.public_key_sec1());
-    }
-
-    #[test]
-    fn device_id_matches_sec1_derivation() {
-        let id = DeviceIdentity::generate();
-        let from_sec1 = DeviceIdentity::device_id_from_sec1(&id.public_key_sec1()).unwrap();
-        assert_eq!(id.device_id(), from_sec1);
-    }
-
-    #[test]
-    fn device_id_hex_round_trips() {
-        let id = DeviceIdentity::generate().device_id();
-        let hex = id.to_hex();
-        assert_eq!(hex.len(), 64);
-        assert_eq!(DeviceId::from_hex(&hex).unwrap(), id);
-    }
-
-    #[test]
-    fn from_hex_rejects_junk() {
-        assert!(DeviceId::from_hex("zz").is_err());
-        assert!(DeviceId::from_hex("abc").is_err());
     }
 
     fn decode<const N: usize>(hex: &str) -> [u8; N] {

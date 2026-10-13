@@ -52,7 +52,7 @@ jobs:
         run: cargo build --locked --all-features
       - name: Build (library, no default features)
         run: cargo build --locked --no-default-features
-      - name: Test HTTP, native process, and signed peer boundaries
-        run: cargo test --locked --all-features --test n_node_sync --test two_node_sync --test agent_host --test agent_peer
+      - name: Test HTTP, native process, crypto, and signed peer boundaries
+        run: cargo test --locked --all-features --lib --test n_node_sync --test two_node_sync --test agent_host --test agent_peer
       - name: Clippy
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
