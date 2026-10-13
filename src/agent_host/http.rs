@@ -5,6 +5,7 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{
@@ -139,13 +140,29 @@ async fn attach(
     .into_response())
 }
 
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AbortInput {
+    input_id: Option<String>,
+}
+
 async fn abort(
     State(s): State<HttpState>,
     Path(id): Path<String>,
     headers: HeaderMap,
+    body: Bytes,
 ) -> Result<Response, HostError> {
     s.authority.authorize(&headers, &id, HostOperation::Write)?;
-    s.host.abort(&id).await?;
+    let input: AbortInput = if body.is_empty() {
+        AbortInput::default()
+    } else {
+        serde_json::from_slice(&body)
+            .map_err(|_| HostError::Invalid("invalid abort input".into()))?
+    };
+    match input.input_id {
+        Some(input_id) => s.host.abort_input(&id, &input_id).await?,
+        None => s.host.abort(&id).await?,
+    }
     Ok((StatusCode::ACCEPTED, Json(json!({"abort_requested":true}))).into_response())
 }
 

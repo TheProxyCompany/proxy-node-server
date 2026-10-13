@@ -162,7 +162,7 @@ impl Fixture {
                             .collect();
                         json!({"agent": agent, "by": sender, "events": events})
                     }
-                    PeerCommand::Abort { .. } => {
+                    PeerCommand::Abort { .. } | PeerCommand::AbortInput { .. } => {
                         json!({"agent": agent, "by": sender, "abort_requested": true})
                     }
                 })

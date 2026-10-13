@@ -1154,6 +1154,17 @@ impl AgentHost {
     }
 
     pub async fn abort(&self, id: &str) -> Result<(), HostError> {
+        self.abort_with_input(id, None).await
+    }
+
+    pub async fn abort_input(&self, id: &str, input_id: &str) -> Result<(), HostError> {
+        if input_id.is_empty() || input_id.len() > 256 {
+            return Err(HostError::Invalid("bounded input id is required".into()));
+        }
+        self.abort_with_input(id, Some(input_id)).await
+    }
+
+    async fn abort_with_input(&self, id: &str, input_id: Option<&str>) -> Result<(), HostError> {
         let agent = self.agent(id)?;
         agent.check_active()?;
         if agent.is_restoring() {
@@ -1161,7 +1172,11 @@ impl AgentHost {
         }
         let mut pipe = agent.stdin.lock().await;
         let pipe = pipe.as_mut().ok_or(HostError::Stopped)?;
-        pipe.write_all(b"{\"type\":\"abort\"}\n").await?;
+        let mut command = json!({"type":"abort"});
+        if let Some(input_id) = input_id {
+            command["input_id"] = input_id.into();
+        }
+        pipe.write_all(format!("{command}\n").as_bytes()).await?;
         pipe.flush().await?;
         Ok(())
     }

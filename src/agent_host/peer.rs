@@ -334,6 +334,8 @@ pub enum PeerCommand {
     },
     /// Start of a stable input in the existing durable host event log.
     InputCursor { agent: String, input_id: String },
+    /// Cooperative abort of one durable input, including queued work.
+    AbortInput { agent: String, input_id: String },
 }
 
 fn default_event_limit() -> u32 {
@@ -432,7 +434,8 @@ impl PeerCommand {
             | Self::Events { agent, .. }
             | Self::Abort { agent }
             | Self::Attach { agent, .. }
-            | Self::InputCursor { agent, .. } => agent,
+            | Self::InputCursor { agent, .. }
+            | Self::AbortInput { agent, .. } => agent,
         }
     }
 
@@ -485,9 +488,9 @@ impl PeerCommand {
                     return Err(PeerError::Invalid("event limit out of bounds".into()));
                 }
             }
-            Self::InputCursor { input_id, .. } => {
+            Self::InputCursor { input_id, .. } | Self::AbortInput { input_id, .. } => {
                 if input_id.is_empty() || input_id.len() > 256 {
-                    return Err(PeerError::Invalid("invalid input cursor id".into()));
+                    return Err(PeerError::Invalid("invalid input id".into()));
                 }
             }
             Self::Open { .. } | Self::Status { .. } | Self::Abort { .. } => {}
