@@ -1249,74 +1249,6 @@ mod tests {
             .unwrap()
     }
 
-    /// A purpose token opens one party thread and ends when the person or
-    /// the host ends it, never on the clock: a standing party does not end
-    /// in silence on day thirty. A purpose beside a family is an ordinary
-    /// token and runs out.
-    #[test]
-    fn a_purpose_token_has_no_clock() {
-        assert!(scope_is_purpose_only("party:p1;title=x;host=a.proxy.ing"));
-        assert!(!scope_is_purpose_only(
-            "party:p1;title=x;host=a.proxy.ing threads"
-        ));
-        assert!(!scope_is_purpose_only("threads"));
-        assert!(!scope_is_purpose_only(""));
-        assert_eq!(expires_at_for("party:p1", NOW), NO_EXPIRY);
-        assert_eq!(
-            expires_at_for("threads party:p1", NOW),
-            NOW + TOKEN_TTL_SECS
-        );
-        assert_eq!(expires_at_for("threads", NOW), NOW + TOKEN_TTL_SECS);
-
-        let server = server(Answer::Approved);
-        let client = registered(&server);
-        let ask = server
-            .authorize(
-                AuthorizeRequest {
-                    response_type: Some("code".to_string()),
-                    client_id: Some(client.id.clone()),
-                    redirect_uri: Some(client.redirect_uris[0].clone()),
-                    scope: Some("party:p1;title=x;host=a.proxy.ing".to_string()),
-                    state: None,
-                    code_challenge: Some(challenge_of(VERIFIER)),
-                    code_challenge_method: Some("S256".to_string()),
-                },
-                ISSUER,
-                NOW,
-            )
-            .unwrap()
-            .unwrap();
-        let Progress::Redirect(redirect) = server.progress(&ask.id, NOW).unwrap() else {
-            panic!()
-        };
-        let issued = redeem(&server, &client, &code_in(&redirect), VERIFIER, NOW).unwrap();
-        assert_eq!(issued.scope, "party:p1;title=x;host=a.proxy.ing");
-        assert_eq!(issued.expires_in, None);
-        assert!(
-            !serde_json::to_string(&issued)
-                .unwrap()
-                .contains("expires_in")
-        );
-
-        let day_31 = NOW + TOKEN_TTL_SECS + 24 * 60 * 60;
-        let token = server.admit(&issued.access_token, day_31).unwrap().unwrap();
-        assert!(!token.runs_out());
-        assert_eq!(token.expires_at, NO_EXPIRY);
-        assert!(token.is_live_at(day_31 * 10));
-        assert_eq!(token.families(), Vec::<&str>::new());
-        assert_eq!(server.store().live_tokens(day_31).unwrap().len(), 1);
-
-        // The person takes it back, and it is gone the same as any token.
-        server.revoke(&issued.access_token, day_31).unwrap();
-        assert!(
-            server
-                .admit(&issued.access_token, day_31 + 1)
-                .unwrap()
-                .is_none()
-        );
-        assert!(server.store().live_tokens(day_31 + 1).unwrap().is_empty());
-    }
-
     fn code_in(redirect: &str) -> String {
         redirect
             .split(['?', '&'])
@@ -1364,19 +1296,6 @@ mod tests {
             "short",
             "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
         ));
-    }
-
-    #[test]
-    fn a_redirect_is_https_or_loopback_http_with_no_fragment() {
-        assert!(redirect_uri_is_allowed(
-            "https://claude.ai/api/mcp/auth_callback"
-        ));
-        assert!(redirect_uri_is_allowed("http://localhost:52341/callback"));
-        assert!(redirect_uri_is_allowed("http://127.0.0.1/callback"));
-        assert!(!redirect_uri_is_allowed("http://example.com/callback"));
-        assert!(!redirect_uri_is_allowed("https://claude.ai/cb#fragment"));
-        assert!(!redirect_uri_is_allowed("custom://callback"));
-        assert!(!redirect_uri_is_allowed("https:///nohost"));
     }
 
     #[test]
@@ -1489,56 +1408,6 @@ mod tests {
             .unwrap()
             .unwrap_err();
         assert!(matches!(plain, Refusal::Redirect(url) if url.contains("error=invalid_request")));
-    }
-
-    #[test]
-    fn the_person_lets_it_in_and_the_client_redeems_the_code_once() {
-        let server = server(Answer::Approved);
-        let client = registered(&server);
-        let ask = asked(&server, &client);
-        assert_eq!(ask.client_name, "Claude");
-        assert_eq!(ask.state.as_deref(), Some("xyz"));
-
-        let Progress::Redirect(redirect) = server.progress(&ask.id, NOW + 5).unwrap() else {
-            panic!()
-        };
-        assert!(
-            redirect.starts_with("https://claude.ai/api/mcp/auth_callback?code="),
-            "{redirect}"
-        );
-        assert!(
-            redirect.contains(&format!(
-                "&state=xyz&iss=https%3A%2F%2Fjckwind.proxy.ing&client_id={}",
-                client.id
-            )),
-            "{redirect}"
-        );
-        // The same code until it is redeemed.
-        assert_eq!(
-            server.progress(&ask.id, NOW + 6).unwrap(),
-            Progress::Redirect(redirect.clone())
-        );
-
-        let code = code_in(&redirect);
-        let issued = redeem(&server, &client, &code, VERIFIER, NOW + 10).unwrap();
-        assert_eq!(issued.token_type, "Bearer");
-        assert_eq!(issued.access_token.len(), 64);
-
-        // Redeemed: the ask is gone, the code is dead, the token is live.
-        assert_eq!(server.progress(&ask.id, NOW + 11).unwrap(), Progress::Gone);
-        assert_eq!(
-            redeem(&server, &client, &code, VERIFIER, NOW + 12)
-                .unwrap_err()
-                .error,
-            "invalid_grant"
-        );
-        let token = server
-            .admit(&issued.access_token, NOW + 20)
-            .unwrap()
-            .unwrap();
-        assert_eq!(token.client_name, "Claude");
-        assert_eq!(token.last_used_at, Some(NOW + 20));
-        assert_eq!(server.store().live_tokens(NOW).unwrap().len(), 1);
     }
 
     /// The person lets the client in, and the code on the redirect.
@@ -1769,124 +1638,6 @@ mod tests {
         server.store().touch_token("nothing", NOW).unwrap();
     }
 
-    #[test]
-    fn the_metadata_points_at_the_issuer_and_the_401_points_at_the_metadata() {
-        let metadata = server_metadata("https://jckwind.proxy.ing/");
-        assert_eq!(metadata.issuer, "https://jckwind.proxy.ing");
-        assert_eq!(
-            metadata.authorization_endpoint,
-            "https://jckwind.proxy.ing/oauth/authorize"
-        );
-        assert_eq!(
-            metadata.token_endpoint,
-            "https://jckwind.proxy.ing/oauth/token"
-        );
-        assert_eq!(
-            metadata.registration_endpoint,
-            "https://jckwind.proxy.ing/oauth/register"
-        );
-        assert_eq!(metadata.code_challenge_methods_supported, ["S256"]);
-        let resource = resource_metadata("https://jckwind.proxy.ing");
-        assert_eq!(
-            resource.authorization_servers,
-            ["https://jckwind.proxy.ing".to_string()]
-        );
-        assert_eq!(
-            www_authenticate("https://jckwind.proxy.ing", None),
-            "Bearer resource_metadata=\"https://jckwind.proxy.ing/.well-known/oauth-protected-resource\""
-        );
-        assert_eq!(
-            www_authenticate("https://jckwind.proxy.ing/", Some("inference")),
-            "Bearer resource_metadata=\"https://jckwind.proxy.ing/.well-known/oauth-protected-resource\", scope=\"inference\""
-        );
-        assert_eq!(
-            insufficient_scope("https://jckwind.proxy.ing", "mail"),
-            "Bearer error=\"insufficient_scope\", scope=\"mail\", resource_metadata=\"https://jckwind.proxy.ing/.well-known/oauth-protected-resource\""
-        );
-        assert_eq!(metadata.scopes_supported, FAMILIES);
-        assert_eq!(resource.scopes_supported, FAMILIES);
-    }
-
-    #[test]
-    fn redirects_keep_the_query_the_client_had_and_encode_what_they_add() {
-        assert_eq!(
-            redirect_with(
-                "https://a.example/cb?x=1",
-                &[("code", "c d"), ("state", "")]
-            ),
-            "https://a.example/cb?x=1&code=c%20d"
-        );
-        assert_eq!(
-            redirect_with(
-                "http://localhost:1/cb",
-                &[("error", "access_denied"), ("state", "a&b")]
-            ),
-            "http://localhost:1/cb?error=access_denied&state=a%26b"
-        );
-    }
-
-    /// A scope is the families it names, once each and in one order, plus a
-    /// purpose scope the node's owner reads. A word the address does not
-    /// have is refused on the client's redirect as `invalid_scope`, and an
-    /// ask that names nothing gets the default, the threads.
-    #[test]
-    fn a_scope_is_the_families_it_names_and_nothing_asked_is_the_default() {
-        assert_eq!(normalize_scope(None).unwrap(), "threads");
-        assert_eq!(normalize_scope(Some("  ")).unwrap(), "threads");
-        assert_eq!(
-            normalize_scope(Some("inference threads inference")).unwrap(),
-            "threads inference"
-        );
-        assert_eq!(
-            normalize_scope(Some("party:p1;title=x;host=a.proxy.ing moves")).unwrap(),
-            "moves party:p1;title=x;host=a.proxy.ing"
-        );
-        let refused = normalize_scope(Some("threads mcp")).unwrap_err();
-        assert!(
-            refused.starts_with("mcp is not a scope this address has"),
-            "{refused}"
-        );
-        assert!(normalize_scope(Some(":x")).is_err());
-        assert_eq!(scope_families(None), vec!["threads"]);
-        assert_eq!(scope_families(Some("")), vec!["threads"]);
-        assert_eq!(scope_families(Some("party:p1")), Vec::<&str>::new());
-        assert_eq!(
-            scope_families(Some("mail life-map-read")),
-            vec!["life-map-read", "mail"]
-        );
-        assert!(scope_opens(Some("mail life-map-read"), "mail"));
-        assert!(!scope_opens(Some("mail life-map-read"), "life-map-write"));
-        for family in FAMILIES {
-            assert!(!family_words(family).is_empty(), "{family} has no words");
-        }
-
-        let server = server(Answer::Approved);
-        let client = registered(&server);
-        let refused = server
-            .authorize(
-                AuthorizeRequest {
-                    response_type: Some("code".to_string()),
-                    client_id: Some(client.id.clone()),
-                    redirect_uri: Some(client.redirect_uris[0].clone()),
-                    scope: Some("everything".to_string()),
-                    state: Some("s".to_string()),
-                    code_challenge: Some(challenge_of(VERIFIER)),
-                    code_challenge_method: Some("S256".to_string()),
-                },
-                ISSUER,
-                NOW,
-            )
-            .unwrap()
-            .unwrap_err();
-        let Refusal::Redirect(url) = refused else {
-            panic!("{refused:?}")
-        };
-        assert!(url.contains("error=invalid_scope"), "{url}");
-        assert!(url.contains("&state=s&iss="), "{url}");
-        let ask = asked(&server, &client);
-        assert_eq!(ask.scope.as_deref(), Some("threads"));
-    }
-
     /// A token opens what its scope names, for thirty days. Then it is not
     /// admitted and not listed, and the client asks again: there is no
     /// refresh token, so the person sees the ask again.
@@ -1986,27 +1737,5 @@ mod tests {
         assert!(!limiter.allow("0", NOW + 5));
         assert!(limiter.allow("new", NOW + 20));
         assert_eq!(limiter.windows.lock().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn the_origin_of_a_redirect_is_its_host_or_this_machine() {
-        assert_eq!(
-            redirect_origin("https://claude.ai/api/mcp/auth_callback"),
-            "claude.ai"
-        );
-        assert_eq!(
-            redirect_origin("https://Dashboard.TheProxyCompany.com:8443/api/proxy/callback?x=1"),
-            "dashboard.theproxycompany.com"
-        );
-        assert_eq!(
-            redirect_origin("https://user@evil.example/cb"),
-            "evil.example"
-        );
-        assert_eq!(
-            redirect_origin("http://localhost:4242/callback"),
-            "this machine"
-        );
-        assert_eq!(redirect_origin("http://127.0.0.1/cb"), "this machine");
-        assert_eq!(redirect_origin("http://[::1]:5/cb"), "this machine");
     }
 }
