@@ -1732,19 +1732,21 @@ async fn supervise(
                 child.wait().await
             }
             _ = stop.changed() => {
+                let cancel = *stop.borrow() == Some(ShutdownMode::CancelInstance);
                 // Explicit host stop gives the runtime its own scoped cleanup path.
                 // A process crash or a lost client never sends this command.
                 let _ = tokio::time::timeout(Duration::from_secs(1), async {
                     let mut stdin = agent.stdin.lock().await;
                     if let Some(stdin) = stdin.as_mut() {
-                        let cancel = *stop.borrow() == Some(ShutdownMode::CancelInstance);
                         let command = format!("{}\n", json!({"type":"shutdown","cancel_instance":cancel}));
                         stdin.write_all(command.as_bytes()).await?;
                         stdin.flush().await?;
                     }
                     Ok::<_, std::io::Error>(())
                 }).await;
-                match tokio::time::timeout(Duration::from_secs(5), child.wait()).await {
+                // Terminal cleanup shares the harness's 90-second host-control window.
+                let shutdown_timeout = Duration::from_secs(if cancel { 90 } else { 5 });
+                match tokio::time::timeout(shutdown_timeout, child.wait()).await {
                     Ok(status) => status,
                     Err(_) => { let _ = child.kill().await; child.wait().await }
                 }
