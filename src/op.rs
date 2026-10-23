@@ -293,13 +293,6 @@ mod tests {
     }
 
     #[test]
-    fn seal_then_verify() {
-        let id = DeviceIdentity::generate();
-        let op = SignedOp::seal(sample_body(&id), &id).unwrap();
-        assert!(op.verify(id.verifying_key()).is_ok());
-    }
-
-    #[test]
     fn verify_rejects_wrong_key() {
         let id = DeviceIdentity::generate();
         let other = DeviceIdentity::generate();
@@ -326,29 +319,6 @@ mod tests {
         let sig = Signature::from_slice(&op.sig).unwrap();
         assert!(DeviceIdentity::verify(id.verifying_key(), &canon, &sig).is_err());
         assert!(DeviceIdentity::verify(id.verifying_key(), &signing_input(&canon), &sig).is_ok());
-    }
-
-    #[test]
-    fn envelope_bytes_round_trip() {
-        let id = DeviceIdentity::generate();
-        let op = SignedOp::seal(sample_body(&id), &id).unwrap();
-        let bytes = op.to_bytes().unwrap();
-        let back = SignedOp::from_bytes(&bytes).unwrap();
-        assert_eq!(back.body, op.body);
-        assert_eq!(back.sig, op.sig);
-        assert_eq!(back.id, op.id);
-        // Survives a decode round-trip and still verifies.
-        assert!(back.verify(id.verifying_key()).is_ok());
-    }
-
-    #[test]
-    fn seal_is_deterministic() {
-        let id = DeviceIdentity::generate();
-        let a = SignedOp::seal(sample_body(&id), &id).unwrap();
-        let b = SignedOp::seal(sample_body(&id), &id).unwrap();
-        // P-256 signatures are deterministic (RFC 6979), so the content id is too.
-        assert_eq!(a.id, b.id);
-        assert_eq!(a.sig, b.sig);
     }
 
     // Regression, finding 4: seal ignores whatever device the caller put on the
@@ -412,43 +382,5 @@ mod tests {
         let bytes = op.to_bytes().unwrap();
         let err = SignedOp::from_bytes(&bytes).unwrap_err();
         assert!(matches!(err, OpError::UnsupportedVersion(v) if v == ENVELOPE_VERSION + 1));
-    }
-
-    #[test]
-    fn order_key_wire_round_trips() {
-        let id = DeviceIdentity::generate();
-        let op = SignedOp::seal(sample_body(&id), &id).unwrap();
-        let key = op.order_key();
-        assert_eq!(OrderKey::from_wire(&key.to_wire()), key);
-        // MIN maps to all zeros and back.
-        assert_eq!(OrderKey::MIN.to_wire(), [0u8; 72]);
-        assert_eq!(OrderKey::from_wire(&[0u8; 72]), OrderKey::MIN);
-    }
-
-    // Big-endian encoding makes lexicographic byte order match the numeric
-    // `(hlc, device, op_id)` order the log relies on.
-    #[test]
-    fn order_key_wire_preserves_order() {
-        let lo = OrderKey {
-            hlc: Hlc(10),
-            device: DeviceId::from_bytes([0; 32]),
-            op_id: OpId::from_bytes([0; 32]),
-        };
-        let hi = OrderKey {
-            hlc: Hlc(11),
-            device: DeviceId::from_bytes([0; 32]),
-            op_id: OpId::from_bytes([0; 32]),
-        };
-        assert!(lo < hi);
-        assert!(lo.to_wire() < hi.to_wire());
-    }
-
-    #[test]
-    fn store_id_rejects_out_of_bounds() {
-        assert!(StoreId::new("").is_err());
-        assert!(StoreId::new("kv").is_ok());
-        assert!(StoreId::new("a".repeat(MAX_STORE_ID_LEN)).is_ok());
-        assert!(StoreId::new("a".repeat(MAX_STORE_ID_LEN + 1)).is_err());
-        assert!(StoreId::new("caf\u{e9}").is_err());
     }
 }

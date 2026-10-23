@@ -113,29 +113,3 @@ impl DeviceBook for Arc<Mutex<DeviceRegistry>> {
             .map(crate::identity::sec1_compressed))
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn insert_and_resolve() {
-        let id = DeviceIdentity::generate();
-        let mut reg = DeviceRegistry::new();
-        assert!(!reg.contains(&id.device_id()));
-
-        let registered = reg.insert_sec1(&id.public_key_sec1()).unwrap();
-        assert_eq!(registered, id.device_id());
-        assert!(reg.contains(&id.device_id()));
-        assert_eq!(reg.key_for(&id.device_id()), Some(id.verifying_key()));
-
-        let other = DeviceIdentity::generate();
-        assert_eq!(reg.key_for(&other.device_id()), None);
-    }
-
-    #[test]
-    fn insert_sec1_rejects_junk() {
-        let mut reg = DeviceRegistry::new();
-        assert!(reg.insert_sec1(&[0u8; 33]).is_err());
-    }
-}

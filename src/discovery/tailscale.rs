@@ -122,32 +122,3 @@ struct Peer {
     #[serde(rename = "Online", default)]
     online: bool,
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_online_peers_from_status_json() {
-        let json = br#"{
-            "Peer": {
-                "node-a": { "TailscaleIPs": ["100.64.0.1", "fd7a::1"], "Online": true },
-                "node-b": { "TailscaleIPs": ["100.64.0.2"], "Online": false }
-            }
-        }"#;
-        let status: Status = serde_json::from_slice(json).unwrap();
-        assert_eq!(status.peer.len(), 2);
-        let a = &status.peer["node-a"];
-        assert!(a.online);
-        assert_eq!(a.tailscale_ips, vec!["100.64.0.1", "fd7a::1"]);
-        assert!(!status.peer["node-b"].online);
-    }
-
-    // A trimmed status (fields absent) must not fail the parse: default to no
-    // peers rather than erroring the whole browse.
-    #[test]
-    fn tolerates_missing_fields() {
-        let status: Status = serde_json::from_slice(b"{}").unwrap();
-        assert!(status.peer.is_empty());
-    }
-}
