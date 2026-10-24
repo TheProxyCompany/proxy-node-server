@@ -16,7 +16,6 @@ required-features = ["daemon"]
 
 [features]
 default = []
-agent-host = ["dep:rsa", "reqwest/rustls", "dep:fs2", "pull-http", "dep:futures-util", "tokio/process", "tokio/io-util"]
 daemon = ["dep:clap", "dep:serde_json"]
 pull-http = ["daemon", "dep:axum", "dep:tokio", "dep:reqwest"]
 # Provider-agnostic discovery/transport seams. Lean by construction: the traits
@@ -31,8 +30,6 @@ discovery-tailscale = ["discovery", "dep:serde_json", "dep:futures-util", "tokio
 harness = ["pull-http", "dep:clap"]
 
 [dependencies]
-rsa = { version = "0.9", features = ["sha2"], optional = true }
-fs2 = { version = "0.4", optional = true }
 p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
 sha2 = "0.10"
 postcard = { version = "1", features = ["alloc"] }
