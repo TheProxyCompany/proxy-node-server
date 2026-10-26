@@ -13,7 +13,8 @@
 //! - [`durable`]: append-only op-log durability file for the reference daemon.
 //! - [`transport`]: the [`transport::PullSource`] seam.
 //! - [`pull_v3`]: Pull Protocol v3 wire types and signed envelope primitives.
-//! - [`net`] (feature `pull-http`): the HTTP pull server, client, and pull loop.
+//! - [`net`] (feature `pull-http`): the unified HTTP pull server, client,
+//!   [`net::MeshPullSocket`] female socket trait, and peer policy.
 //! - [`oauth`]: the node as the OAuth authorization server for its own
 //!   address, so a client connects with a click in Proxy, not a pasted bearer.
 //! - [`discovery`] (feature `discovery`): provider-agnostic presence/transport
@@ -48,9 +49,10 @@ pub use log::{
 };
 pub use op::{ENVELOPE_VERSION, MAX_STORE_ID_LEN, OpBody, OpId, OrderKey, SignedOp, StoreId};
 pub use pull_v3::{
-    MAX_REQUEST_SKEW_MS, MAX_V3_REQUEST_BYTES, MAX_V3_RESPONSE_BYTES, OriginHeadV3, PAGE_LIMIT_MAX,
-    PULL_PAGE_STORE_ID, PULL_PATH, PULL_REQUEST_STORE_ID, PULL_RESPONSE_STORE_ID, PULL_V3_VERSION,
-    PullPageV3, PullPhase, PullRequestV3, ResumeV3, V3_PAGE_BYTE_BUDGET, V3_PAGE_LIMIT_MAX,
+    CoverageVector, MAX_REQUEST_SKEW_MS, MAX_V3_REQUEST_BYTES, MAX_V3_RESPONSE_BYTES, OriginHeadV3,
+    PAGE_LIMIT_MAX, PULL_PAGE_STORE_ID, PULL_PATH, PULL_REQUEST_STORE_ID, PULL_RESPONSE_STORE_ID,
+    PULL_V3_VERSION, PullPageV3, PullPhase, PullRequestV3, ResumeV3, V3_PAGE_BYTE_BUDGET,
+    V3_PAGE_LIMIT_MAX,
 };
 #[cfg(feature = "daemon")]
 pub use pull_v3::{
@@ -64,14 +66,24 @@ pub use transport::{Cursor, PeerId};
 pub use error::TransportError;
 #[cfg(feature = "pull-http")]
 pub use net::{
-    ApplyMode, DEFAULT_MAX_PARKED_WATCHES, DEFAULT_PULL_LIMIT, DeviceEntry, DevicesResp,
-    HeadPublisher, HeadWatch, HttpPullSource, IdentityResp, PullResponse, PullV3Handler,
-    RELAY_PROTOCOL_VERSION, RelayCursorV2, RelayOpV2, RelayPageV2, RelayResponseV2,
-    RelaySyncOutcome, RelayWireEntryV2, ServeState, WATCH_DEFAULT_WAIT, WATCH_EMPTY_BACKOFF,
-    WATCH_MAX_WAIT, learn_attested_devices, learn_devices, load_cursor, load_peer_keys,
-    load_relay_caller_keys, load_relay_cursor, register_peer, register_peer_with_key, relay_router,
-    router, save_cursor, save_peer_keys, save_relay_caller_keys, save_relay_cursor, sync_once,
-    sync_once_with, sync_relay_once_v2, v3_pull_router,
+    ApplyMode, DEFAULT_MAX_PARKED_WATCHES, DEFAULT_PULL_LIMIT, DISCOVERY_RESCAN_INTERVAL,
+    DeviceEntry, DevicesResp, HeadPublisher, HeadWatch, HttpPullSource, IdentityResp,
+    MESH_AUDIT_ENV, MESH_PEERS_ENV, MeshPullHost, MeshPullSocket, NEWEST_FIRST_PREVIEW_GAP,
+    OpLogPullSocket, PULL_FALLBACK_INTERVAL, PullAdmission, PullResponse, PullStorage,
+    PullV3Handler, REGISTER_RETRY_BACKOFF, RELAY_PROTOCOL_VERSION, RelayCursorV2, RelayOpV2,
+    RelayPageV2, RelayResponseV2, RelaySyncOutcome, RelayWireEntryV2, ServeState,
+    TRELLIS_SWEEP_INTERVAL, V3_NO_PROGRESS_LIMIT, V3Outcome, V3Progress, WATCH_DEFAULT_WAIT,
+    WATCH_EMPTY_BACKOFF, WATCH_MAX_WAIT, WATCH_REPROBE_INTERVAL, admit_pull_ack_v3,
+    apply_pull_page_v3, authenticate_pull_request_v3, build_keyed_channel_v3, build_pull_page_v3,
+    classify_pull_request_error, decode_epoch, decode_order_key, decode_page_op, drain_v3_pages,
+    encode_order_key, encode_origin_rows, endpoint_has_confidential_transport, inflated_claims,
+    is_cgnat_ip, is_loopback_host, keyed_resume, learn_attested_devices, learn_devices,
+    load_cursor, load_peer_keys, load_relay_caller_keys, load_relay_cursor, parse_mesh_peers,
+    parse_mesh_peers_from, persist_v3_reset, preview_head_window_v3, preview_resume_after,
+    register_peer, register_peer_with_key, relay_router, reset_pull_page_v3, router, save_cursor,
+    save_peer_keys, save_relay_caller_keys, save_relay_cursor, sweep_store_v3, sync_once,
+    sync_once_with, sync_relay_once_v2, unix_ms, v3_http_client, v3_needs_reset, v3_progress,
+    v3_pull_router, validate_v3_reset,
 };
 #[cfg(feature = "pull-http")]
 pub use transport::PullSource;
@@ -99,7 +111,7 @@ mod tests {
     }
 
     #[test]
-    fn every_source_file_is_under_one_thousand_lines() {
+    fn every_source_file_is_under_eight_hundred_lines() {
         let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut files = Vec::new();
         collect_rs_files(&src_dir, &mut files);

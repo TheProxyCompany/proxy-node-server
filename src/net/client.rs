@@ -24,6 +24,7 @@ use crate::pull_v3::{MAX_V3_RESPONSE_BYTES, PULL_PATH};
 use crate::transport::{Cursor, PullSource};
 
 /// Pulls a peer's op-log over HTTP.
+#[derive(Clone)]
 pub struct HttpPullSource {
     pub(super) base_url: String,
     pub(super) client: reqwest::Client,

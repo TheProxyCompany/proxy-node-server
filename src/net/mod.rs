@@ -1,19 +1,25 @@
-//! HTTP pull transport (feature `pull-http`): the server routes a node exposes,
-//! the [`HttpPullSource`] client that pulls a peer's ops, and [`sync_once`], the
-//! one-shot pull step the daemon loops over. All bodies are postcard over
-//! `application/octet-stream`.
+//! Unified HTTP pull & sync surface (feature `pull-http`): v1 semantic pull,
+//! Relay v2 insertion-ordered stream, Pull v3 two-channel sync, the
+//! [`MeshPullSocket`] ("Female Socket") storage trait, and peer transport
+//! confidentiality policy.
 
 mod client;
 mod persistence;
+mod policy;
 mod relay;
 mod server;
+mod socket;
 mod sync;
+mod v3_client;
+mod v3_server;
 mod watch;
 
 #[cfg(test)]
 mod tests_relay;
 #[cfg(test)]
 mod tests_support;
+#[cfg(test)]
+mod tests_v3;
 #[cfg(test)]
 mod tests_watch;
 
@@ -24,16 +30,39 @@ use serde::{Deserialize, Serialize};
 use crate::identity::decode_hex;
 use crate::op::{OrderKey, SignedOp};
 
-pub use crate::pull_v3::{PullV3Handler, v3_pull_router};
+pub use crate::pull_v3::{
+    CoverageVector, MAX_REQUEST_SKEW_MS, MAX_V3_REQUEST_BYTES, MAX_V3_RESPONSE_BYTES, OriginHeadV3,
+    PAGE_LIMIT_MAX, PULL_PAGE_STORE_ID, PULL_PATH, PULL_REQUEST_STORE_ID, PULL_RESPONSE_STORE_ID,
+    PULL_V3_VERSION, PullPageV3, PullPhase, PullRequestV3, ResumeV3, V3_PAGE_BYTE_BUDGET,
+    V3_PAGE_LIMIT_MAX, seal_pull_page_v3, sign_pull_request_v3, verify_pull_page_v3,
+    verify_pull_request_v3,
+};
 pub use client::HttpPullSource;
 pub use persistence::{
     load_cursor, load_peer_keys, load_relay_caller_keys, load_relay_cursor, save_cursor,
     save_peer_keys, save_relay_caller_keys, save_relay_cursor,
 };
+pub use policy::{
+    MESH_AUDIT_ENV, MESH_PEERS_ENV, endpoint_has_confidential_transport, is_cgnat_ip,
+    is_loopback_host, parse_mesh_peers, parse_mesh_peers_from,
+};
 pub use server::{ServeState, relay_router, router};
+pub use socket::{MeshPullHost, MeshPullSocket, OpLogPullSocket, PullAdmission, PullStorage};
 pub use sync::{
     ApplyMode, RelaySyncOutcome, learn_attested_devices, learn_devices, register_peer,
     register_peer_with_key, sync_once, sync_once_with, sync_relay_once_v2,
+};
+pub use v3_client::{
+    DISCOVERY_RESCAN_INTERVAL, NEWEST_FIRST_PREVIEW_GAP, PULL_FALLBACK_INTERVAL,
+    REGISTER_RETRY_BACKOFF, TRELLIS_SWEEP_INTERVAL, V3_NO_PROGRESS_LIMIT, V3Outcome, V3Progress,
+    WATCH_REPROBE_INTERVAL, apply_pull_page_v3, decode_epoch, decode_order_key, decode_page_op,
+    drain_v3_pages, inflated_claims, persist_v3_reset, preview_head_window_v3,
+    preview_resume_after, sweep_store_v3, unix_ms, v3_http_client, v3_progress, validate_v3_reset,
+};
+pub use v3_server::{
+    PullV3Handler, admit_pull_ack_v3, authenticate_pull_request_v3, build_keyed_channel_v3,
+    build_pull_page_v3, classify_pull_request_error, encode_origin_rows, keyed_resume,
+    reset_pull_page_v3, v3_needs_reset, v3_pull_router,
 };
 pub use watch::{HeadPublisher, HeadWatch};
 
@@ -94,6 +123,10 @@ impl RelayCursorV2 {
         epoch: [0; 32],
         after: 0,
     };
+
+    pub const fn new(epoch: [u8; 32], after: u64) -> Self {
+        Self { epoch, after }
+    }
 }
 
 impl Default for RelayCursorV2 {
@@ -170,14 +203,10 @@ pub struct DevicesResp {
     pub devices: Vec<DeviceEntry>,
 }
 
-pub(super) fn encode_order_key(key: &OrderKey) -> String {
+pub fn encode_order_key(key: &OrderKey) -> String {
     crate::identity::encode_hex(&key.to_wire())
 }
 
-pub(super) fn decode_order_key(s: &str) -> Option<OrderKey> {
-    decode_fixed_hex::<72>(s).map(|wire| OrderKey::from_wire(&wire))
-}
-
-pub(super) fn decode_fixed_hex<const N: usize>(encoded: &str) -> Option<[u8; N]> {
+pub(crate) fn decode_fixed_hex<const N: usize>(encoded: &str) -> Option<[u8; N]> {
     decode_hex(encoded)?.try_into().ok()
 }
