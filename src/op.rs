@@ -174,6 +174,21 @@ impl SignedOp {
         Ok(())
     }
 
+    /// Verify this op directly against a 33-byte compressed SEC1 public key
+    /// without allocating a [`crate::registry::DeviceRegistry`].
+    pub fn verify_with_sec1(&self, public_key_sec1: &[u8]) -> Result<(), OpError> {
+        if public_key_sec1.len() != 33 {
+            return Err(crate::error::IdentityError::InvalidLength {
+                expected: 33,
+                got: public_key_sec1.len(),
+            }
+            .into());
+        }
+        let pubkey = VerifyingKey::from_sec1_bytes(public_key_sec1)
+            .map_err(|_| OpError::from(crate::error::IdentityError::InvalidPublicKey))?;
+        self.verify(&pubkey)
+    }
+
     /// Global total-order key for replay and cursors: `(hlc, device, op_id)`.
     pub fn order_key(&self) -> OrderKey {
         OrderKey {
@@ -382,5 +397,31 @@ mod tests {
         let bytes = op.to_bytes().unwrap();
         let err = SignedOp::from_bytes(&bytes).unwrap_err();
         assert!(matches!(err, OpError::UnsupportedVersion(v) if v == ENVELOPE_VERSION + 1));
+    }
+
+    #[test]
+    fn verify_with_sec1_verifies_directly_without_registry() {
+        use crate::error::IdentityError;
+
+        let id = DeviceIdentity::generate();
+        let other = DeviceIdentity::generate();
+        let op = SignedOp::seal(sample_body(&id), &id).unwrap();
+
+        assert!(op.verify_with_sec1(&id.public_key_sec1()).is_ok());
+        assert!(matches!(
+            op.verify_with_sec1(&other.public_key_sec1()),
+            Err(OpError::DeviceMismatch)
+        ));
+        assert!(matches!(
+            op.verify_with_sec1(&[0u8; 32]),
+            Err(OpError::Identity(IdentityError::InvalidLength {
+                expected: 33,
+                got: 32,
+            }))
+        ));
+        assert!(matches!(
+            op.verify_with_sec1(&[0u8; 33]),
+            Err(OpError::Identity(IdentityError::InvalidPublicKey))
+        ));
     }
 }

@@ -23,6 +23,19 @@ pub struct RelayStreamState {
     pub floor: u64,
 }
 
+impl RelayStreamState {
+    pub const fn new(epoch: [u8; 32], head: u64, floor: u64) -> Self {
+        Self { epoch, head, floor }
+    }
+}
+
+/// One signed operation at its relay-local insertion sequence, paired with its
+/// verbatim wire envelope bytes.
+pub type RelayEnvelopeRow = (u64, SignedOp, Vec<u8>);
+
+/// One signed operation's order key paired with its verbatim wire envelope bytes.
+pub type OriginEnvelopeRow = (OrderKey, Vec<u8>);
+
 /// One signed operation at its relay-local insertion sequence.
 #[derive(Clone, Debug)]
 pub struct RelayLogEntry {
@@ -150,6 +163,61 @@ impl OpLog {
             entries,
         }
     }
+
+    /// Every origin device present in the log, ascending by raw device-id bytes.
+    pub fn origins(&self) -> Vec<crate::identity::DeviceId> {
+        let mut set = std::collections::BTreeSet::new();
+        for op in self.ops.values() {
+            set.insert(op.body.device);
+        }
+        set.into_iter().collect()
+    }
+
+    /// One origin's `(OrderKey, raw_envelope_bytes)` strictly after `after`,
+    /// ascending by [`OrderKey`], optionally filtered to `store`, capped at `limit`.
+    pub fn origin_since(
+        &self,
+        origin: &crate::identity::DeviceId,
+        after: Option<OrderKey>,
+        store: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<(OrderKey, Vec<u8>)>, String> {
+        let range = match after {
+            Some(bound) => (Bound::Excluded(bound), Bound::Unbounded),
+            None => (Bound::Unbounded, Bound::Unbounded),
+        };
+        let mut out = Vec::new();
+        for (key, op) in self.ops.range(range) {
+            if op.body.device != *origin {
+                continue;
+            }
+            if store.is_some_and(|wanted| op.body.store.as_str() != wanted) {
+                continue;
+            }
+            let bytes = op.to_bytes().map_err(|e| e.to_string())?;
+            out.push((*key, bytes));
+            if out.len() >= limit {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Relay entries `(seq, op, raw_envelope_bytes)` strictly after `after`,
+    /// capped at `limit`.
+    pub fn relay_since_with_envelopes(
+        &self,
+        after: u64,
+        limit: usize,
+    ) -> Result<Vec<(u64, SignedOp, Vec<u8>)>, String> {
+        let page = self.relay_page(after, limit);
+        let mut out = Vec::with_capacity(page.entries.len());
+        for entry in page.entries {
+            let bytes = entry.op.to_bytes().map_err(|e| e.to_string())?;
+            out.push((entry.seq, entry.op, bytes));
+        }
+        Ok(out)
+    }
 }
 
 /// Decode and apply every op targeting `store` in global total order.
@@ -227,6 +295,63 @@ pub trait LogSource: Clone + Send + Sync + 'static {
     fn relay_page(&self, _after: u64, _limit: usize) -> Result<Option<RelayLogPage>, String> {
         Ok(None)
     }
+
+    /// Every origin device present in the log, ascending by raw device-id bytes.
+    fn origins(&self) -> Result<Vec<crate::identity::DeviceId>, String> {
+        let mut set = std::collections::BTreeSet::new();
+        for op in self.since(OrderKey::MIN, usize::MAX) {
+            set.insert(op.body.device);
+        }
+        Ok(set.into_iter().collect())
+    }
+
+    /// One origin's `(OrderKey, raw_envelope_bytes)` strictly after `after`,
+    /// ascending by [`OrderKey`], optionally filtered to `store`, capped at `limit`.
+    fn origin_since(
+        &self,
+        origin: &crate::identity::DeviceId,
+        after: Option<OrderKey>,
+        store: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<(OrderKey, Vec<u8>)>, String> {
+        let start = after.unwrap_or(OrderKey::MIN);
+        let mut out = Vec::new();
+        for op in self.since(start, usize::MAX) {
+            if op.body.device != *origin {
+                continue;
+            }
+            if after.is_some_and(|bound| op.order_key() <= bound) {
+                continue;
+            }
+            if store.is_some_and(|wanted| op.body.store.as_str() != wanted) {
+                continue;
+            }
+            let bytes = op.to_bytes().map_err(|e| e.to_string())?;
+            out.push((op.order_key(), bytes));
+            if out.len() >= limit {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Relay entries `(seq, op, raw_envelope_bytes)` strictly after `after`,
+    /// capped at `limit`.
+    fn relay_since_with_envelopes(
+        &self,
+        after: u64,
+        limit: usize,
+    ) -> Result<Option<Vec<RelayEnvelopeRow>>, String> {
+        let Some(page) = self.relay_page(after, limit)? else {
+            return Ok(None);
+        };
+        let mut out = Vec::with_capacity(page.entries.len());
+        for entry in page.entries {
+            let bytes = entry.op.to_bytes().map_err(|e| e.to_string())?;
+            out.push((entry.seq, entry.op, bytes));
+        }
+        Ok(Some(out))
+    }
 }
 
 impl LogSource for Arc<Mutex<OpLog>> {
@@ -259,5 +384,32 @@ impl LogSource for Arc<Mutex<OpLog>> {
                 .expect("oplog mutex poisoned")
                 .relay_page(after, limit),
         ))
+    }
+
+    fn origins(&self) -> Result<Vec<crate::identity::DeviceId>, String> {
+        Ok(self.lock().expect("oplog mutex poisoned").origins())
+    }
+
+    fn origin_since(
+        &self,
+        origin: &crate::identity::DeviceId,
+        after: Option<OrderKey>,
+        store: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<(OrderKey, Vec<u8>)>, String> {
+        self.lock()
+            .expect("oplog mutex poisoned")
+            .origin_since(origin, after, store, limit)
+    }
+
+    fn relay_since_with_envelopes(
+        &self,
+        after: u64,
+        limit: usize,
+    ) -> Result<Option<Vec<RelayEnvelopeRow>>, String> {
+        self.lock()
+            .expect("oplog mutex poisoned")
+            .relay_since_with_envelopes(after, limit)
+            .map(Some)
     }
 }
