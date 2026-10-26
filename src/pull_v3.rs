@@ -460,8 +460,10 @@ impl<L: crate::log::LogSource, D: crate::registry::DeviceBook> PullV3Handler
 
         let mut by_origin: BTreeMap<DeviceId, Vec<SignedOp>> = BTreeMap::new();
         for op in self.log.since(OrderKey::MIN, usize::MAX) {
-            if let Some(ref store) = request.store
-                && op.body.store.as_str() != store
+            if request
+                .store
+                .as_deref()
+                .is_some_and(|store| op.body.store.as_str() != store)
             {
                 continue;
             }
