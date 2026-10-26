@@ -33,10 +33,10 @@ use crate::registry::DeviceBook;
 /// ([`LogSource`]), the device keys it gossips ([`DeviceBook`]), and the
 /// head-change notifier `/watch` parks on.
 pub struct ServeState<L: LogSource, D: DeviceBook> {
-    identity: Arc<DeviceIdentity>,
-    log: L,
-    devices: D,
-    relay_callers: D,
+    pub(crate) identity: Arc<DeviceIdentity>,
+    pub(crate) log: L,
+    pub(crate) devices: D,
+    pub(crate) relay_callers: D,
     watch: HeadWatch,
     watch_limit: Arc<Semaphore>,
     pub(super) relay_replays: Arc<RelayReplayCache>,

@@ -39,7 +39,7 @@ pub mod registry;
 pub mod store;
 pub mod transport;
 
-pub use error::{DurabilityError, HlcError, IdentityError, OpError, ReplayError};
+pub use error::{DurabilityError, HlcError, IdentityError, NodeError, OpError, ReplayError};
 pub use hlc::{DEFAULT_MAX_DELTA, Hlc, NodeClock};
 pub use identity::{DeviceId, DeviceIdentity};
 pub use kv::{KvOp, KvStore};
@@ -65,12 +65,13 @@ pub use error::TransportError;
 #[cfg(feature = "pull-http")]
 pub use net::{
     ApplyMode, DEFAULT_MAX_PARKED_WATCHES, DEFAULT_PULL_LIMIT, DeviceEntry, DevicesResp,
-    HeadPublisher, HeadWatch, HttpPullSource, IdentityResp, PullResponse, RELAY_PROTOCOL_VERSION,
-    RelayCursorV2, RelayOpV2, RelayPageV2, RelayResponseV2, RelaySyncOutcome, RelayWireEntryV2,
-    ServeState, WATCH_DEFAULT_WAIT, WATCH_EMPTY_BACKOFF, WATCH_MAX_WAIT, learn_attested_devices,
-    learn_devices, load_cursor, load_peer_keys, load_relay_caller_keys, load_relay_cursor,
-    register_peer, register_peer_with_key, relay_router, router, save_cursor, save_peer_keys,
-    save_relay_caller_keys, save_relay_cursor, sync_once, sync_once_with, sync_relay_once_v2,
+    HeadPublisher, HeadWatch, HttpPullSource, IdentityResp, PullResponse, PullV3Handler,
+    RELAY_PROTOCOL_VERSION, RelayCursorV2, RelayOpV2, RelayPageV2, RelayResponseV2,
+    RelaySyncOutcome, RelayWireEntryV2, ServeState, WATCH_DEFAULT_WAIT, WATCH_EMPTY_BACKOFF,
+    WATCH_MAX_WAIT, learn_attested_devices, learn_devices, load_cursor, load_peer_keys,
+    load_relay_caller_keys, load_relay_cursor, register_peer, register_peer_with_key, relay_router,
+    router, save_cursor, save_peer_keys, save_relay_caller_keys, save_relay_cursor, sync_once,
+    sync_once_with, sync_relay_once_v2, v3_pull_router,
 };
 #[cfg(feature = "pull-http")]
 pub use transport::PullSource;

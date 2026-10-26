@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use crate::identity::decode_hex;
 use crate::op::{OrderKey, SignedOp};
 
+pub use crate::pull_v3::{PullV3Handler, v3_pull_router};
 pub use client::HttpPullSource;
 pub use persistence::{
     load_cursor, load_peer_keys, load_relay_caller_keys, load_relay_cursor, save_cursor,

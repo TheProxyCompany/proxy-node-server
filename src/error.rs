@@ -58,6 +58,10 @@ pub enum OpError {
     BadLength,
 }
 
+/// Alias for [`OpError`] used by callers that refer to the crate-level op
+/// verification error as `NodeError`.
+pub type NodeError = OpError;
+
 /// Failure while replaying a log into a [`crate::store::Store`].
 #[derive(Debug, Error)]
 pub enum ReplayError<E: std::error::Error + Send + Sync + 'static> {
