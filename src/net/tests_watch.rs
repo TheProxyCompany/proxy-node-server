@@ -472,3 +472,67 @@ async fn pull_v3_bytes_posts_signed_envelope_and_returns_sealed_page() {
     assert_eq!(page.next_relay_seq, 9);
     assert_eq!(page.store.as_deref(), Some("trellis"));
 }
+
+#[test]
+fn relay_v2_rejects_replayed_signature_for_a_different_nonce() {
+    use super::relay::{RELAY_OPS_SIGNING_CONTEXT, sign_relay_response, verify_relay_signature};
+    use super::tests_support::encoded_relay_response;
+    use crate::identity::encode_hex;
+
+    let serving = DeviceIdentity::generate();
+    let cursor = RelayCursorV2 {
+        epoch: [0x88; 32],
+        after: 4,
+    };
+    let body = encoded_relay_response(cursor.epoch, 4, 4, Vec::new());
+    let old_nonce = [0x11; 32];
+    let next_nonce = [0x22; 32];
+    let signature = encode_hex(&sign_relay_response(
+        &serving,
+        &serving.device_id(),
+        RELAY_OPS_SIGNING_CONTEXT,
+        &cursor.epoch,
+        cursor.after,
+        10,
+        &old_nonce,
+        &body,
+    ));
+
+    let error = verify_relay_signature(
+        serving.device_id(),
+        serving.device_id(),
+        &serving.public_key_sec1(),
+        RELAY_OPS_SIGNING_CONTEXT,
+        cursor,
+        10,
+        &next_nonce,
+        &body,
+        &signature,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        TransportError::Identity(crate::error::IdentityError::BadSignature)
+    ));
+}
+
+#[tokio::test]
+async fn relay_v2_unsupported_status_is_reported_precisely() {
+    let client = spawn_app(Router::new()).await;
+    let expected = DeviceIdentity::generate();
+
+    let error = client
+        .fetch_relay_ops_v2(
+            &expected,
+            expected.device_id(),
+            &expected.public_key_sec1(),
+            RelayCursorV2::START,
+        )
+        .await
+        .unwrap_err();
+    assert!(error.is_relay_v2_unsupported());
+    assert!(matches!(
+        error,
+        TransportError::RelayV2Unsupported { status: 404 }
+    ));
+}

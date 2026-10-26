@@ -108,8 +108,8 @@ mod tests {
             let content = std::fs::read_to_string(&path).expect("read rs file");
             let lines = content.lines().count();
             assert!(
-                lines < 1_000,
-                "{} has {} lines (must be strictly < 1,000)",
+                lines < 800,
+                "{} has {} lines (must be strictly < 800)",
                 path.display(),
                 lines
             );

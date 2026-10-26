@@ -2,13 +2,11 @@ use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use axum::Router;
 use axum::http::StatusCode;
 
 use super::relay::{
-    DEVICE_BOOK_NONCE_HEADER, DEVICE_BOOK_SIGNATURE_HEADER, RELAY_OPS_SIGNING_CONTEXT,
-    RELAY_REPLAY_LIMIT, RELAY_SIGNATURE_HEADER, sign_device_book, sign_relay_response,
-    verify_device_book, verify_relay_signature,
+    DEVICE_BOOK_NONCE_HEADER, DEVICE_BOOK_SIGNATURE_HEADER, RELAY_REPLAY_LIMIT,
+    RELAY_SIGNATURE_HEADER, sign_device_book, verify_device_book,
 };
 use super::tests_support::{
     FailingDeviceBook, StateOnlyRelayLog, encoded_devices, encoded_relay_response,
@@ -759,65 +757,5 @@ async fn relay_v2_rejects_signature_from_an_unpinned_key() {
     assert!(matches!(
         error,
         TransportError::Identity(crate::error::IdentityError::BadSignature)
-    ));
-}
-
-#[test]
-fn relay_v2_rejects_replayed_signature_for_a_different_nonce() {
-    let serving = DeviceIdentity::generate();
-    let cursor = RelayCursorV2 {
-        epoch: [0x88; 32],
-        after: 4,
-    };
-    let body = encoded_relay_response(cursor.epoch, 4, 4, Vec::new());
-    let old_nonce = [0x11; 32];
-    let next_nonce = [0x22; 32];
-    let signature = encode_hex(&sign_relay_response(
-        &serving,
-        &serving.device_id(),
-        RELAY_OPS_SIGNING_CONTEXT,
-        &cursor.epoch,
-        cursor.after,
-        10,
-        &old_nonce,
-        &body,
-    ));
-
-    let error = verify_relay_signature(
-        serving.device_id(),
-        serving.device_id(),
-        &serving.public_key_sec1(),
-        RELAY_OPS_SIGNING_CONTEXT,
-        cursor,
-        10,
-        &next_nonce,
-        &body,
-        &signature,
-    )
-    .unwrap_err();
-    assert!(matches!(
-        error,
-        TransportError::Identity(crate::error::IdentityError::BadSignature)
-    ));
-}
-
-#[tokio::test]
-async fn relay_v2_unsupported_status_is_reported_precisely() {
-    let client = spawn_app(Router::new()).await;
-    let expected = DeviceIdentity::generate();
-
-    let error = client
-        .fetch_relay_ops_v2(
-            &expected,
-            expected.device_id(),
-            &expected.public_key_sec1(),
-            RelayCursorV2::START,
-        )
-        .await
-        .unwrap_err();
-    assert!(error.is_relay_v2_unsupported());
-    assert!(matches!(
-        error,
-        TransportError::RelayV2Unsupported { status: 404 }
     ));
 }
