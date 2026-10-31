@@ -18,6 +18,7 @@ pub mod log;
 pub mod net;
 pub mod oauth;
 pub mod op;
+pub mod ports;
 pub mod pull;
 pub mod registry;
 pub mod row_op;
@@ -29,7 +30,7 @@ pub use sqlite::SqliteError;
 pub mod transport;
 
 pub use error::{DurabilityError, HlcError, IdentityError, NodeError, OpError, ReplayError};
-pub use file_store::{RowAuthority, sha256_hex, should_emit_sweep_file};
+pub use file_store::{FileMutation, FileStoreOp, RowAuthority, sha256_hex, should_emit_sweep_file};
 pub use hlc::{DEFAULT_MAX_DELTA, Hlc, NodeClock};
 pub use identity::{DeviceId, DeviceIdentity};
 pub use kv::{KvOp, KvStore};

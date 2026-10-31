@@ -1,4 +1,5 @@
-//! File and directory store synchronization primitives (`AgentStore`, `PartyStore`).
+//! File and directory store synchronization primitives (`AgentStore`, `PartyStore`)
+//! implementing the [`crate::store::Store`] pattern.
 //!
 //! Ownership and convergence derive directly from authenticated op-log heads
 //! (`RowAuthority`) and content SHA-256 digests — never from hidden `.mesh`
@@ -14,6 +15,36 @@ pub enum RowAuthority {
     Local,
     /// Authenticated ops exist and every newest one names another device.
     Remote,
+}
+
+/// Mutation payload for a file-backed [`crate::store::Store`] (`PartyStore`, `AgentStore`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FileMutation {
+    Upsert { content: Vec<u8>, mode: u32 },
+    Delete,
+}
+
+/// Operation for a directory/file-backed [`crate::store::Store`] (`PartyStore`, `AgentStore`),
+/// keyed by `(entity_id, relative_path)`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileStoreOp {
+    pub entity_id: String,
+    pub path: String,
+    pub mutation: FileMutation,
+}
+
+impl FileStoreOp {
+    pub fn row_pk(&self) -> String {
+        crate::row_op::row_pk_of(&[("id", &self.entity_id), ("path", &self.path)])
+    }
+
+    pub fn encode_bytes(&self) -> Result<Vec<u8>, postcard::Error> {
+        postcard::to_allocvec(self)
+    }
+
+    pub fn decode_bytes(payload: &[u8]) -> Result<Self, postcard::Error> {
+        postcard::from_bytes(payload)
+    }
 }
 
 /// Compute the lowercase hex SHA-256 digest of `bytes`.

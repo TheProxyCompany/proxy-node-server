@@ -42,6 +42,8 @@ uhlc = "0.8"
 base64 = "0.22"
 percent-encoding = "2"
 subtle = { version = "2", default-features = false }
+libc = "0.2"
+hex = "0.4"
 
 clap = { version = "4", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }

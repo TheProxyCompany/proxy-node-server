@@ -3,6 +3,8 @@
 //! coverage (`mesh_origin_coverage`), and pending-edge / callback outbox tables.
 
 pub mod coverage;
+pub mod device_book;
+pub mod log_source;
 pub mod oplog;
 pub mod oplog_heads;
 pub mod oplog_queries;
