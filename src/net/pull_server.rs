@@ -18,25 +18,24 @@ use crate::identity::{DeviceId, DeviceIdentity, encode_hex};
 use crate::log::{LogSource, RelayStreamState};
 use crate::op::OrderKey;
 use crate::pull::{
-    CoverageVector, MAX_V3_REQUEST_BYTES, PULL_PATH, PULL_V3_VERSION, PullPageV3, PullPhase,
-    PullRequestV3, ResumeV3, V3_PAGE_BYTE_BUDGET, V3_PAGE_LIMIT_MAX, seal_pull_page_v3,
-    verify_pull_request_v3,
+    CoverageVector, MAX_PULL_REQUEST_BYTES, PULL_PAGE_BYTE_BUDGET, PULL_PAGE_LIMIT_MAX, PULL_PATH,
+    PULL_VERSION, PullPage, PullPhase, PullRequest, Resume, seal_pull_page, verify_pull_request,
 };
 use crate::registry::DeviceBook;
 
 /// Mirrors `relay_needs_reset` so channel B inherits v2's epoch and floor
 /// reset semantics verbatim.
-pub fn v3_needs_reset(request_epoch: [u8; 32], after: u64, state: &RelayStreamState) -> bool {
+pub fn pull_needs_reset(request_epoch: [u8; 32], after: u64, state: &RelayStreamState) -> bool {
     (request_epoch == [0u8; 32] && state.floor > 0)
         || (request_epoch != [0u8; 32] && request_epoch != state.epoch)
         || (request_epoch == state.epoch && (after < state.floor || after > state.head))
 }
 
-/// Construct a reset [`PullPageV3`] advertising `stream`'s current epoch,
+/// Construct a reset [`PullPage`] advertising `stream`'s current epoch,
 /// compaction floor, and head sequence.
-pub fn reset_pull_page_v3(stream: &RelayStreamState) -> PullPageV3 {
-    PullPageV3 {
-        version: PULL_V3_VERSION,
+pub fn reset_pull_page(stream: &RelayStreamState) -> PullPage {
+    PullPage {
+        version: PULL_VERSION,
         epoch: encode_hex(&stream.epoch),
         reset: true,
         floor: stream.floor,
@@ -75,8 +74,8 @@ pub fn encode_origin_rows(
 }
 
 /// Build a [`PullPhase::Keyed`] resume token positioned at `(origin, last_key)`.
-pub fn keyed_resume(origin: &DeviceId, last_key: Option<OrderKey>) -> ResumeV3 {
-    ResumeV3 {
+pub fn keyed_resume(origin: &DeviceId, last_key: Option<OrderKey>) -> Resume {
+    Resume {
         phase: PullPhase::Keyed,
         after_seq: 0,
         origin: origin.to_hex(),
@@ -90,16 +89,16 @@ pub fn keyed_resume(origin: &DeviceId, last_key: Option<OrderKey>) -> ResumeV3 {
 /// within an origin and origins ascending by raw device-id bytes (with the
 /// serving device's own origin fronted on a fresh exchange).
 #[allow(clippy::too_many_arguments)]
-pub fn build_keyed_channel_v3<S: MeshPullSocket + ?Sized>(
+pub fn build_keyed_channel<S: MeshPullSocket + ?Sized>(
     socket: &S,
     claims: &CoverageVector,
-    resume: Option<&ResumeV3>,
+    resume: Option<&Resume>,
     audit: bool,
     budget: usize,
     byte_budget: usize,
     store: Option<&str>,
     own: &DeviceId,
-) -> Result<(Vec<String>, Option<ResumeV3>), S::Error> {
+) -> Result<(Vec<String>, Option<Resume>), S::Error> {
     let mut keyed = Vec::new();
     let mut bytes: usize = 0;
     if budget == 0 {
@@ -158,24 +157,24 @@ pub fn build_keyed_channel_v3<S: MeshPullSocket + ?Sized>(
     Ok((keyed, None))
 }
 
-/// Construct a [`PullPageV3`] across Channel A (keyed per-origin diff) and
+/// Construct a [`PullPage`] across Channel A (keyed per-origin diff) and
 /// Channel B (positional arrival backfill) against `socket`.
-pub fn build_pull_page_v3<S: MeshPullSocket + ?Sized>(
+pub fn build_pull_page<S: MeshPullSocket + ?Sized>(
     socket: &S,
     _peer: &DeviceId,
-    request: &PullRequestV3,
-) -> Result<PullPageV3, S::Error> {
+    request: &PullRequest,
+) -> Result<PullPage, S::Error> {
     let stream = socket.relay_stream_state()?;
     let request_epoch = decode_epoch(&request.relay_epoch)
         .ok_or_else(|| S::invalid_argument("invalid relay epoch"))?;
 
     let store_filter = request.store.as_deref();
-    if store_filter.is_none() && v3_needs_reset(request_epoch, request.relay_after, &stream) {
-        return Ok(reset_pull_page_v3(&stream));
+    if store_filter.is_none() && pull_needs_reset(request_epoch, request.relay_after, &stream) {
+        return Ok(reset_pull_page(&stream));
     }
 
     let epoch_hex = encode_hex(&stream.epoch);
-    let limit = request.limit.clamp(1, V3_PAGE_LIMIT_MAX) as usize;
+    let limit = request.limit.clamp(1, PULL_PAGE_LIMIT_MAX) as usize;
     let claims = CoverageVector(request.decode_coverage());
     let audit = request.audit;
     let resume_keyed = request
@@ -185,18 +184,18 @@ pub fn build_pull_page_v3<S: MeshPullSocket + ?Sized>(
     let own = socket.own_device_id();
 
     if let Some(store) = store_filter {
-        let (keyed, resume) = build_keyed_channel_v3(
+        let (keyed, resume) = build_keyed_channel(
             socket,
             &claims,
             resume_keyed,
             audit,
             limit,
-            V3_PAGE_BYTE_BUDGET,
+            PULL_PAGE_BYTE_BUDGET,
             Some(store),
             &own,
         )?;
-        return Ok(PullPageV3 {
-            version: PULL_V3_VERSION,
+        return Ok(PullPage {
+            version: PULL_VERSION,
             epoch: epoch_hex,
             reset: false,
             floor: stream.floor,
@@ -220,8 +219,8 @@ pub fn build_pull_page_v3<S: MeshPullSocket + ?Sized>(
     let page = |backfill: Vec<(u64, String)>,
                 keyed: Vec<String>,
                 next_relay_seq: u64,
-                resume: Option<ResumeV3>| PullPageV3 {
-        version: PULL_V3_VERSION,
+                resume: Option<Resume>| PullPage {
+        version: PULL_VERSION,
         epoch: epoch_hex.clone(),
         reset: false,
         floor: stream.floor,
@@ -234,7 +233,7 @@ pub fn build_pull_page_v3<S: MeshPullSocket + ?Sized>(
         head_seq: stream.head,
         store: None,
     };
-    let backfill_resume = |after_seq: u64| ResumeV3 {
+    let backfill_resume = |after_seq: u64| Resume {
         phase: PullPhase::Backfill,
         after_seq,
         origin: String::new(),
@@ -246,13 +245,13 @@ pub fn build_pull_page_v3<S: MeshPullSocket + ?Sized>(
     let mut budget = limit;
     let mut keyed = Vec::new();
     if !resume_backfill {
-        let (served, keyed_resume) = build_keyed_channel_v3(
+        let (served, keyed_resume) = build_keyed_channel(
             socket,
             &claims,
             resume_keyed,
             audit,
             budget,
-            V3_PAGE_BYTE_BUDGET,
+            PULL_PAGE_BYTE_BUDGET,
             None,
             &own,
         )?;
@@ -285,7 +284,7 @@ pub fn build_pull_page_v3<S: MeshPullSocket + ?Sized>(
             let encoded = BASE64.encode(&envelope);
             page_bytes += encoded.len();
             backfill.push((seq, encoded));
-            byte_cut = page_bytes >= V3_PAGE_BYTE_BUDGET;
+            byte_cut = page_bytes >= PULL_PAGE_BYTE_BUDGET;
         }
     }
     let resume = ((scanned_len == budget && budget > 0) || byte_cut)
@@ -296,16 +295,16 @@ pub fn build_pull_page_v3<S: MeshPullSocket + ?Sized>(
 /// Validate a presented compaction acknowledgment against `socket`'s current
 /// stream state and record it if valid, returning `Ok(Some(reset_page))` when
 /// the presented cursor requires a stream reset.
-pub fn admit_pull_ack_v3<S: MeshPullSocket + ?Sized>(
+pub fn admit_pull_ack<S: MeshPullSocket + ?Sized>(
     socket: &S,
     peer: &DeviceId,
-    request: &PullRequestV3,
-) -> Result<Option<PullPageV3>, S::Error> {
+    request: &PullRequest,
+) -> Result<Option<PullPage>, S::Error> {
     let request_epoch = decode_epoch(&request.relay_epoch)
         .ok_or_else(|| S::invalid_argument("invalid relay epoch"))?;
     let stream = socket.relay_stream_state()?;
-    if v3_needs_reset(request_epoch, request.relay_after, &stream) {
-        return Ok(Some(reset_pull_page_v3(&stream)));
+    if pull_needs_reset(request_epoch, request.relay_after, &stream) {
+        return Ok(Some(reset_pull_page(&stream)));
     }
     if request_epoch == [0u8; 32] {
         return Ok(None);
@@ -314,7 +313,7 @@ pub fn admit_pull_ack_v3<S: MeshPullSocket + ?Sized>(
     Ok(None)
 }
 
-/// Map a [`verify_pull_request_v3`] error string to the canonical HTTP status
+/// Map a [`verify_pull_request`] error string to the canonical HTTP status
 /// code (`400 Bad Request` for malformed payload or unsupported version,
 /// `403 Forbidden` for expired requests, `401 Unauthorized` otherwise).
 pub fn classify_pull_request_error(message: &str) -> StatusCode {
@@ -329,12 +328,12 @@ pub fn classify_pull_request_error(message: &str) -> StatusCode {
 
 /// Verify a signed v3 pull request envelope against `socket`'s key lookup,
 /// peer trust check, and coverage priming gate.
-pub fn authenticate_pull_request_v3<S: MeshPullSocket + ?Sized>(
+pub fn authenticate_pull_request<S: MeshPullSocket + ?Sized>(
     socket: &S,
     bytes: &[u8],
-) -> Result<(DeviceId, PullRequestV3), (StatusCode, String)> {
+) -> Result<(DeviceId, PullRequest), (StatusCode, String)> {
     let mut lookup_error: Option<String> = None;
-    let (peer, request) = verify_pull_request_v3(bytes, socket.now_ms(), |peer| {
+    let (peer, request) = verify_pull_request(bytes, socket.now_ms(), |peer| {
         match socket.lookup_peer_sec1(peer) {
             Ok(key) => Ok(key),
             Err(error) => {
@@ -375,8 +374,8 @@ pub fn authenticate_pull_request_v3<S: MeshPullSocket + ?Sized>(
 }
 
 /// Server-side handler contract for [`PULL_PATH`] (`POST /mesh/v3/pull`).
-pub trait PullV3Handler: Clone + Send + Sync + 'static {
-    /// Identity used to sign outgoing [`PullPageV3`] envelopes.
+pub trait PullHandler: Clone + Send + Sync + 'static {
+    /// Identity used to sign outgoing [`PullPage`] envelopes.
     fn identity(&self) -> &DeviceIdentity;
 
     /// Current Unix timestamp in milliseconds used to check request clock skew.
@@ -384,7 +383,7 @@ pub trait PullV3Handler: Clone + Send + Sync + 'static {
         unix_ms() as i64
     }
 
-    /// HLC timestamp stamped onto outgoing [`PullPageV3`] envelopes.
+    /// HLC timestamp stamped onto outgoing [`PullPage`] envelopes.
     fn response_hlc(&self) -> Hlc {
         Hlc((self.now_ms().max(0) as u64) << 16)
     }
@@ -409,25 +408,25 @@ pub trait PullV3Handler: Clone + Send + Sync + 'static {
     fn admit_pull_ack(
         &self,
         _peer: &DeviceId,
-        _request: &PullRequestV3,
-    ) -> impl Future<Output = Result<Option<PullPageV3>, String>> + Send {
+        _request: &PullRequest,
+    ) -> impl Future<Output = Result<Option<PullPage>, String>> + Send {
         async { Ok(None) }
     }
 
-    /// Construct the response [`PullPageV3`] for an authenticated request.
-    fn serve_pull_v3(&self, peer: &DeviceId, request: PullRequestV3) -> Result<PullPageV3, String>;
+    /// Construct the response [`PullPage`] for an authenticated request.
+    fn serve_pull(&self, peer: &DeviceId, request: PullRequest) -> Result<PullPage, String>;
 }
 
 /// Mount `POST /mesh/v3/pull` ([`PULL_PATH`]) backed by `handler`.
-pub fn v3_pull_router<H: PullV3Handler>(handler: H) -> axum::Router {
-    async fn post_pull_v3<H: PullV3Handler>(
+pub fn pull_router<H: PullHandler>(handler: H) -> axum::Router {
+    async fn post_pull<H: PullHandler>(
         State(handler): State<H>,
         body: axum::body::Bytes,
     ) -> Response {
         let now_ms = handler.now_ms();
         let mut lookup_error: Option<String> = None;
         let (peer, request) =
-            match verify_pull_request_v3(&body, now_ms, |id| match handler.lookup_peer_sec1(id) {
+            match verify_pull_request(&body, now_ms, |id| match handler.lookup_peer_sec1(id) {
                 Ok(key) => Ok(key),
                 Err(error) => {
                     lookup_error = Some(error.clone());
@@ -466,7 +465,7 @@ pub fn v3_pull_router<H: PullV3Handler>(handler: H) -> axum::Router {
         }
         let page = match handler.admit_pull_ack(&peer, &request).await {
             Ok(Some(reset)) => reset,
-            Ok(None) => match handler.serve_pull_v3(&peer, request) {
+            Ok(None) => match handler.serve_pull(&peer, request) {
                 Ok(page) => page,
                 Err(message) => {
                     return (StatusCode::INTERNAL_SERVER_ERROR, message).into_response();
@@ -474,7 +473,7 @@ pub fn v3_pull_router<H: PullV3Handler>(handler: H) -> axum::Router {
             },
             Err(message) => return (StatusCode::INTERNAL_SERVER_ERROR, message).into_response(),
         };
-        match seal_pull_page_v3(&page, handler.identity(), handler.response_hlc()) {
+        match seal_pull_page(&page, handler.identity(), handler.response_hlc()) {
             Ok(bytes) => (
                 StatusCode::OK,
                 [(header::CONTENT_TYPE, "application/octet-stream")],
@@ -486,12 +485,12 @@ pub fn v3_pull_router<H: PullV3Handler>(handler: H) -> axum::Router {
     }
 
     axum::Router::new()
-        .route(PULL_PATH, post(post_pull_v3::<H>))
-        .layer(DefaultBodyLimit::max(MAX_V3_REQUEST_BYTES))
+        .route(PULL_PATH, post(post_pull::<H>))
+        .layer(DefaultBodyLimit::max(MAX_PULL_REQUEST_BYTES))
         .with_state(handler)
 }
 
-impl<L: LogSource, D: DeviceBook> PullV3Handler for ServeState<L, D> {
+impl<L: LogSource, D: DeviceBook> PullHandler for ServeState<L, D> {
     fn identity(&self) -> &DeviceIdentity {
         &self.identity
     }
@@ -503,13 +502,13 @@ impl<L: LogSource, D: DeviceBook> PullV3Handler for ServeState<L, D> {
     fn admit_pull_ack(
         &self,
         peer: &DeviceId,
-        request: &PullRequestV3,
-    ) -> impl Future<Output = Result<Option<PullPageV3>, String>> + Send {
-        let result = admit_pull_ack_v3(self, peer, request);
+        request: &PullRequest,
+    ) -> impl Future<Output = Result<Option<PullPage>, String>> + Send {
+        let result = admit_pull_ack(self, peer, request);
         async move { result }
     }
 
-    fn serve_pull_v3(&self, peer: &DeviceId, request: PullRequestV3) -> Result<PullPageV3, String> {
-        build_pull_page_v3(self, peer, &request)
+    fn serve_pull(&self, peer: &DeviceId, request: PullRequest) -> Result<PullPage, String> {
+        build_pull_page(self, peer, &request)
     }
 }

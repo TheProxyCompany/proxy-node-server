@@ -241,11 +241,11 @@ mod serve {
 
     use proxy_node_server::{
         DeviceId, DeviceIdentity, DeviceRegistry, HeadPublisher, HttpPullSource, KvStore,
-        NodeClock, OpLog, OplogWriter, OrderKey, RelayCursorV2, RelayPageV2, ServeState,
+        NodeClock, OpLog, OplogWriter, OrderKey, RelayCursor, RelayPage, ServeState,
         TransportError, WATCH_DEFAULT_WAIT, WATCH_EMPTY_BACKOFF, learn_attested_devices,
         learn_devices, load_cursor, load_peer_keys, load_relay_caller_keys, load_relay_cursor,
         register_peer_with_key, relay_router, replay, replay_oplog_file, router, save_cursor,
-        save_peer_keys, save_relay_caller_keys, save_relay_cursor, sync_once, sync_relay_once_v2,
+        save_peer_keys, save_relay_caller_keys, save_relay_cursor, sync_once, sync_relay_once,
     };
 
     use super::{KEY_FILE, OPLOG_FILE, read_scalar};
@@ -263,7 +263,7 @@ mod serve {
         source: HttpPullSource,
         peer_id: DeviceId,
         peer_key: [u8; 33],
-        relay_cursor: RelayCursorV2,
+        relay_cursor: RelayCursor,
         legacy_cursor: OrderKey,
         poll_only_until: Option<Instant>,
     }
@@ -305,13 +305,13 @@ mod serve {
         links: &[Link],
         capable: &[usize],
         wait: Duration,
-    ) -> (usize, Result<RelayPageV2, TransportError>) {
+    ) -> (usize, Result<RelayPage, TransportError>) {
         let mut futures: Vec<_> = capable
             .iter()
             .map(|&i| {
                 (
                     i,
-                    Box::pin(links[i].source.watch_relay_head_v2(
+                    Box::pin(links[i].source.watch_relay_head(
                         identity,
                         links[i].peer_id,
                         &links[i].peer_key,
@@ -597,7 +597,7 @@ mod serve {
                         }
                     } else {
                         let before = link.relay_cursor;
-                        let result = sync_relay_once_v2(
+                        let result = sync_relay_once(
                             &link.source,
                             &identity,
                             link.peer_id,

@@ -19,10 +19,13 @@ pub mod net;
 pub mod oauth;
 pub mod op;
 pub mod pull;
-pub use pull as pull_v3;
 pub mod registry;
 pub mod row_op;
+#[cfg(feature = "sqlite")]
+pub mod sqlite;
 pub mod store;
+#[cfg(feature = "sqlite")]
+pub use sqlite::SqliteError;
 pub mod transport;
 
 pub use error::{DurabilityError, HlcError, IdentityError, NodeError, OpError, ReplayError};
@@ -36,17 +39,12 @@ pub use log::{
 pub use op::{ENVELOPE_VERSION, MAX_STORE_ID_LEN, OpBody, OpId, OrderKey, SignedOp, StoreId};
 pub use pull::{
     CoverageVector, MAX_PULL_REQUEST_BYTES, MAX_PULL_RESPONSE_BYTES, MAX_REQUEST_SKEW_MS,
-    MAX_V3_REQUEST_BYTES, MAX_V3_RESPONSE_BYTES, OriginHead, OriginHeadV3, PAGE_LIMIT_MAX,
-    PULL_PAGE_BYTE_BUDGET, PULL_PAGE_LIMIT_MAX, PULL_PAGE_STORE_ID, PULL_PATH,
-    PULL_PROTOCOL_VERSION, PULL_REQUEST_STORE_ID, PULL_RESPONSE_STORE_ID, PULL_V3_VERSION,
-    PullPage, PullPageV3, PullPhase, PullRequest, PullRequestV3, Resume, ResumeV3,
-    V3_PAGE_BYTE_BUDGET, V3_PAGE_LIMIT_MAX,
+    OriginHead, PAGE_LIMIT_MAX, PULL_PAGE_BYTE_BUDGET, PULL_PAGE_LIMIT_MAX, PULL_PAGE_STORE_ID,
+    PULL_PATH, PULL_REQUEST_STORE_ID, PULL_RESPONSE_STORE_ID, PULL_VERSION, PullPage, PullPhase,
+    PullRequest, Resume,
 };
 #[cfg(feature = "daemon")]
-pub use pull::{
-    seal_pull_page, seal_pull_page_v3, sign_pull_request, sign_pull_request_v3, verify_pull_page,
-    verify_pull_page_v3, verify_pull_request, verify_pull_request_v3,
-};
+pub use pull::{seal_pull_page, sign_pull_request, verify_pull_page, verify_pull_request};
 pub use registry::{DeviceBook, DeviceRegistry};
 pub use row_op::{
     Column, KeyField, Mutation, ORIGIN_LOCAL, ORIGIN_REMOTE, ProxyDbOp, RowOp, STORE_ID, Scalar,
@@ -62,25 +60,21 @@ pub use net::{
     ApplyMode, DEFAULT_MAX_PARKED_WATCHES, DEFAULT_PULL_LIMIT, DISCOVERY_RESCAN_INTERVAL,
     DeviceEntry, DevicesResp, HeadPublisher, HeadWatch, HttpPullSource, IdentityResp,
     MESH_AUDIT_ENV, MESH_PEERS_ENV, MeshPullHost, MeshPullSocket, NEWEST_FIRST_PREVIEW_GAP,
-    OpLogPullSocket, PULL_FALLBACK_INTERVAL, PullAdmission, PullHandler, PullOutcome, PullProgress,
-    PullResponse, PullStorage, PullV3Handler, REGISTER_RETRY_BACKOFF, RELAY_PROTOCOL_VERSION,
-    RelayCursor, RelayCursorV2, RelayOpV2, RelayPageV2, RelayResponse, RelayResponseV2,
-    RelaySyncOutcome, RelayWireEntry, RelayWireEntryV2, ServeState, TRELLIS_SWEEP_INTERVAL,
-    V3_NO_PROGRESS_LIMIT, V3Outcome, V3Progress, WATCH_DEFAULT_WAIT, WATCH_EMPTY_BACKOFF,
-    WATCH_MAX_WAIT, WATCH_REPROBE_INTERVAL, admit_pull_ack, admit_pull_ack_v3, apply_pull_page,
-    apply_pull_page_v3, authenticate_pull_request, authenticate_pull_request_v3,
-    build_keyed_channel, build_keyed_channel_v3, build_pull_page, build_pull_page_v3,
-    classify_pull_request_error, decode_epoch, decode_order_key, decode_page_op, drain_pull_pages,
-    drain_v3_pages, encode_order_key, encode_origin_rows, endpoint_has_confidential_transport,
-    inflated_claims, is_cgnat_ip, is_loopback_host, keyed_resume, learn_attested_devices,
-    learn_devices, load_cursor, load_peer_keys, load_relay_caller_keys, load_relay_cursor,
-    parse_mesh_peers, parse_mesh_peers_from, persist_pull_reset, persist_v3_reset,
-    preview_head_window, preview_head_window_v3, preview_resume_after, pull_http_client,
-    pull_needs_reset, pull_progress, pull_router, register_peer, register_peer_with_key,
-    relay_router, reset_pull_page, reset_pull_page_v3, router, save_cursor, save_peer_keys,
-    save_relay_caller_keys, save_relay_cursor, sweep_store, sweep_store_v3, sync_once,
-    sync_once_with, sync_relay_once, sync_relay_once_v2, unix_ms, v3_http_client, v3_needs_reset,
-    v3_progress, v3_pull_router, validate_pull_reset, validate_v3_reset,
+    OpLogPullSocket, PULL_FALLBACK_INTERVAL, PULL_NO_PROGRESS_LIMIT, PullAdmission, PullHandler,
+    PullOutcome, PullProgress, PullResponse, PullStorage, REGISTER_RETRY_BACKOFF,
+    RELAY_PROTOCOL_VERSION, RelayCursor, RelayOp, RelayPage, RelayResponse, RelaySyncOutcome,
+    RelayWireEntry, ServeState, TRELLIS_SWEEP_INTERVAL, WATCH_DEFAULT_WAIT, WATCH_EMPTY_BACKOFF,
+    WATCH_MAX_WAIT, WATCH_REPROBE_INTERVAL, admit_pull_ack, apply_pull_page,
+    authenticate_pull_request, build_keyed_channel, build_pull_page, classify_pull_request_error,
+    decode_epoch, decode_order_key, decode_page_op, drain_pull_pages, encode_order_key,
+    encode_origin_rows, endpoint_has_confidential_transport, inflated_claims, is_cgnat_ip,
+    is_loopback_host, keyed_resume, learn_attested_devices, learn_devices, load_cursor,
+    load_peer_keys, load_relay_caller_keys, load_relay_cursor, parse_mesh_peers,
+    parse_mesh_peers_from, persist_pull_reset, preview_head_window, preview_resume_after,
+    pull_http_client, pull_needs_reset, pull_progress, pull_router, register_peer,
+    register_peer_with_key, relay_router, reset_pull_page, router, save_cursor, save_peer_keys,
+    save_relay_caller_keys, save_relay_cursor, sweep_store, sync_once, sync_once_with,
+    sync_relay_once, unix_ms, validate_pull_reset,
 };
 #[cfg(feature = "pull-http")]
 pub use transport::PullSource;

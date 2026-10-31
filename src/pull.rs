@@ -32,19 +32,19 @@ use crate::op::{ENVELOPE_VERSION, OpBody, SignedOp, StoreId};
 #[cfg(feature = "pull-http")]
 pub use crate::net::{
     DISCOVERY_RESCAN_INTERVAL, MESH_AUDIT_ENV, MESH_PEERS_ENV, MeshPullHost, MeshPullSocket,
-    NEWEST_FIRST_PREVIEW_GAP, OpLogPullSocket, PULL_FALLBACK_INTERVAL, PullAdmission, PullStorage,
-    PullV3Handler, REGISTER_RETRY_BACKOFF, TRELLIS_SWEEP_INTERVAL, V3_NO_PROGRESS_LIMIT, V3Outcome,
-    V3Progress, WATCH_REPROBE_INTERVAL, admit_pull_ack_v3, apply_pull_page_v3,
-    authenticate_pull_request_v3, build_keyed_channel_v3, build_pull_page_v3,
-    classify_pull_request_error, decode_epoch, decode_order_key, decode_page_op, drain_v3_pages,
-    encode_origin_rows, endpoint_has_confidential_transport, inflated_claims, is_cgnat_ip,
-    is_loopback_host, keyed_resume, parse_mesh_peers, parse_mesh_peers_from, persist_v3_reset,
-    preview_head_window_v3, preview_resume_after, reset_pull_page_v3, sweep_store_v3, unix_ms,
-    v3_http_client, v3_needs_reset, v3_progress, v3_pull_router, validate_v3_reset,
+    NEWEST_FIRST_PREVIEW_GAP, OpLogPullSocket, PULL_FALLBACK_INTERVAL, PULL_NO_PROGRESS_LIMIT,
+    PullAdmission, PullHandler, PullOutcome, PullProgress, PullStorage, REGISTER_RETRY_BACKOFF,
+    TRELLIS_SWEEP_INTERVAL, WATCH_REPROBE_INTERVAL, admit_pull_ack, apply_pull_page,
+    authenticate_pull_request, build_keyed_channel, build_pull_page, classify_pull_request_error,
+    decode_epoch, decode_order_key, decode_page_op, drain_pull_pages, encode_origin_rows,
+    endpoint_has_confidential_transport, inflated_claims, is_cgnat_ip, is_loopback_host,
+    keyed_resume, parse_mesh_peers, parse_mesh_peers_from, persist_pull_reset, preview_head_window,
+    preview_resume_after, pull_http_client, pull_needs_reset, pull_progress, pull_router,
+    reset_pull_page, sweep_store, unix_ms, validate_pull_reset,
 };
 
 /// Wire version spoken on [`PULL_PATH`].
-pub const PULL_V3_VERSION: u8 = 1;
+pub const PULL_VERSION: u8 = 1;
 
 /// Route the v3 pull request posts to. Absence (404/405) is the mixed-fleet
 /// feature-detect: the link falls back to the v2 loop.
@@ -63,16 +63,16 @@ pub const PULL_RESPONSE_STORE_ID: &str = PULL_PAGE_STORE_ID;
 pub const PAGE_LIMIT_MAX: usize = 8192;
 
 /// Largest number of envelopes one v3 page carries across both channels.
-pub const V3_PAGE_LIMIT_MAX: u32 = PAGE_LIMIT_MAX as u32;
+pub const PULL_PAGE_LIMIT_MAX: u32 = PAGE_LIMIT_MAX as u32;
 
 /// Byte governor for one v3 page before cutting with a resume token.
-pub const V3_PAGE_BYTE_BUDGET: usize = 32 * 1024 * 1024;
+pub const PULL_PAGE_BYTE_BUDGET: usize = 32 * 1024 * 1024;
 
 /// Body cap for a v3 pull request.
-pub const MAX_V3_REQUEST_BYTES: usize = 256 * 1024;
+pub const MAX_PULL_REQUEST_BYTES: usize = 256 * 1024;
 
 /// Body cap for a v3 pull response page.
-pub const MAX_V3_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_PULL_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 
 /// Accepted clock skew on a signed pull request, matching the v2 tier.
 pub const MAX_REQUEST_SKEW_MS: i64 = 120_000;
@@ -90,7 +90,7 @@ pub enum PullPhase {
 /// Where the next page picks up. The server echoes it; the client returns it
 /// verbatim.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ResumeV3 {
+pub struct Resume {
     pub phase: PullPhase,
     /// Channel B position — meaningful in [`PullPhase::Backfill`].
     pub after_seq: u64,
@@ -103,12 +103,12 @@ pub struct ResumeV3 {
 
 /// One origin device's high-water mark in a puller's coverage vector.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct OriginHeadV3 {
+pub struct OriginHead {
     pub origin: DeviceId,
     pub head: OrderKey,
 }
 
-impl OriginHeadV3 {
+impl OriginHead {
     pub fn new(origin: DeviceId, head: OrderKey) -> Self {
         Self { origin, head }
     }
@@ -143,11 +143,11 @@ impl CoverageVector {
         self.0.get(&key.device).is_some_and(|claim| *key <= *claim)
     }
 
-    /// Encode this coverage vector into the wire map carried by [`PullRequestV3::coverage`].
+    /// Encode this coverage vector into the wire map carried by [`PullRequest::coverage`].
     pub fn to_wire_map(&self) -> BTreeMap<String, String> {
         self.0
             .iter()
-            .map(|(origin, head)| OriginHeadV3::new(*origin, *head).to_wire_pair())
+            .map(|(origin, head)| OriginHead::new(*origin, *head).to_wire_pair())
             .collect()
     }
 
@@ -155,7 +155,7 @@ impl CoverageVector {
     pub fn from_wire_map(wire: &BTreeMap<String, String>) -> Self {
         Self(
             wire.iter()
-                .filter_map(|(origin, key)| OriginHeadV3::from_wire_pair(origin, key))
+                .filter_map(|(origin, key)| OriginHead::from_wire_pair(origin, key))
                 .map(|entry| (entry.origin, entry.head))
                 .collect(),
         )
@@ -163,8 +163,8 @@ impl CoverageVector {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PullRequestV3 {
-    /// Protocol revision. Currently [`PULL_V3_VERSION`].
+pub struct PullRequest {
+    /// Protocol revision. Currently [`PULL_VERSION`].
     pub version: u8,
     /// The puller's claims: origin device hex -> [`OrderKey`] wire hex. An
     /// origin absent from the map claims nothing.
@@ -174,7 +174,7 @@ pub struct PullRequestV3 {
     /// The puller's durable v2 cursor sequence. Recorded server-side as this
     /// peer's compaction acknowledgment when the epoch matches.
     pub relay_after: u64,
-    pub resume: Option<ResumeV3>,
+    pub resume: Option<Resume>,
     pub limit: u32,
     /// Diagnostic: channel A ignores claims and re-serves each origin in full.
     pub audit: bool,
@@ -184,7 +184,7 @@ pub struct PullRequestV3 {
     pub issued_at_ms: i64,
 }
 
-impl PullRequestV3 {
+impl PullRequest {
     /// Decode well-formed `(origin, OrderKey)` claims, skipping malformed or
     /// mismatched entries.
     pub fn decode_coverage(&self) -> BTreeMap<DeviceId, OrderKey> {
@@ -193,7 +193,7 @@ impl PullRequestV3 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PullPageV3 {
+pub struct PullPage {
     pub version: u8,
     /// The server's current stream epoch, 32-byte hex.
     pub epoch: String,
@@ -216,7 +216,7 @@ pub struct PullPageV3 {
     #[serde(default)]
     pub head_seq: u64,
     /// `None` exactly when `complete`.
-    pub resume: Option<ResumeV3>,
+    pub resume: Option<Resume>,
     pub complete: bool,
     pub snapshot_recommended: bool,
     /// Echo of the request's `store` filter.
@@ -224,11 +224,11 @@ pub struct PullPageV3 {
     pub store: Option<String>,
 }
 
-/// Seal a [`PullRequestV3`] into a canonical [`SignedOp`] wire envelope under
+/// Seal a [`PullRequest`] into a canonical [`SignedOp`] wire envelope under
 /// [`PULL_REQUEST_STORE_ID`].
 #[cfg(feature = "daemon")]
-pub fn sign_pull_request_v3(
-    request: &PullRequestV3,
+pub fn sign_pull_request(
+    request: &PullRequest,
     identity: &DeviceIdentity,
     hlc: Hlc,
 ) -> Result<Vec<u8>, String> {
@@ -250,14 +250,14 @@ pub fn sign_pull_request_v3(
         .map_err(|error| format!("encode pull v3 request envelope: {error}"))
 }
 
-/// Verify a signed [`PullRequestV3`] envelope against the requester's stored
+/// Verify a signed [`PullRequest`] envelope against the requester's stored
 /// SEC1 public key and clock-skew bound.
 #[cfg(feature = "daemon")]
-pub fn verify_pull_request_v3<F>(
+pub fn verify_pull_request<F>(
     bytes: &[u8],
     now_ms: i64,
     lookup_sec1: F,
-) -> Result<(DeviceId, PullRequestV3), String>
+) -> Result<(DeviceId, PullRequest), String>
 where
     F: FnOnce(&DeviceId) -> Result<Option<[u8; 33]>, String>,
 {
@@ -279,9 +279,9 @@ where
             OpError::DeviceMismatch => "Stored mesh key does not derive the signer".to_string(),
             other => format!("Invalid pull signature: {other}"),
         })?;
-    let request: PullRequestV3 = serde_json::from_slice(&op.body.payload)
+    let request: PullRequest = serde_json::from_slice(&op.body.payload)
         .map_err(|error| format!("Invalid payload: {error}"))?;
-    if request.version != PULL_V3_VERSION {
+    if request.version != PULL_VERSION {
         return Err("Unsupported pull protocol version".to_string());
     }
     let skew = i128::from(now_ms) - i128::from(request.issued_at_ms);
@@ -291,11 +291,11 @@ where
     Ok((peer, request))
 }
 
-/// Seal a [`PullPageV3`] into a canonical [`SignedOp`] wire envelope under
+/// Seal a [`PullPage`] into a canonical [`SignedOp`] wire envelope under
 /// [`PULL_PAGE_STORE_ID`].
 #[cfg(feature = "daemon")]
-pub fn seal_pull_page_v3(
-    page: &PullPageV3,
+pub fn seal_pull_page(
+    page: &PullPage,
     identity: &DeviceIdentity,
     hlc: Hlc,
 ) -> Result<Vec<u8>, String> {
@@ -316,14 +316,14 @@ pub fn seal_pull_page_v3(
         .map_err(|error| format!("encode pull page envelope: {error}"))
 }
 
-/// Verify that a signed [`PullPageV3`] envelope came from `peer` under its
+/// Verify that a signed [`PullPage`] envelope came from `peer` under its
 /// pinned compressed SEC1 key and respects protocol version and entry caps.
 #[cfg(feature = "daemon")]
-pub fn verify_pull_page_v3(
+pub fn verify_pull_page(
     bytes: &[u8],
     peer: &DeviceId,
     peer_key: &[u8; 33],
-) -> Result<PullPageV3, String> {
+) -> Result<PullPage, String> {
     let op = SignedOp::from_bytes(bytes)
         .map_err(|error| format!("invalid v3 pull page envelope: {error}"))?;
     if op.body.store.as_str() != PULL_PAGE_STORE_ID {
@@ -341,9 +341,9 @@ pub fn verify_pull_page_v3(
         OpError::DeviceMismatch => "pinned peer key does not derive the peer".to_string(),
         other => format!("invalid v3 pull page signature: {other}"),
     })?;
-    let page: PullPageV3 = serde_json::from_slice(&op.body.payload)
+    let page: PullPage = serde_json::from_slice(&op.body.payload)
         .map_err(|error| format!("decode v3 pull page: {error}"))?;
-    if page.version != PULL_V3_VERSION {
+    if page.version != PULL_VERSION {
         return Err("unsupported v3 pull page version".to_string());
     }
     if page.backfill.len() > PAGE_LIMIT_MAX || page.keyed.len() > PAGE_LIMIT_MAX {
@@ -366,21 +366,21 @@ mod tests {
             device: client.device_id(),
             op_id: OpId::from_bytes([0x11; 32]),
         };
-        let (origin_hex, head_hex) = OriginHeadV3::new(client.device_id(), head).to_wire_pair();
-        let request = PullRequestV3 {
-            version: PULL_V3_VERSION,
+        let (origin_hex, head_hex) = OriginHead::new(client.device_id(), head).to_wire_pair();
+        let request = PullRequest {
+            version: PULL_VERSION,
             coverage: BTreeMap::from([(origin_hex, head_hex)]),
             relay_epoch: "00".repeat(32),
             relay_after: 7,
             resume: None,
-            limit: V3_PAGE_LIMIT_MAX,
+            limit: PULL_PAGE_LIMIT_MAX,
             audit: false,
             store: Some("trellis".to_string()),
             issued_at_ms: 1_000_000,
         };
-        let request_bytes = sign_pull_request_v3(&request, &client, Hlc(10)).unwrap();
+        let request_bytes = sign_pull_request(&request, &client, Hlc(10)).unwrap();
         let (verified_peer, verified_request) =
-            verify_pull_request_v3(&request_bytes, 1_000_500, |peer| {
+            verify_pull_request(&request_bytes, 1_000_500, |peer| {
                 Ok((*peer == client.device_id()).then(|| client.public_key_sec1()))
             })
             .unwrap();
@@ -392,13 +392,13 @@ mod tests {
         );
 
         let expired =
-            verify_pull_request_v3(&request_bytes, 1_000_000 + MAX_REQUEST_SKEW_MS + 1, |_| {
+            verify_pull_request(&request_bytes, 1_000_000 + MAX_REQUEST_SKEW_MS + 1, |_| {
                 Ok(Some(client.public_key_sec1()))
             });
         assert!(expired.is_err());
 
-        let page = PullPageV3 {
-            version: PULL_V3_VERSION,
+        let page = PullPage {
+            version: PULL_VERSION,
             epoch: "aa".repeat(32),
             reset: false,
             floor: 0,
@@ -406,7 +406,7 @@ mod tests {
             keyed: vec!["YmFy".to_string()],
             next_relay_seq: 1,
             head_seq: 5,
-            resume: Some(ResumeV3 {
+            resume: Some(Resume {
                 phase: PullPhase::Keyed,
                 after_seq: 0,
                 origin: client.device_id().to_hex(),
@@ -416,24 +416,23 @@ mod tests {
             snapshot_recommended: false,
             store: Some("trellis".to_string()),
         };
-        let page_bytes = seal_pull_page_v3(&page, &server, Hlc(20)).unwrap();
+        let page_bytes = seal_pull_page(&page, &server, Hlc(20)).unwrap();
         let verified_page =
-            verify_pull_page_v3(&page_bytes, &server.device_id(), &server.public_key_sec1())
-                .unwrap();
+            verify_pull_page(&page_bytes, &server.device_id(), &server.public_key_sec1()).unwrap();
         assert_eq!(verified_page, page);
 
         let wrong_peer =
-            verify_pull_page_v3(&page_bytes, &client.device_id(), &client.public_key_sec1());
+            verify_pull_page(&page_bytes, &client.device_id(), &client.public_key_sec1());
         assert!(wrong_peer.is_err());
 
         let mismatched_key =
-            verify_pull_page_v3(&page_bytes, &server.device_id(), &client.public_key_sec1());
+            verify_pull_page(&page_bytes, &server.device_id(), &client.public_key_sec1());
         assert_eq!(
             mismatched_key.unwrap_err(),
             "pinned peer key does not derive the peer"
         );
 
-        let mismatched_request_key = verify_pull_request_v3(&request_bytes, 1_000_500, |_| {
+        let mismatched_request_key = verify_pull_request(&request_bytes, 1_000_500, |_| {
             Ok(Some(server.public_key_sec1()))
         });
         assert_eq!(
@@ -441,7 +440,7 @@ mod tests {
             "Stored mesh key does not derive the signer"
         );
 
-        let cross_domain = verify_pull_page_v3(
+        let cross_domain = verify_pull_page(
             &request_bytes,
             &client.device_id(),
             &client.public_key_sec1(),
@@ -452,21 +451,3 @@ mod tests {
         );
     }
 }
-
-// Unversioned canonical type aliases and function re-exports.
-pub type PullRequest = PullRequestV3;
-pub type PullPage = PullPageV3;
-pub type Resume = ResumeV3;
-pub type OriginHead = OriginHeadV3;
-
-pub const PULL_PROTOCOL_VERSION: u8 = PULL_V3_VERSION;
-pub const MAX_PULL_REQUEST_BYTES: usize = MAX_V3_REQUEST_BYTES;
-pub const MAX_PULL_RESPONSE_BYTES: usize = MAX_V3_RESPONSE_BYTES;
-pub const PULL_PAGE_BYTE_BUDGET: usize = V3_PAGE_BYTE_BUDGET;
-pub const PULL_PAGE_LIMIT_MAX: u32 = V3_PAGE_LIMIT_MAX;
-
-#[cfg(feature = "daemon")]
-pub use self::{
-    seal_pull_page_v3 as seal_pull_page, sign_pull_request_v3 as sign_pull_request,
-    verify_pull_page_v3 as verify_pull_page, verify_pull_request_v3 as verify_pull_request,
-};

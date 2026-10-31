@@ -9,16 +9,16 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 
 use super::client::HttpPullSource;
-use super::pull_server::v3_needs_reset;
+use super::pull_server::pull_needs_reset;
 use super::socket::{MeshPullSocket, PullAdmission};
-use super::{RelayCursorV2, decode_fixed_hex};
+use super::{RelayCursor, decode_fixed_hex};
 use crate::error::TransportError;
 use crate::hlc::Hlc;
 use crate::identity::{DeviceId, DeviceIdentity, encode_hex};
 use crate::op::{OpId, OrderKey, SignedOp};
 use crate::pull::{
-    PULL_V3_VERSION, PullPageV3, PullPhase, PullRequestV3, ResumeV3, V3_PAGE_LIMIT_MAX,
-    sign_pull_request_v3, verify_pull_page_v3,
+    PULL_PAGE_LIMIT_MAX, PULL_VERSION, PullPage, PullPhase, PullRequest, Resume, sign_pull_request,
+    verify_pull_page,
 };
 
 /// Poll-only fallback interval for a peer whose `/watch` errored.
@@ -34,21 +34,21 @@ pub const WATCH_REPROBE_INTERVAL: Duration = Duration::from_secs(60);
 pub const DISCOVERY_RESCAN_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Arrival gap beyond which a v3 drain runs a newest-first preview of the head window.
-pub const NEWEST_FIRST_PREVIEW_GAP: u64 = V3_PAGE_LIMIT_MAX as u64;
+pub const NEWEST_FIRST_PREVIEW_GAP: u64 = PULL_PAGE_LIMIT_MAX as u64;
 
 /// Consecutive non-advancing v3 pages before failing the exchange.
-pub const V3_NO_PROGRESS_LIMIT: u32 = 2;
+pub const PULL_NO_PROGRESS_LIMIT: u32 = 2;
 
 /// Interval between claim-ignoring store sweeps on each link.
 pub const TRELLIS_SWEEP_INTERVAL: Duration = Duration::from_secs(600);
 
 /// Durable backbone position plus resume token compared between pages to
 /// detect a non-advancing exchange.
-pub type V3Progress = (u64, Option<(u8, u64, String, String)>);
+pub type PullProgress = (u64, Option<(u8, u64, String, String)>);
 
 /// What one v3 drain did, beyond the ops it applied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum V3Outcome {
+pub enum PullOutcome {
     Applied(usize),
     Unsupported,
     Warming,
@@ -73,13 +73,13 @@ pub fn decode_order_key(hex: &str) -> Option<OrderKey> {
 }
 
 /// Compute the starting sequence for a newest-first head-window preview.
-/// Re-anchors at `head_seq - V3_PAGE_LIMIT_MAX` whenever `previous` is absent
+/// Re-anchors at `head_seq - PULL_PAGE_LIMIT_MAX` whenever `previous` is absent
 /// or fell more than one full page behind `head_seq`.
 pub fn preview_resume_after(previous: Option<u64>, head_seq: u64) -> u64 {
-    let window_start = head_seq.saturating_sub(u64::from(V3_PAGE_LIMIT_MAX));
+    let window_start = head_seq.saturating_sub(u64::from(PULL_PAGE_LIMIT_MAX));
     previous
         .filter(|after| {
-            *after <= head_seq && head_seq.saturating_sub(*after) <= u64::from(V3_PAGE_LIMIT_MAX)
+            *after <= head_seq && head_seq.saturating_sub(*after) <= u64::from(PULL_PAGE_LIMIT_MAX)
         })
         .unwrap_or(window_start)
 }
@@ -101,7 +101,7 @@ pub fn inflated_claims<I: IntoIterator<Item = DeviceId>>(origins: I) -> BTreeMap
 }
 
 /// Compute the progress tuple for stall detection across paged v3 responses.
-pub fn v3_progress(relay_cursor: Option<RelayCursorV2>, resume: Option<&ResumeV3>) -> V3Progress {
+pub fn pull_progress(relay_cursor: Option<RelayCursor>, resume: Option<&Resume>) -> PullProgress {
     (
         relay_cursor.map(|cursor| cursor.after).unwrap_or(0),
         resume.map(|resume| {
@@ -120,7 +120,7 @@ pub fn v3_progress(relay_cursor: Option<RelayCursorV2>, resume: Option<&ResumeV3
 
 /// Build a `reqwest::Client` configured for v3 page exchanges (5s connect
 /// timeout, 60s request timeout, no redirects).
-pub fn v3_http_client() -> reqwest::Client {
+pub fn pull_http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(60))
@@ -129,7 +129,7 @@ pub fn v3_http_client() -> reqwest::Client {
         .unwrap_or_default()
 }
 
-/// Base64-decode and deserialize one [`SignedOp`] entry from a [`PullPageV3`].
+/// Base64-decode and deserialize one [`SignedOp`] entry from a [`PullPage`].
 pub fn decode_page_op(encoded: &str, peer: &DeviceId) -> Result<SignedOp, String> {
     let bytes = BASE64.decode(encoded).map_err(|error| {
         format!(
@@ -145,13 +145,13 @@ pub fn decode_page_op(encoded: &str, peer: &DeviceId) -> Result<SignedOp, String
     })
 }
 
-/// Validate a reset [`PullPageV3`] against the [`PullRequestV3`] that elicited
-/// it, returning the new [`RelayCursorV2`] `(response_epoch, page.floor)`.
-pub fn validate_v3_reset(
-    request: &PullRequestV3,
-    page: &PullPageV3,
+/// Validate a reset [`PullPage`] against the [`PullRequest`] that elicited
+/// it, returning the new [`RelayCursor`] `(response_epoch, page.floor)`.
+pub fn validate_pull_reset(
+    request: &PullRequest,
+    page: &PullPage,
     response_epoch: [u8; 32],
-) -> Result<RelayCursorV2, String> {
+) -> Result<RelayCursor, String> {
     if !page.reset {
         return Err("invalid v3 reset: response was not marked as a reset".to_string());
     }
@@ -181,49 +181,49 @@ pub fn validate_v3_reset(
         head: page.head_seq,
         floor: page.floor,
     };
-    if !v3_needs_reset(request_epoch, request.relay_after, &response_state) {
+    if !pull_needs_reset(request_epoch, request.relay_after, &response_state) {
         return Err(
             "invalid v3 reset: signed stream state does not invalidate the requested cursor"
                 .to_string(),
         );
     }
 
-    Ok(RelayCursorV2 {
+    Ok(RelayCursor {
         epoch: response_epoch,
         after: page.floor,
     })
 }
 
 /// Validate a v3 reset response and commit the replacement cursor through `socket`.
-pub async fn persist_v3_reset<S>(
+pub async fn persist_pull_reset<S>(
     socket: &S,
     peer: &DeviceId,
-    request: &PullRequestV3,
-    page: &PullPageV3,
+    request: &PullRequest,
+    page: &PullPage,
     response_epoch: [u8; 32],
-) -> Result<RelayCursorV2, S::Error>
+) -> Result<RelayCursor, S::Error>
 where
     S: MeshPullSocket + Sync + ?Sized,
 {
-    let reset = validate_v3_reset(request, page, response_epoch).map_err(|msg| {
+    let reset = validate_pull_reset(request, page, response_epoch).map_err(|msg| {
         if msg == "invalid relay epoch" {
             S::invalid_argument(msg)
         } else {
             S::protocol_error(msg)
         }
     })?;
-    socket.commit_v3_reset(peer, reset).await?;
+    socket.commit_pull_reset(peer, reset).await?;
     Ok(reset)
 }
 
-/// Apply one verified [`PullPageV3`] through `socket`. Channel B advances the
+/// Apply one verified [`PullPage`] through `socket`. Channel B advances the
 /// durable relay cursor and folds `next_relay_seq`; Channel A advances one
 /// coverage claim per origin run over its claim-safe prefix.
-pub async fn apply_pull_page_v3<S>(
+pub async fn apply_pull_page<S>(
     socket: &S,
     peer: &DeviceId,
-    cursor: &mut Option<RelayCursorV2>,
-    page: &PullPageV3,
+    cursor: &mut Option<RelayCursor>,
+    page: &PullPage,
     skip_unattested: bool,
 ) -> Result<usize, S::Error>
 where
@@ -239,7 +239,7 @@ where
                 peer.to_hex()
             )));
         }
-        None => RelayCursorV2 { epoch, after: 0 },
+        None => RelayCursor { epoch, after: 0 },
     };
     socket.commit_relay_cursor(peer, current).await?;
     *cursor = Some(current);
@@ -286,7 +286,7 @@ where
         return Err(error);
     }
 
-    let next_cursor = RelayCursorV2 {
+    let next_cursor = RelayCursor {
         epoch: current.epoch,
         after: current.after.max(page.next_relay_seq),
     };
@@ -350,36 +350,36 @@ where
 
 /// Fetch `peer`'s arrival stream after `after_seq` with inflated claims and
 /// apply it through `socket` without advancing any durable cursor or claim.
-pub async fn preview_head_window_v3<S>(
+pub async fn preview_head_window<S>(
     socket: &S,
     source: &HttpPullSource,
     peer: &DeviceId,
     peer_sec1: &[u8; 33],
-    relay_cursor: Option<RelayCursorV2>,
+    relay_cursor: Option<RelayCursor>,
     after_seq: u64,
 ) -> Result<(usize, u64), S::Error>
 where
     S: MeshPullSocket + Sync + ?Sized,
 {
     let origins = socket.known_origins()?;
-    let request = PullRequestV3 {
-        version: PULL_V3_VERSION,
+    let request = PullRequest {
+        version: PULL_VERSION,
         coverage: inflated_claims(origins),
         relay_epoch: encode_hex(&relay_cursor.map(|c| c.epoch).unwrap_or([0u8; 32])),
         relay_after: relay_cursor.map(|c| c.after).unwrap_or(0),
-        resume: Some(ResumeV3 {
+        resume: Some(Resume {
             phase: PullPhase::Backfill,
             after_seq,
             origin: String::new(),
             after_key: String::new(),
         }),
-        limit: V3_PAGE_LIMIT_MAX,
+        limit: PULL_PAGE_LIMIT_MAX,
         audit: false,
         store: None,
         issued_at_ms: socket.now_ms(),
     };
     let page = source
-        .pull_v3(
+        .pull(
             &request,
             socket.local_identity(),
             socket.next_hlc(),
@@ -412,35 +412,35 @@ where
 
 /// Page `peer`'s entire slice of `store` with claims ignored and apply it
 /// through `socket` without advancing durable cursors or claims.
-pub async fn sweep_store_v3<S>(
+pub async fn sweep_store<S>(
     socket: &S,
     source: &HttpPullSource,
     peer: &DeviceId,
     peer_sec1: &[u8; 33],
-    relay_cursor: Option<RelayCursorV2>,
+    relay_cursor: Option<RelayCursor>,
     store: &str,
 ) -> Result<usize, S::Error>
 where
     S: MeshPullSocket + Sync + ?Sized,
 {
     let mut applied = 0usize;
-    let mut resume: Option<ResumeV3> = None;
+    let mut resume: Option<Resume> = None;
     let mut last_resume: Option<(String, String)> = None;
     loop {
-        let request = PullRequestV3 {
-            version: PULL_V3_VERSION,
+        let request = PullRequest {
+            version: PULL_VERSION,
             coverage: BTreeMap::new(),
             relay_epoch: encode_hex(&relay_cursor.map(|c| c.epoch).unwrap_or([0u8; 32])),
             relay_after: relay_cursor.map(|c| c.after).unwrap_or(0),
             resume: resume.clone(),
-            limit: V3_PAGE_LIMIT_MAX,
+            limit: PULL_PAGE_LIMIT_MAX,
             audit: true,
             store: Some(store.to_string()),
             issued_at_ms: socket.now_ms(),
         };
-        let envelope = sign_pull_request_v3(&request, socket.local_identity(), socket.next_hlc())
+        let envelope = sign_pull_request(&request, socket.local_identity(), socket.next_hlc())
             .map_err(S::protocol_error)?;
-        let (status, bytes) = source.pull_v3_bytes(envelope).await.map_err(|error| {
+        let (status, bytes) = source.pull_bytes(envelope).await.map_err(|error| {
             S::protocol_error(format!(
                 "v3 store sweep from peer {}: {error}",
                 peer.to_hex()
@@ -455,7 +455,7 @@ where
                 peer.to_hex()
             )));
         }
-        let page = verify_pull_page_v3(&bytes, peer, peer_sec1).map_err(S::protocol_error)?;
+        let page = verify_pull_page(&bytes, peer, peer_sec1).map_err(S::protocol_error)?;
         if page.store.as_deref() != Some(store) {
             return Ok(applied);
         }
@@ -492,25 +492,25 @@ where
 /// Execute a complete v3 multi-page drain against `source` using `socket` for
 /// coverage reads, op admission, cursor persistence, and head-window previews.
 #[allow(clippy::too_many_arguments)]
-pub async fn drain_v3_pages<S>(
+pub async fn drain_pull_pages<S>(
     socket: &S,
     source: &HttpPullSource,
     peer: &DeviceId,
     peer_sec1: &[u8; 33],
-    relay_cursor: &mut Option<RelayCursorV2>,
+    relay_cursor: &mut Option<RelayCursor>,
     audit: bool,
     skip_unattested: bool,
-) -> Result<V3Outcome, S::Error>
+) -> Result<PullOutcome, S::Error>
 where
     S: MeshPullSocket + Sync + ?Sized,
 {
     let mut total = 0usize;
-    let mut resume: Option<ResumeV3> = None;
+    let mut resume: Option<Resume> = None;
     let mut reset_seen = false;
     let mut recommendation_overridden = false;
     let mut pages = 0u64;
     let mut stalled = 0u32;
-    let mut last_progress: Option<V3Progress> = None;
+    let mut last_progress: Option<PullProgress> = None;
     let mut last_preview: Option<Instant> = None;
     let mut preview_after: Option<u64> = None;
     let preview_due =
@@ -518,28 +518,28 @@ where
 
     loop {
         let coverage = socket.local_coverage()?;
-        let request = PullRequestV3 {
-            version: PULL_V3_VERSION,
+        let request = PullRequest {
+            version: PULL_VERSION,
             coverage: coverage.to_wire_map(),
             relay_epoch: encode_hex(&relay_cursor.map(|c| c.epoch).unwrap_or([0u8; 32])),
             relay_after: relay_cursor.map(|c| c.after).unwrap_or(0),
             resume: resume.clone(),
-            limit: V3_PAGE_LIMIT_MAX,
+            limit: PULL_PAGE_LIMIT_MAX,
             audit,
             store: None,
             issued_at_ms: socket.now_ms(),
         };
         let resumed = request.resume.is_some();
-        let envelope = sign_pull_request_v3(&request, socket.local_identity(), socket.next_hlc())
+        let envelope = sign_pull_request(&request, socket.local_identity(), socket.next_hlc())
             .map_err(S::protocol_error)?;
-        let (status, bytes) = source.pull_v3_bytes(envelope).await.map_err(|error| {
+        let (status, bytes) = source.pull_bytes(envelope).await.map_err(|error| {
             S::protocol_error(format!("v3 pull from peer {}: {error}", peer.to_hex()))
         })?;
         if status == 404 || status == 405 {
-            return Ok(V3Outcome::Unsupported);
+            return Ok(PullOutcome::Unsupported);
         }
         if status == 503 {
-            return Ok(V3Outcome::Warming);
+            return Ok(PullOutcome::Warming);
         }
         if !(200..300).contains(&status) {
             return Err(S::protocol_error(format!(
@@ -548,7 +548,7 @@ where
                 String::from_utf8_lossy(&bytes).trim()
             )));
         }
-        let page = verify_pull_page_v3(&bytes, peer, peer_sec1).map_err(S::protocol_error)?;
+        let page = verify_pull_page(&bytes, peer, peer_sec1).map_err(S::protocol_error)?;
         let epoch = decode_epoch(&page.epoch).ok_or_else(|| {
             S::protocol_error(format!(
                 "v3 pull peer={} returned an invalid stream epoch",
@@ -567,20 +567,14 @@ where
             if preview_due(&last_preview) && page.head_seq > 0 {
                 last_preview = Some(Instant::now());
                 let after_seq = preview_resume_after(preview_after, page.head_seq);
-                if let Ok((_applied, next_seq)) = preview_head_window_v3(
-                    socket,
-                    source,
-                    peer,
-                    peer_sec1,
-                    *relay_cursor,
-                    after_seq,
-                )
-                .await
+                if let Ok((_applied, next_seq)) =
+                    preview_head_window(socket, source, peer, peer_sec1, *relay_cursor, after_seq)
+                        .await
                 {
                     preview_after = Some(next_seq);
                 }
             }
-            resume = Some(ResumeV3 {
+            resume = Some(Resume {
                 phase: PullPhase::Backfill,
                 after_seq: relay_cursor.map(|c| c.after).unwrap_or(0),
                 origin: String::new(),
@@ -596,15 +590,15 @@ where
                 )));
             }
             reset_seen = true;
-            let reset = persist_v3_reset(socket, peer, &request, &page, epoch).await?;
+            let reset = persist_pull_reset(socket, peer, &request, &page, epoch).await?;
             *relay_cursor = Some(reset);
             resume = None;
             continue;
         }
 
-        total += apply_pull_page_v3(socket, peer, relay_cursor, &page, skip_unattested).await?;
+        total += apply_pull_page(socket, peer, relay_cursor, &page, skip_unattested).await?;
         pages += 1;
-        socket.on_v3_page_applied(peer, &page, pages, total);
+        socket.on_pull_page_applied(peer, &page, pages, total);
 
         if preview_due(&last_preview) && !page.complete {
             last_preview = Some(Instant::now());
@@ -613,15 +607,9 @@ where
                 .saturating_sub(relay_cursor.map(|c| c.after).unwrap_or(0));
             if behind > NEWEST_FIRST_PREVIEW_GAP {
                 let after_seq = preview_resume_after(preview_after, page.head_seq);
-                if let Ok((_applied, next_seq)) = preview_head_window_v3(
-                    socket,
-                    source,
-                    peer,
-                    peer_sec1,
-                    *relay_cursor,
-                    after_seq,
-                )
-                .await
+                if let Ok((_applied, next_seq)) =
+                    preview_head_window(socket, source, peer, peer_sec1, *relay_cursor, after_seq)
+                        .await
                 {
                     preview_after = Some(next_seq);
                 }
@@ -630,17 +618,17 @@ where
 
         if page.complete {
             if !resumed {
-                return Ok(V3Outcome::Applied(total));
+                return Ok(PullOutcome::Applied(total));
             }
             resume = None;
             continue;
         }
         resume = page.resume;
 
-        let progress = v3_progress(*relay_cursor, resume.as_ref());
+        let progress = pull_progress(*relay_cursor, resume.as_ref());
         if last_progress.as_ref() == Some(&progress) {
             stalled += 1;
-            if stalled >= V3_NO_PROGRESS_LIMIT {
+            if stalled >= PULL_NO_PROGRESS_LIMIT {
                 return Err(S::protocol_error(format!(
                     "v3 pull peer={} returned {stalled} pages without advancing",
                     peer.to_hex()
@@ -655,26 +643,26 @@ where
 
 impl HttpPullSource {
     /// Seal `request` under `local_identity` at `hlc`, POST it to [`crate::pull::PULL_PATH`],
-    /// and verify the returned [`PullPageV3`] envelope against `expected_peer`
+    /// and verify the returned [`PullPage`] envelope against `expected_peer`
     /// and `expected_peer_key`.
-    pub async fn pull_v3(
+    pub async fn pull(
         &self,
-        request: &PullRequestV3,
+        request: &PullRequest,
         local_identity: &DeviceIdentity,
         hlc: Hlc,
         expected_peer: &DeviceId,
         expected_peer_key: &[u8; 33],
-    ) -> Result<PullPageV3, TransportError> {
+    ) -> Result<PullPage, TransportError> {
         let signed_request =
-            sign_pull_request_v3(request, local_identity, hlc).map_err(TransportError::Wire)?;
-        let (status, body) = self.pull_v3_bytes(signed_request).await?;
+            sign_pull_request(request, local_identity, hlc).map_err(TransportError::Wire)?;
+        let (status, body) = self.pull_bytes(signed_request).await?;
         if matches!(status, 404 | 405 | 501) {
-            return Err(TransportError::RelayV2Unsupported { status });
+            return Err(TransportError::RelayRelayUnsupported { status });
         }
         if !(200..300).contains(&status) {
             return Err(TransportError::Http(format!("status {status}")));
         }
-        verify_pull_page_v3(&body, expected_peer, expected_peer_key).map_err(|reason| {
+        verify_pull_page(&body, expected_peer, expected_peer_key).map_err(|reason| {
             TransportError::Verify {
                 device: expected_peer.to_hex(),
                 reason,

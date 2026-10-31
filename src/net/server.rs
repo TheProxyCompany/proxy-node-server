@@ -93,9 +93,9 @@ pub fn router<L: LogSource, D: DeviceBook>(state: ServeState<L, D>) -> Router {
         .route("/ops", get(get_ops::<L, D>))
         .route("/head", get(get_head::<L, D>))
         .route("/watch", get(get_watch::<L, D>))
-        .route("/v2/ops", get(get_relay_ops_v2::<L, D>))
-        .route("/v2/head", get(get_relay_head_v2::<L, D>))
-        .route("/v2/watch", get(get_relay_watch_v2::<L, D>))
+        .route("/v2/ops", get(get_relay_ops::<L, D>))
+        .route("/v2/head", get(get_relay_head::<L, D>))
+        .route("/v2/watch", get(get_relay_watch::<L, D>))
         .route("/devices", get(get_devices::<L, D>))
         .with_state(state)
 }
@@ -105,9 +105,9 @@ pub fn router<L: LogSource, D: DeviceBook>(state: ServeState<L, D>) -> Router {
 pub fn relay_router<L: LogSource, D: DeviceBook>(state: ServeState<L, D>) -> Router {
     Router::new()
         .route("/identity", get(get_identity::<L, D>))
-        .route("/v2/ops", get(get_relay_ops_v2::<L, D>))
-        .route("/v2/head", get(get_relay_head_v2::<L, D>))
-        .route("/v2/watch", get(get_relay_watch_v2::<L, D>))
+        .route("/v2/ops", get(get_relay_ops::<L, D>))
+        .route("/v2/head", get(get_relay_head::<L, D>))
+        .route("/v2/watch", get(get_relay_watch::<L, D>))
         .route("/devices", get(get_devices::<L, D>))
         .with_state(state)
 }
@@ -210,28 +210,28 @@ async fn get_watch<L: LogSource, D: DeviceBook>(
 }
 
 #[derive(Deserialize)]
-struct RelayBaseQueryV2 {
+struct RelayBaseQueryRelay {
     epoch: String,
     after: u64,
 }
 
 #[derive(Deserialize)]
-struct RelayOpsQueryV2 {
+struct RelayOpsQueryRelay {
     epoch: String,
     after: u64,
     limit: u16,
 }
 
 #[derive(Deserialize)]
-struct RelayWatchQueryV2 {
+struct RelayWatchQueryRelay {
     epoch: String,
     after: u64,
     wait: u64,
 }
 
-async fn get_relay_ops_v2<L: LogSource, D: DeviceBook>(
+async fn get_relay_ops<L: LogSource, D: DeviceBook>(
     State(state): State<ServeState<L, D>>,
-    Query(query): Query<RelayOpsQueryV2>,
+    Query(query): Query<RelayOpsQueryRelay>,
     headers: HeaderMap,
 ) -> Response {
     if query.limit == 0 || query.limit > DEFAULT_PULL_LIMIT {
@@ -328,9 +328,9 @@ async fn get_relay_ops_v2<L: LogSource, D: DeviceBook>(
     )
 }
 
-async fn get_relay_head_v2<L: LogSource, D: DeviceBook>(
+async fn get_relay_head<L: LogSource, D: DeviceBook>(
     State(state): State<ServeState<L, D>>,
-    Query(query): Query<RelayBaseQueryV2>,
+    Query(query): Query<RelayBaseQueryRelay>,
     headers: HeaderMap,
 ) -> Response {
     let request = match relay_request(
@@ -372,9 +372,9 @@ async fn get_relay_head_v2<L: LogSource, D: DeviceBook>(
     )
 }
 
-async fn get_relay_watch_v2<L: LogSource, D: DeviceBook>(
+async fn get_relay_watch<L: LogSource, D: DeviceBook>(
     State(state): State<ServeState<L, D>>,
-    Query(query): Query<RelayWatchQueryV2>,
+    Query(query): Query<RelayWatchQueryRelay>,
     headers: HeaderMap,
 ) -> Response {
     let request = match relay_request(

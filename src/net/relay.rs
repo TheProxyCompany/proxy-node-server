@@ -11,8 +11,8 @@ use p256::ecdsa::{Signature, VerifyingKey};
 
 use super::server::octet;
 use super::{
-    RELAY_PROTOCOL_VERSION, RelayCursorV2, RelayOpV2, RelayPageV2, RelayResponseV2,
-    RelayWireEntryV2, decode_fixed_hex,
+    RELAY_PROTOCOL_VERSION, RelayCursor, RelayOp, RelayPage, RelayResponse, RelayWireEntry,
+    decode_fixed_hex,
 };
 use crate::error::TransportError;
 use crate::identity::{DeviceId, DeviceIdentity, encode_hex};
@@ -269,12 +269,12 @@ pub(super) fn signed_relay_response(
             Ok(envelope) => envelope,
             Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         };
-        wire_entries.push(RelayWireEntryV2 {
+        wire_entries.push(RelayWireEntry {
             seq: entry.seq,
             envelope,
         });
     }
-    let response = RelayResponseV2 {
+    let response = RelayResponse {
         v: RELAY_PROTOCOL_VERSION,
         epoch: state.epoch,
         head: state.head,
@@ -373,7 +373,7 @@ pub(super) fn verify_relay_signature(
     expected_peer: DeviceId,
     expected_sec1: &[u8; 33],
     context: &[u8],
-    cursor: RelayCursorV2,
+    cursor: RelayCursor,
     request_bound: u64,
     nonce: &[u8; 32],
     body: &[u8],
@@ -415,11 +415,11 @@ pub(super) fn verify_relay_signature(
 }
 
 pub(super) fn decode_relay_response(
-    wire: RelayResponseV2,
-    cursor: RelayCursorV2,
+    wire: RelayResponse,
+    cursor: RelayCursor,
     max_entries: usize,
     status_only: bool,
-) -> Result<RelayPageV2, TransportError> {
+) -> Result<RelayPage, TransportError> {
     if wire.v != RELAY_PROTOCOL_VERSION {
         return Err(TransportError::Wire(format!(
             "unsupported relay protocol version {}",
@@ -436,7 +436,7 @@ pub(super) fn decode_relay_response(
         if !cursor_invalid || !wire.entries.is_empty() || wire.next != wire.floor {
             return Err(TransportError::Wire("invalid relay reset response".into()));
         }
-        return Ok(RelayPageV2 {
+        return Ok(RelayPage {
             epoch: wire.epoch,
             head: wire.head,
             floor: wire.floor,
@@ -483,12 +483,12 @@ pub(super) fn decode_relay_response(
 
     let mut entries = Vec::with_capacity(wire.entries.len());
     for entry in wire.entries {
-        entries.push(RelayOpV2 {
+        entries.push(RelayOp {
             seq: entry.seq,
             op: SignedOp::from_bytes(&entry.envelope)?,
         });
     }
-    Ok(RelayPageV2 {
+    Ok(RelayPage {
         epoch: wire.epoch,
         head: wire.head,
         floor: wire.floor,

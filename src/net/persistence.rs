@@ -3,7 +3,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use super::RelayCursorV2;
+use super::RelayCursor;
 use crate::identity::DeviceId;
 use crate::op::OrderKey;
 use crate::registry::DeviceRegistry;
@@ -50,12 +50,12 @@ fn relay_cursor_path(data_dir: &Path, peer: &DeviceId) -> PathBuf {
 }
 
 /// Load a peer's persisted `(epoch, relay sequence)` cursor.
-pub fn load_relay_cursor(data_dir: &Path, peer: &DeviceId) -> RelayCursorV2 {
+pub fn load_relay_cursor(data_dir: &Path, peer: &DeviceId) -> RelayCursor {
     let Ok(bytes) = std::fs::read(relay_cursor_path(data_dir, peer)) else {
-        return RelayCursorV2::START;
+        return RelayCursor::START;
     };
     if bytes.len() != 40 {
-        return RelayCursorV2::START;
+        return RelayCursor::START;
     }
     let mut epoch = [0u8; 32];
     epoch.copy_from_slice(&bytes[..32]);
@@ -63,9 +63,9 @@ pub fn load_relay_cursor(data_dir: &Path, peer: &DeviceId) -> RelayCursorV2 {
     after.copy_from_slice(&bytes[32..]);
     let after = u64::from_be_bytes(after);
     if epoch == [0u8; 32] && after != 0 {
-        return RelayCursorV2::START;
+        return RelayCursor::START;
     }
-    RelayCursorV2 { epoch, after }
+    RelayCursor { epoch, after }
 }
 
 /// Durably persist a relay-v2 cursor in a file distinct from the v1 semantic
@@ -73,7 +73,7 @@ pub fn load_relay_cursor(data_dir: &Path, peer: &DeviceId) -> RelayCursorV2 {
 pub fn save_relay_cursor(
     data_dir: &Path,
     peer: &DeviceId,
-    cursor: RelayCursorV2,
+    cursor: RelayCursor,
 ) -> std::io::Result<()> {
     let path = relay_cursor_path(data_dir, peer);
     let dir = path

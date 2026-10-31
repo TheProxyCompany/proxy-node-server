@@ -31,11 +31,10 @@ use crate::identity::decode_hex;
 use crate::op::{OrderKey, SignedOp};
 
 pub use crate::pull::{
-    CoverageVector, MAX_REQUEST_SKEW_MS, MAX_V3_REQUEST_BYTES, MAX_V3_RESPONSE_BYTES, OriginHeadV3,
-    PAGE_LIMIT_MAX, PULL_PAGE_STORE_ID, PULL_PATH, PULL_REQUEST_STORE_ID, PULL_RESPONSE_STORE_ID,
-    PULL_V3_VERSION, PullPageV3, PullPhase, PullRequestV3, ResumeV3, V3_PAGE_BYTE_BUDGET,
-    V3_PAGE_LIMIT_MAX, seal_pull_page_v3, sign_pull_request_v3, verify_pull_page_v3,
-    verify_pull_request_v3,
+    CoverageVector, MAX_PULL_REQUEST_BYTES, MAX_PULL_RESPONSE_BYTES, MAX_REQUEST_SKEW_MS,
+    OriginHead, PAGE_LIMIT_MAX, PULL_PAGE_BYTE_BUDGET, PULL_PAGE_LIMIT_MAX, PULL_PAGE_STORE_ID,
+    PULL_PATH, PULL_REQUEST_STORE_ID, PULL_RESPONSE_STORE_ID, PULL_VERSION, PullPage, PullPhase,
+    PullRequest, Resume, seal_pull_page, sign_pull_request, verify_pull_page, verify_pull_request,
 };
 pub use client::HttpPullSource;
 pub use persistence::{
@@ -48,21 +47,22 @@ pub use policy::{
 };
 pub use pull_client::{
     DISCOVERY_RESCAN_INTERVAL, NEWEST_FIRST_PREVIEW_GAP, PULL_FALLBACK_INTERVAL,
-    REGISTER_RETRY_BACKOFF, TRELLIS_SWEEP_INTERVAL, V3_NO_PROGRESS_LIMIT, V3Outcome, V3Progress,
-    WATCH_REPROBE_INTERVAL, apply_pull_page_v3, decode_epoch, decode_order_key, decode_page_op,
-    drain_v3_pages, inflated_claims, persist_v3_reset, preview_head_window_v3,
-    preview_resume_after, sweep_store_v3, unix_ms, v3_http_client, v3_progress, validate_v3_reset,
+    PULL_NO_PROGRESS_LIMIT, PullOutcome, PullProgress, REGISTER_RETRY_BACKOFF,
+    TRELLIS_SWEEP_INTERVAL, WATCH_REPROBE_INTERVAL, apply_pull_page, decode_epoch,
+    decode_order_key, decode_page_op, drain_pull_pages, inflated_claims, persist_pull_reset,
+    preview_head_window, preview_resume_after, pull_http_client, pull_progress, sweep_store,
+    unix_ms, validate_pull_reset,
 };
 pub use pull_server::{
-    PullV3Handler, admit_pull_ack_v3, authenticate_pull_request_v3, build_keyed_channel_v3,
-    build_pull_page_v3, classify_pull_request_error, encode_origin_rows, keyed_resume,
-    reset_pull_page_v3, v3_needs_reset, v3_pull_router,
+    PullHandler, admit_pull_ack, authenticate_pull_request, build_keyed_channel, build_pull_page,
+    classify_pull_request_error, encode_origin_rows, keyed_resume, pull_needs_reset, pull_router,
+    reset_pull_page,
 };
 pub use server::{ServeState, relay_router, router};
 pub use socket::{MeshPullHost, MeshPullSocket, OpLogPullSocket, PullAdmission, PullStorage};
 pub use sync::{
     ApplyMode, RelaySyncOutcome, learn_attested_devices, learn_devices, register_peer,
-    register_peer_with_key, sync_once, sync_once_with, sync_relay_once_v2,
+    register_peer_with_key, sync_once, sync_once_with, sync_relay_once,
 };
 pub use watch::{HeadPublisher, HeadWatch};
 
@@ -113,12 +113,12 @@ pub struct PullResponse {
 /// epoch is the explicit first-contact sentinel; a successful response replaces
 /// it with the server's authenticated stream epoch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RelayCursorV2 {
+pub struct RelayCursor {
     pub epoch: [u8; 32],
     pub after: u64,
 }
 
-impl RelayCursorV2 {
+impl RelayCursor {
     pub const START: Self = Self {
         epoch: [0; 32],
         after: 0,
@@ -129,15 +129,15 @@ impl RelayCursorV2 {
     }
 }
 
-impl Default for RelayCursorV2 {
+impl Default for RelayCursor {
     fn default() -> Self {
         Self::START
     }
 }
 
-/// Wire entry authenticated inside a [`RelayResponseV2`].
+/// Wire entry authenticated inside a [`RelayResponse`].
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct RelayWireEntryV2 {
+pub struct RelayWireEntry {
     pub seq: u64,
     pub envelope: Vec<u8>,
 }
@@ -145,7 +145,7 @@ pub struct RelayWireEntryV2 {
 /// Exact postcard body returned by all three relay-local v2 routes. `/v2/head`
 /// and `/v2/watch` carry no entries; `/v2/ops` carries a bounded page.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct RelayResponseV2 {
+pub struct RelayResponse {
     pub v: u8,
     pub epoch: [u8; 32],
     pub head: u64,
@@ -154,34 +154,34 @@ pub struct RelayResponseV2 {
     /// for a head/watch response. A reset instead returns `floor`.
     pub next: u64,
     pub reset: bool,
-    pub entries: Vec<RelayWireEntryV2>,
+    pub entries: Vec<RelayWireEntry>,
 }
 
 /// One verified and decoded operation from a relay-local page.
 #[derive(Clone, Debug)]
-pub struct RelayOpV2 {
+pub struct RelayOp {
     pub seq: u64,
     pub op: SignedOp,
 }
 
 /// Authenticated, validated, and envelope-decoded v2 response returned to
 /// callers. `reset` instructs the caller to replace its cursor with
-/// [`RelayPageV2::cursor`] before requesting again.
+/// [`RelayPage::cursor`] before requesting again.
 #[derive(Clone, Debug)]
-pub struct RelayPageV2 {
+pub struct RelayPage {
     pub epoch: [u8; 32],
     pub head: u64,
     pub floor: u64,
     pub next: u64,
     pub reset: bool,
-    pub entries: Vec<RelayOpV2>,
+    pub entries: Vec<RelayOp>,
 }
 
-impl RelayPageV2 {
+impl RelayPage {
     /// Safe continuation cursor. Head/watch responses preserve the caller's
     /// `after`, so observing available work never skips entries not yet pulled.
-    pub fn cursor(&self) -> RelayCursorV2 {
-        RelayCursorV2 {
+    pub fn cursor(&self) -> RelayCursor {
+        RelayCursor {
             epoch: self.epoch,
             after: self.next,
         }
@@ -210,25 +210,3 @@ pub fn encode_order_key(key: &OrderKey) -> String {
 pub(crate) fn decode_fixed_hex<const N: usize>(encoded: &str) -> Option<[u8; N]> {
     decode_hex(encoded)?.try_into().ok()
 }
-
-// Canonical unversioned aliases for pull client/server primitives.
-pub use pull_server::PullV3Handler as PullHandler;
-pub type PullOutcome = V3Outcome;
-pub type PullProgress = V3Progress;
-pub type RelayCursor = RelayCursorV2;
-pub type RelayResponse = RelayResponseV2;
-pub type RelayWireEntry = RelayWireEntryV2;
-
-pub use pull_client::{
-    apply_pull_page_v3 as apply_pull_page, drain_v3_pages as drain_pull_pages,
-    persist_v3_reset as persist_pull_reset, preview_head_window_v3 as preview_head_window,
-    sweep_store_v3 as sweep_store, v3_http_client as pull_http_client,
-    v3_progress as pull_progress, validate_v3_reset as validate_pull_reset,
-};
-pub use pull_server::{
-    admit_pull_ack_v3 as admit_pull_ack, authenticate_pull_request_v3 as authenticate_pull_request,
-    build_keyed_channel_v3 as build_keyed_channel, build_pull_page_v3 as build_pull_page,
-    reset_pull_page_v3 as reset_pull_page, v3_needs_reset as pull_needs_reset,
-    v3_pull_router as pull_router,
-};
-pub use sync::sync_relay_once_v2 as sync_relay_once;

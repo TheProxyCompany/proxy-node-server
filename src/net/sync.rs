@@ -4,7 +4,7 @@
 use std::sync::Mutex;
 
 use super::client::HttpPullSource;
-use super::{DevicesResp, RelayCursorV2};
+use super::{DevicesResp, RelayCursor};
 use crate::durable::OplogWriter;
 use crate::error::TransportError;
 use crate::hlc::NodeClock;
@@ -234,7 +234,7 @@ pub struct RelaySyncOutcome {
 
 /// Pull one authenticated relay-v2 page from a pinned peer.
 #[allow(clippy::too_many_arguments)]
-pub async fn sync_relay_once_v2<S>(
+pub async fn sync_relay_once<S>(
     source: &HttpPullSource,
     local_identity: &DeviceIdentity,
     expected_peer: DeviceId,
@@ -243,14 +243,14 @@ pub async fn sync_relay_once_v2<S>(
     clock: &NodeClock,
     log: &Mutex<OpLog>,
     store: &Mutex<S>,
-    cursor: &mut RelayCursorV2,
+    cursor: &mut RelayCursor,
     durability: Option<&Mutex<OplogWriter>>,
 ) -> Result<RelaySyncOutcome, TransportError>
 where
     S: Store,
 {
     let page = source
-        .fetch_relay_ops_v2(
+        .fetch_relay_ops(
             local_identity,
             expected_peer,
             expected_public_key_sec1,
@@ -323,7 +323,7 @@ where
         let mut store = store.lock().expect("store mutex poisoned");
         replay(&log, &mut *store).map_err(|e| TransportError::Replay(e.to_string()))?;
     }
-    *cursor = RelayCursorV2 {
+    *cursor = RelayCursor {
         epoch: page.epoch,
         after,
     };

@@ -5,14 +5,14 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::Mutex;
 
-use super::RelayCursorV2;
+use super::RelayCursor;
 use super::pull_client::unix_ms;
 use super::server::ServeState;
 use crate::hlc::{Hlc, NodeClock};
 use crate::identity::{DeviceId, DeviceIdentity};
 use crate::log::{LogSource, OpLog, RelayStreamState, replay};
 use crate::op::{OrderKey, SignedOp};
-use crate::pull::{CoverageVector, PullPageV3};
+use crate::pull::{CoverageVector, PullPage};
 use crate::registry::{DeviceBook, DeviceRegistry};
 use crate::store::Store;
 
@@ -157,11 +157,7 @@ pub trait MeshPullSocket {
 
     /// Monotonically persist `peer`'s relay cursor inside an already-acquired
     /// write quantum.
-    fn save_relay_cursor(
-        &self,
-        _peer: &DeviceId,
-        _cursor: RelayCursorV2,
-    ) -> Result<(), Self::Error> {
+    fn save_relay_cursor(&self, _peer: &DeviceId, _cursor: RelayCursor) -> Result<(), Self::Error> {
         Ok(())
     }
 
@@ -169,16 +165,16 @@ pub trait MeshPullSocket {
     fn reset_relay_cursor(
         &self,
         _peer: &DeviceId,
-        _cursor: RelayCursorV2,
+        _cursor: RelayCursor,
     ) -> Result<(), Self::Error> {
         Ok(())
     }
 
     /// Observe progress after one v3 page has been durably applied.
-    fn on_v3_page_applied(
+    fn on_pull_page_applied(
         &self,
         _peer: &DeviceId,
-        _page: &PullPageV3,
+        _page: &PullPage,
         _pages: u64,
         _applied_total: usize,
     ) {
@@ -188,7 +184,7 @@ pub trait MeshPullSocket {
     fn commit_relay_cursor(
         &self,
         peer: &DeviceId,
-        cursor: RelayCursorV2,
+        cursor: RelayCursor,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send
     where
         Self: Sync,
@@ -198,10 +194,10 @@ pub trait MeshPullSocket {
 
     /// Acquire any host write gate / vouch fence and persist a validated v3
     /// stream reset for `peer`.
-    fn commit_v3_reset(
+    fn commit_pull_reset(
         &self,
         peer: &DeviceId,
-        reset: RelayCursorV2,
+        reset: RelayCursor,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send
     where
         Self: Sync,
@@ -294,7 +290,7 @@ pub struct OpLogPullSocket<'a, S: Store> {
     pub log: &'a Mutex<OpLog>,
     pub store: &'a Mutex<S>,
     pub coverage: &'a Mutex<CoverageVector>,
-    pub cursors: &'a Mutex<BTreeMap<DeviceId, RelayCursorV2>>,
+    pub cursors: &'a Mutex<BTreeMap<DeviceId, RelayCursor>>,
 }
 
 impl<'a, S: Store + Send> MeshPullSocket for OpLogPullSocket<'a, S> {
@@ -372,7 +368,7 @@ impl<'a, S: Store + Send> MeshPullSocket for OpLogPullSocket<'a, S> {
         Ok(())
     }
 
-    fn save_relay_cursor(&self, peer: &DeviceId, cursor: RelayCursorV2) -> Result<(), String> {
+    fn save_relay_cursor(&self, peer: &DeviceId, cursor: RelayCursor) -> Result<(), String> {
         let mut cursors = self.cursors.lock().expect("cursors poisoned");
         cursors
             .entry(*peer)
@@ -387,7 +383,7 @@ impl<'a, S: Store + Send> MeshPullSocket for OpLogPullSocket<'a, S> {
         Ok(())
     }
 
-    fn reset_relay_cursor(&self, peer: &DeviceId, cursor: RelayCursorV2) -> Result<(), String> {
+    fn reset_relay_cursor(&self, peer: &DeviceId, cursor: RelayCursor) -> Result<(), String> {
         self.cursors
             .lock()
             .expect("cursors poisoned")
