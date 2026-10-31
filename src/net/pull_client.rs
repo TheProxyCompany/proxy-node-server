@@ -9,14 +9,14 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 
 use super::client::HttpPullSource;
+use super::pull_server::v3_needs_reset;
 use super::socket::{MeshPullSocket, PullAdmission};
-use super::v3_server::v3_needs_reset;
 use super::{RelayCursorV2, decode_fixed_hex};
 use crate::error::TransportError;
 use crate::hlc::Hlc;
 use crate::identity::{DeviceId, DeviceIdentity, encode_hex};
 use crate::op::{OpId, OrderKey, SignedOp};
-use crate::pull_v3::{
+use crate::pull::{
     PULL_V3_VERSION, PullPageV3, PullPhase, PullRequestV3, ResumeV3, V3_PAGE_LIMIT_MAX,
     sign_pull_request_v3, verify_pull_page_v3,
 };
@@ -654,7 +654,7 @@ where
 }
 
 impl HttpPullSource {
-    /// Seal `request` under `local_identity` at `hlc`, POST it to [`crate::pull_v3::PULL_PATH`],
+    /// Seal `request` under `local_identity` at `hlc`, POST it to [`crate::pull::PULL_PATH`],
     /// and verify the returned [`PullPageV3`] envelope against `expected_peer`
     /// and `expected_peer_key`.
     pub async fn pull_v3(

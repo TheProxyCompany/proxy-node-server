@@ -20,7 +20,7 @@ use super::{
 use crate::error::TransportError;
 use crate::identity::{DeviceId, DeviceIdentity, encode_hex};
 use crate::op::{OrderKey, SignedOp};
-use crate::pull_v3::{MAX_V3_RESPONSE_BYTES, PULL_PATH};
+use crate::pull::{MAX_V3_RESPONSE_BYTES, PULL_PATH};
 use crate::transport::{Cursor, PullSource};
 
 /// Pulls a peer's op-log over HTTP.

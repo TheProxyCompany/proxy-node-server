@@ -452,3 +452,21 @@ mod tests {
         );
     }
 }
+
+// Unversioned canonical type aliases and function re-exports.
+pub type PullRequest = PullRequestV3;
+pub type PullPage = PullPageV3;
+pub type Resume = ResumeV3;
+pub type OriginHead = OriginHeadV3;
+
+pub const PULL_PROTOCOL_VERSION: u8 = PULL_V3_VERSION;
+pub const MAX_PULL_REQUEST_BYTES: usize = MAX_V3_REQUEST_BYTES;
+pub const MAX_PULL_RESPONSE_BYTES: usize = MAX_V3_RESPONSE_BYTES;
+pub const PULL_PAGE_BYTE_BUDGET: usize = V3_PAGE_BYTE_BUDGET;
+pub const PULL_PAGE_LIMIT_MAX: u32 = V3_PAGE_LIMIT_MAX;
+
+#[cfg(feature = "daemon")]
+pub use self::{
+    seal_pull_page_v3 as seal_pull_page, sign_pull_request_v3 as sign_pull_request,
+    verify_pull_page_v3 as verify_pull_page, verify_pull_request_v3 as verify_pull_request,
+};

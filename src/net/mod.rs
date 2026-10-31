@@ -6,20 +6,20 @@
 mod client;
 mod persistence;
 mod policy;
+mod pull_client;
+mod pull_server;
 mod relay;
 mod server;
 mod socket;
 mod sync;
-mod v3_client;
-mod v3_server;
 mod watch;
 
+#[cfg(test)]
+mod tests_pull;
 #[cfg(test)]
 mod tests_relay;
 #[cfg(test)]
 mod tests_support;
-#[cfg(test)]
-mod tests_v3;
 #[cfg(test)]
 mod tests_watch;
 
@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 use crate::identity::decode_hex;
 use crate::op::{OrderKey, SignedOp};
 
-pub use crate::pull_v3::{
+pub use crate::pull::{
     CoverageVector, MAX_REQUEST_SKEW_MS, MAX_V3_REQUEST_BYTES, MAX_V3_RESPONSE_BYTES, OriginHeadV3,
     PAGE_LIMIT_MAX, PULL_PAGE_STORE_ID, PULL_PATH, PULL_REQUEST_STORE_ID, PULL_RESPONSE_STORE_ID,
     PULL_V3_VERSION, PullPageV3, PullPhase, PullRequestV3, ResumeV3, V3_PAGE_BYTE_BUDGET,
@@ -46,23 +46,23 @@ pub use policy::{
     MESH_AUDIT_ENV, MESH_PEERS_ENV, endpoint_has_confidential_transport, is_cgnat_ip,
     is_loopback_host, parse_mesh_peers, parse_mesh_peers_from,
 };
-pub use server::{ServeState, relay_router, router};
-pub use socket::{MeshPullHost, MeshPullSocket, OpLogPullSocket, PullAdmission, PullStorage};
-pub use sync::{
-    ApplyMode, RelaySyncOutcome, learn_attested_devices, learn_devices, register_peer,
-    register_peer_with_key, sync_once, sync_once_with, sync_relay_once_v2,
-};
-pub use v3_client::{
+pub use pull_client::{
     DISCOVERY_RESCAN_INTERVAL, NEWEST_FIRST_PREVIEW_GAP, PULL_FALLBACK_INTERVAL,
     REGISTER_RETRY_BACKOFF, TRELLIS_SWEEP_INTERVAL, V3_NO_PROGRESS_LIMIT, V3Outcome, V3Progress,
     WATCH_REPROBE_INTERVAL, apply_pull_page_v3, decode_epoch, decode_order_key, decode_page_op,
     drain_v3_pages, inflated_claims, persist_v3_reset, preview_head_window_v3,
     preview_resume_after, sweep_store_v3, unix_ms, v3_http_client, v3_progress, validate_v3_reset,
 };
-pub use v3_server::{
+pub use pull_server::{
     PullV3Handler, admit_pull_ack_v3, authenticate_pull_request_v3, build_keyed_channel_v3,
     build_pull_page_v3, classify_pull_request_error, encode_origin_rows, keyed_resume,
     reset_pull_page_v3, v3_needs_reset, v3_pull_router,
+};
+pub use server::{ServeState, relay_router, router};
+pub use socket::{MeshPullHost, MeshPullSocket, OpLogPullSocket, PullAdmission, PullStorage};
+pub use sync::{
+    ApplyMode, RelaySyncOutcome, learn_attested_devices, learn_devices, register_peer,
+    register_peer_with_key, sync_once, sync_once_with, sync_relay_once_v2,
 };
 pub use watch::{HeadPublisher, HeadWatch};
 
@@ -210,3 +210,25 @@ pub fn encode_order_key(key: &OrderKey) -> String {
 pub(crate) fn decode_fixed_hex<const N: usize>(encoded: &str) -> Option<[u8; N]> {
     decode_hex(encoded)?.try_into().ok()
 }
+
+// Canonical unversioned aliases for pull client/server primitives.
+pub use pull_server::PullV3Handler as PullHandler;
+pub type PullOutcome = V3Outcome;
+pub type PullProgress = V3Progress;
+pub type RelayCursor = RelayCursorV2;
+pub type RelayResponse = RelayResponseV2;
+pub type RelayWireEntry = RelayWireEntryV2;
+
+pub use pull_client::{
+    apply_pull_page_v3 as apply_pull_page, drain_v3_pages as drain_pull_pages,
+    persist_v3_reset as persist_pull_reset, preview_head_window_v3 as preview_head_window,
+    sweep_store_v3 as sweep_store, v3_http_client as pull_http_client,
+    v3_progress as pull_progress, validate_v3_reset as validate_pull_reset,
+};
+pub use pull_server::{
+    admit_pull_ack_v3 as admit_pull_ack, authenticate_pull_request_v3 as authenticate_pull_request,
+    build_keyed_channel_v3 as build_keyed_channel, build_pull_page_v3 as build_pull_page,
+    reset_pull_page_v3 as reset_pull_page, v3_needs_reset as pull_needs_reset,
+    v3_pull_router as pull_router,
+};
+pub use sync::sync_relay_once_v2 as sync_relay_once;

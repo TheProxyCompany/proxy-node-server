@@ -412,7 +412,7 @@ async fn unchanged_head_watch_does_not_busy_loop() {
 
 #[tokio::test]
 async fn pull_v3_bytes_posts_signed_envelope_and_returns_sealed_page() {
-    use crate::pull_v3::{
+    use crate::pull::{
         PULL_PATH, PULL_V3_VERSION, PullPageV3, PullRequestV3, seal_pull_page_v3,
         sign_pull_request_v3, verify_pull_page_v3, verify_pull_request_v3,
     };

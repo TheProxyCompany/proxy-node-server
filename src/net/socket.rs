@@ -6,13 +6,13 @@ use std::future::Future;
 use std::sync::Mutex;
 
 use super::RelayCursorV2;
+use super::pull_client::unix_ms;
 use super::server::ServeState;
-use super::v3_client::unix_ms;
 use crate::hlc::{Hlc, NodeClock};
 use crate::identity::{DeviceId, DeviceIdentity};
 use crate::log::{LogSource, OpLog, RelayStreamState, replay};
 use crate::op::{OrderKey, SignedOp};
-use crate::pull_v3::{CoverageVector, PullPageV3};
+use crate::pull::{CoverageVector, PullPageV3};
 use crate::registry::{DeviceBook, DeviceRegistry};
 use crate::store::Store;
 

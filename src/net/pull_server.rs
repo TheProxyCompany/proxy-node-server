@@ -10,14 +10,14 @@ use axum::routing::post;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 
+use super::pull_client::{decode_epoch, decode_order_key, unix_ms};
 use super::server::ServeState;
 use super::socket::MeshPullSocket;
-use super::v3_client::{decode_epoch, decode_order_key, unix_ms};
 use crate::hlc::Hlc;
 use crate::identity::{DeviceId, DeviceIdentity, encode_hex};
 use crate::log::{LogSource, RelayStreamState};
 use crate::op::OrderKey;
-use crate::pull_v3::{
+use crate::pull::{
     CoverageVector, MAX_V3_REQUEST_BYTES, PULL_PATH, PULL_V3_VERSION, PullPageV3, PullPhase,
     PullRequestV3, ResumeV3, V3_PAGE_BYTE_BUDGET, V3_PAGE_LIMIT_MAX, seal_pull_page_v3,
     verify_pull_request_v3,
