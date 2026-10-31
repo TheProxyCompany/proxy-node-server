@@ -39,25 +39,7 @@ pub fn ledger_path() -> Option<std::path::PathBuf> {
         home.join(".cache")
     };
     let path = base.join("com.theproxycompany/mesh-ports.json");
-    migrate_legacy_ledger(&home, &path);
     Some(path)
-}
-
-fn migrate_legacy_ledger(home: &Path, new: &Path) {
-    if new.exists() {
-        return;
-    }
-    let old = home.join("Library/Application Support/com.theproxycompany/mesh-ports.json");
-    if !old.is_file() {
-        return;
-    }
-    if let Some(parent) = new.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if std::fs::rename(&old, new).is_ok() {
-        return;
-    }
-    let _ = std::fs::copy(&old, new).and_then(|_| std::fs::remove_file(&old));
 }
 
 #[cfg(feature = "daemon")]
