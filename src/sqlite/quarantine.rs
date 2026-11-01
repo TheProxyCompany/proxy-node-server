@@ -97,7 +97,7 @@ pub fn encode_quarantined_candidates<'a>(
         .collect()
 }
 
-pub fn quarantine_unattested_ops_in_txn(
+pub fn quarantine_ops(
     conn: &rusqlite::Connection,
     peer: &DeviceId,
     envelopes: &[(&SignedOp, [u8; 32], Vec<u8>)],
@@ -177,7 +177,7 @@ pub fn new_unattested_signers(peer: &DeviceId, skipped: &[&SignedOp]) -> Vec<Str
     }
 }
 
-pub fn quarantined_rows_for_peer_conn(
+pub fn quarantined_rows(
     conn: &rusqlite::Connection,
     peer: &DeviceId,
     limit: usize,
@@ -230,7 +230,7 @@ pub fn quarantined_rows_for_peer_conn(
     Ok(selected)
 }
 
-pub fn finish_quarantine_replay_in_txn(
+pub fn finish_quarantine_replay(
     conn: &rusqlite::Connection,
     peer: &DeviceId,
     scanned: &[Vec<u8>],
@@ -317,7 +317,7 @@ pub struct RemoteOpClassification {
     pub completed: HashSet<Vec<u8>>,
 }
 
-pub fn classify_remote_ops_conn(
+pub fn classify_remote_ops(
     conn: &rusqlite::Connection,
     ops: &[&SignedOp],
 ) -> Result<RemoteOpClassification, SqliteError> {
@@ -419,7 +419,7 @@ pub fn encode_verified_remote_ops(
         .collect()
 }
 
-pub fn record_verified_remote_ops_in_txn(
+pub fn record_verified_ops(
     conn: &rusqlite::Connection,
     encoded: &[(Vec<u8>, Vec<u8>, [u8; 32])],
 ) -> Result<(), SqliteError> {
