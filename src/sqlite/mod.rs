@@ -21,3 +21,4 @@ pub enum SqliteError {
 #[cfg(feature = "pull-http")]
 pub mod pull_socket;
 pub mod quarantine;
+pub mod rows;

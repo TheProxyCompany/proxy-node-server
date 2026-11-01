@@ -25,6 +25,7 @@ pub mod row_op;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 pub mod store;
+pub mod thread_sources;
 #[cfg(feature = "sqlite")]
 pub use sqlite::SqliteError;
 pub mod transport;
