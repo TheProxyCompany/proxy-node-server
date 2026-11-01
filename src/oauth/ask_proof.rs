@@ -404,13 +404,16 @@ pub fn first_sighting_conn(
         "DELETE FROM ask_nonces WHERE seen_at < ?1",
         rusqlite::params![forget_before],
     )
-    .map_err(|error| crate::sqlite::SqliteError::Other(format!("forget old ask nonces: {error}")))?;
+    .map_err(|error| {
+        crate::sqlite::SqliteError::Other(format!("forget old ask nonces: {error}"))
+    })?;
     let added = conn
         .execute(
             "INSERT OR IGNORE INTO ask_nonces (nonce, key_id, seen_at) VALUES (?1, ?2, ?3)",
             rusqlite::params![nonce, key_id, now_i64],
         )
-        .map_err(|error| crate::sqlite::SqliteError::Other(format!("note an ask nonce: {error}")))?;
+        .map_err(|error| {
+            crate::sqlite::SqliteError::Other(format!("note an ask nonce: {error}"))
+        })?;
     Ok(added == 1)
 }
-
