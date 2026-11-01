@@ -4,6 +4,7 @@
 //! confidentiality policy.
 
 mod client;
+pub mod gate;
 mod persistence;
 mod policy;
 mod pull_client;
