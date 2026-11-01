@@ -1,0 +1,21 @@
+:root { color-scheme: light dark; --ink: #18181b; --muted: #71717a; --paper: #fafafa; --line: #e4e4e7; --you: #e4e4e7; }
+@media (prefers-color-scheme: dark) { :root { --ink: #fafafa; --muted: #a1a1aa; --paper: #09090b; --line: #27272a; --you: #27272a; } }
+body { margin: 0; background: var(--paper); color: var(--ink); font: 17px/1.5 -apple-system, BlinkMacSystemFont, "Inter", system-ui, sans-serif; }
+main { max-width: 40rem; margin: 0 auto; padding: 24px 16px 32px; }
+h1 { font-size: 1.5rem; margin: 0 0 .75rem; }
+p { margin: 0 0 1rem; }
+a { color: inherit; }
+button { font: inherit; color: var(--paper); background: var(--ink); border: 0; border-radius: 8px; padding: 10px 16px; cursor: pointer; }
+button.quiet { color: var(--muted); background: none; padding: 0; }
+button:disabled { opacity: .5; cursor: default; }
+.address { color: var(--muted); font-size: .9rem; }
+.muted { color: var(--muted); }
+.note { color: var(--muted); border-top: 1px solid var(--line); padding-top: 1rem; min-height: 1.5rem; }
+header { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; }
+ol.messages { list-style: none; margin: 0 0 1rem; padding: 0; }
+ol.messages li { margin: 0 0 1rem; }
+ol.messages .who { display: block; color: var(--muted); font-size: .85rem; }
+ol.messages p { white-space: pre-wrap; margin: 0; padding: 8px 12px; border-radius: 10px; border: 1px solid var(--line); }
+ol.messages li.user p { background: var(--you); border-color: transparent; }
+form { display: flex; gap: 8px; align-items: flex-end; }
+textarea { flex: 1; font: inherit; color: var(--ink); background: var(--paper); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; resize: vertical; min-height: 2.5rem; }

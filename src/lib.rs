@@ -133,3 +133,8 @@ pub mod roster;
 #[cfg(feature = "daemon")]
 pub mod scope;
 pub mod usage;
+
+#[cfg(feature = "pull-http")]
+pub mod address_web;
+#[cfg(feature = "daemon")]
+pub mod mcp_protocol;
