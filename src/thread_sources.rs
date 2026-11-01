@@ -207,22 +207,37 @@ impl ThreadSourceSendResult {
         }
     }
 
-    pub fn deferred(
+    pub fn deferred(conversation_id: String, reason: impl Into<String>) -> Self {
+        Self {
+            conversation_id,
+            message_id: None,
+            queued: false,
+            deferred: true,
+            deferred_reason: Some(reason.into()),
+            routed: false,
+            owner_device_id: None,
+            client_message_id: None,
+            delivery_unknown: false,
+            delivery_error: None,
+        }
+    }
+
+    pub fn unknown(
         conversation_id: String,
-        owner_device_id: Option<String>,
-        reason: impl Into<String>,
+        client_message_id: String,
+        error: impl Into<String>,
     ) -> Self {
         Self {
             conversation_id,
             message_id: None,
-            queued: true,
-            deferred: true,
-            deferred_reason: Some(reason.into()),
+            queued: false,
+            deferred: false,
+            deferred_reason: None,
             routed: false,
-            owner_device_id,
-            client_message_id: None,
-            delivery_unknown: false,
-            delivery_error: None,
+            owner_device_id: None,
+            client_message_id: Some(client_message_id),
+            delivery_unknown: true,
+            delivery_error: Some(error.into()),
         }
     }
 
