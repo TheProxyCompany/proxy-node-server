@@ -3,7 +3,13 @@
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use percent_encoding::{NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
+
+const UNRESERVED: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'_')
+    .remove(b'.')
+    .remove(b'~');
 use rand_core::{OsRng, RngCore};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -541,7 +547,7 @@ pub async fn send_message(
     if let Some(title) = party_title {
         payload["party_title"] = json!(title);
     }
-    let encoded = utf8_percent_encode(thread_id, NON_ALPHANUMERIC);
+    let encoded = utf8_percent_encode(thread_id, UNRESERVED);
     let (status, body) = send(bearer(
         request(
             reqwest::Method::POST,
@@ -556,7 +562,7 @@ pub async fn send_message(
 }
 
 pub async fn queue_idle(base_url: &str, token: &str, thread_id: &str) -> Result<bool, ClientError> {
-    let encoded = utf8_percent_encode(thread_id, NON_ALPHANUMERIC);
+    let encoded = utf8_percent_encode(thread_id, UNRESERVED);
     let (status, body) = send(bearer(
         request(
             reqwest::Method::GET,
@@ -578,7 +584,7 @@ pub async fn messages_after(
     thread_id: &str,
     after: i64,
 ) -> Result<Vec<RemoteItem>, ClientError> {
-    let encoded = utf8_percent_encode(thread_id, NON_ALPHANUMERIC);
+    let encoded = utf8_percent_encode(thread_id, UNRESERVED);
     let (status, body) = send(bearer(
         request(
             reqwest::Method::GET,
@@ -599,7 +605,7 @@ pub async fn agent_avatar(
     token: &str,
     agent: &str,
 ) -> Result<Option<Avatar>, ClientError> {
-    let encoded = utf8_percent_encode(agent, NON_ALPHANUMERIC);
+    let encoded = utf8_percent_encode(agent, UNRESERVED);
     let response = bearer(
         request(
             reqwest::Method::GET,
