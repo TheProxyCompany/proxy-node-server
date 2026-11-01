@@ -17,7 +17,7 @@ required-features = ["daemon"]
 [features]
 default = []
 daemon = ["dep:clap", "dep:serde_json"]
-pull-http = ["daemon", "dep:axum", "dep:tokio", "dep:reqwest"]
+pull-http = ["daemon", "dep:axum", "dep:tokio", "dep:reqwest", "dep:futures-util", "dep:flate2", "dep:tar"]
 # Provider-agnostic discovery/transport seams. Lean by construction: the traits
 # and PeerInfo pull in no new deps, only the HTTP transport they build on.
 discovery = ["pull-http"]
@@ -48,12 +48,14 @@ hex = "0.4"
 clap = { version = "4", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 axum = { version = "0.8", optional = true }
-tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "sync"], optional = true }
-reqwest = { version = "0.13", default-features = false, optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "sync", "process", "io-util", "fs"], optional = true }
+reqwest = { version = "0.13", default-features = false, features = ["stream", "json"], optional = true }
 mdns-sd = { version = "0.20", optional = true }
 futures-util = { version = "0.3", default-features = false, features = ["alloc"], optional = true }
 rusqlite = { version = "0.39", features = ["bundled"], optional = true }
 chrono = { version = "0.4", optional = true }
+flate2 = { version = "1", optional = true }
+tar = { version = "0.4", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

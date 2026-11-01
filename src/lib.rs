@@ -3,6 +3,7 @@
 //! The open mesh/sync layer of the Proxy network: a signed, HLC-ordered op-log
 //! replication engine with pluggable stores.
 
+pub mod address;
 #[cfg(feature = "discovery")]
 pub mod discovery;
 pub mod durable;
@@ -121,3 +122,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(feature = "pull-http")]
+pub mod tunnel;
