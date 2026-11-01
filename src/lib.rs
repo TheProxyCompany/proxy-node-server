@@ -125,3 +125,11 @@ mod tests {
 
 #[cfg(feature = "pull-http")]
 pub mod tunnel;
+
+#[cfg(feature = "pull-http")]
+pub mod address_client;
+#[cfg(feature = "daemon")]
+pub mod roster;
+#[cfg(feature = "daemon")]
+pub mod scope;
+pub mod usage;

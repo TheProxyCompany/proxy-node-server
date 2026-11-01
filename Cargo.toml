@@ -31,7 +31,7 @@ harness = ["pull-http", "dep:clap"]
 sqlite = ["dep:rusqlite", "dep:chrono"]
 
 [dependencies]
-p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8", "std"] }
 sha2 = "0.10"
 postcard = { version = "1", features = ["alloc"] }
 serde = { version = "1", features = ["derive"] }
