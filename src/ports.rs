@@ -1,9 +1,12 @@
 //! Sticky ports: a per-OS-user JSON ledger mapping each data root to the one
 //! port its instance serves everything on, plus local hardware/compute probing.
 
+#[cfg(feature = "daemon")]
 use std::collections::HashMap;
+#[cfg(feature = "daemon")]
 use std::path::Path;
 
+#[cfg(feature = "daemon")]
 const SIBLING_MAX_AGE_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 
 /// One instance's ledger entry, keyed in the file by its data root.
@@ -64,6 +67,7 @@ pub fn pid_alive(pid: u32) -> bool {
     unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
 }
 
+#[cfg(feature = "daemon")]
 fn unix_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
