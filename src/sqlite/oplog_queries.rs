@@ -22,7 +22,6 @@ pub fn newest_ops_in_store(
     // definitive and the historical fallback is skipped entirely. Rows with
     // no applied op stay absent from the map.
     const CHUNK: usize = 500;
-    let heads_complete = super::oplog_heads::heads_backfill_complete(conn)?;
     let mut newest = std::collections::HashMap::with_capacity(row_pks.len());
     for chunk in row_pks.chunks(CHUNK) {
         let placeholders = (0..chunk.len())
@@ -47,52 +46,6 @@ pub fn newest_ops_in_store(
             let (row_pk, payload) =
                 row.map_err(|e| GCError::Other(format!("oplog newest_ops_in_store row: {e}")))?;
             newest.insert(row_pk, payload);
-        }
-
-        let missing: Vec<&str> = chunk
-            .iter()
-            .copied()
-            .filter(|row_pk| !newest.contains_key(*row_pk))
-            .collect();
-        if !heads_complete && !missing.is_empty() {
-            let placeholders = (0..missing.len())
-                .map(|i| format!("?{}", i + 3))
-                .collect::<Vec<_>>()
-                .join(", ");
-            let mut fallback = conn
-                .prepare(&format!(
-                    "SELECT row_pk, payload
-                     FROM (
-                         SELECT row_pk, payload,
-                                ROW_NUMBER() OVER (
-                                    PARTITION BY row_pk
-                                    ORDER BY hlc DESC, device_id DESC, op_id DESC
-                                ) AS winner
-                         FROM oplog_db.oplog INDEXED BY idx_oplog_lww
-                         WHERE store_id = ?1 AND table_name = ?2 AND applied = 1
-                           AND row_pk IN ({placeholders})
-                     )
-                     WHERE winner = 1"
-                ))
-                .map_err(|e| {
-                    GCError::Other(format!("oplog newest_ops_in_store fallback prepare: {e}"))
-                })?;
-            let params = std::iter::once(&store as &dyn rusqlite::ToSql)
-                .chain(std::iter::once(&table as &dyn rusqlite::ToSql))
-                .chain(missing.iter().map(|pk| pk as &dyn rusqlite::ToSql));
-            let rows = fallback
-                .query_map(rusqlite::params_from_iter(params), |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
-                })
-                .map_err(|e| {
-                    GCError::Other(format!("oplog newest_ops_in_store fallback query: {e}"))
-                })?;
-            for row in rows {
-                let (row_pk, payload) = row.map_err(|e| {
-                    GCError::Other(format!("oplog newest_ops_in_store fallback row: {e}"))
-                })?;
-                newest.insert(row_pk, payload);
-            }
         }
     }
     Ok(newest)

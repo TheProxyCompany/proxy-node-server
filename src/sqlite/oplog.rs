@@ -10,9 +10,7 @@ use crate::{DeviceId, Hlc, OpId, OrderKey, SignedOp};
 use rusqlite::{OptionalExtension, params};
 
 use super::SqliteError as GCError;
-pub use super::oplog_heads::{
-    HeadsBackfillChunk, backfill_heads_chunk_in_txn, demote_head, rebuild_head, upsert_head,
-};
+pub use super::oplog_heads::{demote_head, rebuild_head, upsert_head};
 pub use super::pending_edges::{
     PendingEdgePage, buffer_pending_edge, discard_undispatched_move_callback,
     mark_move_callback_dispatched, move_callback_recorded, pending_edge_wake, pending_edges_for,
