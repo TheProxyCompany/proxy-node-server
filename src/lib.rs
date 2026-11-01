@@ -138,3 +138,6 @@ pub mod usage;
 pub mod address_web;
 #[cfg(feature = "daemon")]
 pub mod mcp_protocol;
+
+#[cfg(feature = "pull-http")]
+pub mod mcp_server;
