@@ -95,7 +95,7 @@ pub enum TransportError {
     /// A peer returned 404/501 for a relay-v2 route. This is a capability
     /// diagnostic, not authenticated permission to downgrade to v1.
     #[error("relay v2 unsupported by peer (status {status})")]
-    RelayV2Unsupported { status: u16 },
+    RelayRelayUnsupported { status: u16 },
 
     #[error("replay failed during sync: {0}")]
     Replay(String),
@@ -131,7 +131,7 @@ pub enum TransportError {
 
 #[cfg(feature = "pull-http")]
 impl TransportError {
-    pub fn is_relay_v2_unsupported(&self) -> bool {
-        matches!(self, Self::RelayV2Unsupported { .. })
+    pub fn is_relay_unsupported(&self) -> bool {
+        matches!(self, Self::RelayRelayUnsupported { .. })
     }
 }

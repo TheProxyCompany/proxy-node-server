@@ -7,8 +7,8 @@ use super::tests_support::{
     V1OnlyLog, seal_kv_op, spawn_app, spawn_watch_node, spawn_watch_node_with_limit,
 };
 use super::{
-    DEFAULT_MAX_PARKED_WATCHES, HttpPullSource, RelayCursorV2, ServeState, WATCH_EMPTY_BACKOFF,
-    load_relay_cursor, relay_router, router, save_relay_cursor, sync_relay_once_v2,
+    DEFAULT_MAX_PARKED_WATCHES, HttpPullSource, RelayCursor, ServeState, WATCH_EMPTY_BACKOFF,
+    load_relay_cursor, relay_router, router, save_relay_cursor, sync_relay_once,
 };
 use crate::durable::OplogWriter;
 use crate::error::TransportError;
@@ -20,7 +20,7 @@ use crate::op::OrderKey;
 use crate::registry::DeviceRegistry;
 
 #[tokio::test]
-async fn v1_only_log_keeps_v1_routes_and_reports_v2_not_implemented() {
+async fn v1_only_log_keeps_v1_routes_and_reports_not_implemented() {
     let serving = Arc::new(DeviceIdentity::generate());
     let author = DeviceIdentity::generate();
     let op = seal_kv_op(&author, Hlc(10), "k", b"v");
@@ -39,17 +39,17 @@ async fn v1_only_log_keeps_v1_routes_and_reports_v2_not_implemented() {
 
     assert_eq!(client.fetch_head().await.unwrap(), expected_head);
     let error = client
-        .fetch_relay_ops_v2(
+        .fetch_relay_ops(
             &author,
             serving.device_id(),
             &serving.public_key_sec1(),
-            RelayCursorV2::START,
+            RelayCursor::START,
         )
         .await
         .unwrap_err();
     assert!(matches!(
         error,
-        TransportError::RelayV2Unsupported { status: 501 }
+        TransportError::RelayRelayUnsupported { status: 501 }
     ));
 }
 
@@ -70,11 +70,11 @@ async fn relay_router_does_not_mount_legacy_log_routes() {
     let legacy = client.fetch_head().await.unwrap_err();
     assert!(matches!(legacy, TransportError::Http(message) if message == "status 404 Not Found"));
     let relay = client
-        .fetch_relay_head_v2(
+        .fetch_relay_head(
             &caller,
             serving.device_id(),
             &serving.public_key_sec1(),
-            RelayCursorV2::START,
+            RelayCursor::START,
         )
         .await
         .unwrap();
@@ -110,9 +110,9 @@ async fn relay_sync_delivers_a_late_lower_semantic_op() {
     let store = Mutex::new(KvStore::new());
     let dir = tempfile::tempdir().unwrap();
     let writer = Mutex::new(OplogWriter::open(&dir.path().join("oplog")).unwrap());
-    let mut cursor = RelayCursorV2::START;
+    let mut cursor = RelayCursor::START;
 
-    let first = sync_relay_once_v2(
+    let first = sync_relay_once(
         &source,
         &local,
         remote.device_id(),
@@ -131,7 +131,7 @@ async fn relay_sync_delivers_a_late_lower_semantic_op() {
     assert_eq!(cursor.after, 1);
 
     remote_log.lock().unwrap().append(low.clone());
-    let late = sync_relay_once_v2(
+    let late = sync_relay_once(
         &source,
         &local,
         remote.device_id(),
@@ -183,9 +183,9 @@ async fn relay_sync_authenticates_epoch_reset_and_replays_from_zero() {
     let store = Mutex::new(KvStore::new());
     let dir = tempfile::tempdir().unwrap();
     let writer = Mutex::new(OplogWriter::open(&dir.path().join("oplog")).unwrap());
-    let mut cursor = RelayCursorV2::START;
+    let mut cursor = RelayCursor::START;
 
-    sync_relay_once_v2(
+    sync_relay_once(
         &first_source,
         &local,
         remote.device_id(),
@@ -216,7 +216,7 @@ async fn relay_sync_authenticates_epoch_reset_and_replays_from_zero() {
     )))
     .await;
 
-    let reset = sync_relay_once_v2(
+    let reset = sync_relay_once(
         &restarted_source,
         &local,
         remote.device_id(),
@@ -234,7 +234,7 @@ async fn relay_sync_authenticates_epoch_reset_and_replays_from_zero() {
     assert_ne!(cursor.epoch, first_epoch);
     assert_eq!(cursor.after, 0);
 
-    let replayed = sync_relay_once_v2(
+    let replayed = sync_relay_once(
         &restarted_source,
         &local,
         remote.device_id(),
@@ -411,10 +411,10 @@ async fn unchanged_head_watch_does_not_busy_loop() {
 }
 
 #[tokio::test]
-async fn pull_v3_bytes_posts_signed_envelope_and_returns_sealed_page() {
-    use crate::pull_v3::{
-        PULL_PATH, PULL_V3_VERSION, PullPageV3, PullRequestV3, seal_pull_page_v3,
-        sign_pull_request_v3, verify_pull_page_v3, verify_pull_request_v3,
+async fn pull_bytes_posts_signed_envelope_and_returns_sealed_page() {
+    use crate::pull::{
+        PULL_PATH, PULL_VERSION, PullPage, PullRequest, seal_pull_page, sign_pull_request,
+        verify_pull_page, verify_pull_request,
     };
     use axum::routing::post;
 
@@ -429,13 +429,13 @@ async fn pull_v3_bytes_posts_signed_envelope_and_returns_sealed_page() {
         post(move |body: axum::body::Bytes| {
             let server = Arc::clone(&server_for_route);
             async move {
-                let (peer, req) = verify_pull_request_v3(&body, 1_000_000, |id| {
+                let (peer, req) = verify_pull_request(&body, 1_000_000, |id| {
                     Ok((*id == client_id).then_some(client_sec1))
                 })
                 .unwrap();
                 assert_eq!(peer, client_id);
-                let page = PullPageV3 {
-                    version: PULL_V3_VERSION,
+                let page = PullPage {
+                    version: PULL_VERSION,
                     epoch: req.relay_epoch,
                     reset: false,
                     floor: 0,
@@ -448,13 +448,13 @@ async fn pull_v3_bytes_posts_signed_envelope_and_returns_sealed_page() {
                     snapshot_recommended: false,
                     store: req.store,
                 };
-                seal_pull_page_v3(&page, &server, Hlc(100)).unwrap()
+                seal_pull_page(&page, &server, Hlc(100)).unwrap()
             }
         }),
     );
     let source = spawn_app(app).await;
-    let request = PullRequestV3 {
-        version: PULL_V3_VERSION,
+    let request = PullRequest {
+        version: PULL_VERSION,
         coverage: Default::default(),
         relay_epoch: "11".repeat(32),
         relay_after: 9,
@@ -464,23 +464,23 @@ async fn pull_v3_bytes_posts_signed_envelope_and_returns_sealed_page() {
         store: Some("trellis".to_string()),
         issued_at_ms: 1_000_000,
     };
-    let signed = sign_pull_request_v3(&request, &client, Hlc(50)).unwrap();
-    let (status, bytes) = source.pull_v3_bytes(signed).await.unwrap();
+    let signed = sign_pull_request(&request, &client, Hlc(50)).unwrap();
+    let (status, bytes) = source.pull_bytes(signed).await.unwrap();
     assert_eq!(status, 200);
-    let page = verify_pull_page_v3(&bytes, &server.device_id(), &server.public_key_sec1()).unwrap();
+    let page = verify_pull_page(&bytes, &server.device_id(), &server.public_key_sec1()).unwrap();
     assert!(page.complete);
     assert_eq!(page.next_relay_seq, 9);
     assert_eq!(page.store.as_deref(), Some("trellis"));
 }
 
 #[test]
-fn relay_v2_rejects_replayed_signature_for_a_different_nonce() {
+fn relay_rejects_replayed_signature_for_a_different_nonce() {
     use super::relay::{RELAY_OPS_SIGNING_CONTEXT, sign_relay_response, verify_relay_signature};
     use super::tests_support::encoded_relay_response;
     use crate::identity::encode_hex;
 
     let serving = DeviceIdentity::generate();
-    let cursor = RelayCursorV2 {
+    let cursor = RelayCursor {
         epoch: [0x88; 32],
         after: 4,
     };
@@ -517,22 +517,22 @@ fn relay_v2_rejects_replayed_signature_for_a_different_nonce() {
 }
 
 #[tokio::test]
-async fn relay_v2_unsupported_status_is_reported_precisely() {
+async fn relay_unsupported_status_is_reported_precisely() {
     let client = spawn_app(Router::new()).await;
     let expected = DeviceIdentity::generate();
 
     let error = client
-        .fetch_relay_ops_v2(
+        .fetch_relay_ops(
             &expected,
             expected.device_id(),
             &expected.public_key_sec1(),
-            RelayCursorV2::START,
+            RelayCursor::START,
         )
         .await
         .unwrap_err();
-    assert!(error.is_relay_v2_unsupported());
+    assert!(error.is_relay_unsupported());
     assert!(matches!(
         error,
-        TransportError::RelayV2Unsupported { status: 404 }
+        TransportError::RelayRelayUnsupported { status: 404 }
     ));
 }

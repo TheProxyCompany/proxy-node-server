@@ -1,0 +1,346 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{agent_name}} · {{address}}</title>
+<style>
+{{style}}
+</style>
+</head>
+<body data-agent-id="{{agent_id}}" data-agent-name="{{agent_name}}">
+<main>
+  <p class="address">{{address}}</p>
+
+  <section id="signin" hidden>
+    <h1>{{agent_name}}</h1>
+    <p>Talk to {{agent_name}} at {{address}} from this browser. Signing in asks your Proxy: you let this page in from Proxy on your Mac or phone, once.</p>
+    <p><button id="signin-button" type="button">Sign in with your Proxy</button></p>
+    <p id="signin-note" class="note"></p>
+  </section>
+
+  <section id="chat" hidden>
+    <header>
+      <h1>{{agent_name}}</h1>
+      <button id="signout" class="quiet" type="button">Sign out</button>
+    </header>
+    <ol id="messages" class="messages"></ol>
+    <form id="composer">
+      <textarea id="draft" rows="2" placeholder="Say something to {{agent_name}}"></textarea>
+      <button id="send" type="submit">Send</button>
+    </form>
+    <p id="chat-note" class="note"></p>
+  </section>
+</main>
+<script>
+(function () {
+  var agent = { id: document.body.dataset.agentId, name: document.body.dataset.agentName };
+  // This page is the client's redirect: the address sends the person back
+  // here with the code once they have let it in.
+  var page = location.origin + location.pathname;
+  var keys = {
+    bearer: "proxy.web.bearer",
+    device: "proxy.web.device",
+    client: "proxy.web.client:" + location.pathname,
+    pkce: "proxy.web.pkce",
+    thread: "proxy.web.thread:" + location.pathname
+  };
+  var bearer = null;
+  // The Mac that minted the bearer, the only one that admits it. The router
+  // names it on the token answer, and every client API call is pinned to it
+  // with x-proxy-target-device, so on an address with more than one Mac a
+  // call never reaches another Mac and its 401. Absent when the page is
+  // reached without the router.
+  var device = null;
+  var thread = null;
+  var polling = null;
+
+  function $(id) { return document.getElementById(id); }
+  function read(area, key) { try { return area.getItem(key); } catch (e) { return null; } }
+  function write(area, key, value) { try { area.setItem(key, value); } catch (e) {} }
+  function remove(area, key) { try { area.removeItem(key); } catch (e) {} }
+  function note(id, text) { $(id).textContent = text || ""; }
+  function show(section) {
+    $("signin").hidden = section !== "signin";
+    $("chat").hidden = section !== "chat";
+  }
+  function json(response) {
+    return response.json().then(function (body) {
+      if (!response.ok) throw new Error(body && (body.error_description || body.error) || "answered " + response.status);
+      return body;
+    });
+  }
+
+  // --- Sign in with your Proxy: the address's own OAuth flow, in this browser ---
+
+  function base64url(bytes) {
+    var text = "";
+    for (var i = 0; i < bytes.length; i++) text += String.fromCharCode(bytes[i]);
+    return btoa(text).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  }
+  function randomToken() {
+    var bytes = new Uint8Array(32);
+    crypto.getRandomValues(bytes);
+    return base64url(bytes);
+  }
+  function challengeOf(verifier) {
+    return crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier)).then(function (digest) {
+      return base64url(new Uint8Array(digest));
+    });
+  }
+
+  // The page registers itself as a client of the address once, and keeps
+  // the id it was given.
+  function clientId() {
+    var kept = read(localStorage, keys.client);
+    if (kept) return Promise.resolve(kept);
+    return fetch("/oauth/register", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ client_name: location.host + "/" + agent.id + " on the web", redirect_uris: [page] })
+    }).then(json).then(function (registered) {
+      write(localStorage, keys.client, registered.client_id);
+      return registered.client_id;
+    });
+  }
+
+  function signIn() {
+    $("signin-button").disabled = true;
+    note("signin-note", "Asking your Proxy…");
+    var verifier = randomToken();
+    var state = randomToken();
+    write(sessionStorage, keys.pkce, JSON.stringify({ verifier: verifier, state: state }));
+    Promise.all([clientId(), challengeOf(verifier)]).then(function (both) {
+      var url = new URL("/oauth/authorize", location.origin);
+      url.searchParams.set("response_type", "code");
+      url.searchParams.set("client_id", both[0]);
+      url.searchParams.set("redirect_uri", page);
+      url.searchParams.set("code_challenge", both[1]);
+      url.searchParams.set("code_challenge_method", "S256");
+      url.searchParams.set("state", state);
+      location.assign(url.toString());
+    }).catch(function (error) {
+      $("signin-button").disabled = false;
+      note("signin-note", "Could not start signing in: " + error.message);
+    });
+  }
+
+  // Back from the address with the code: it leaves the URL at once, and is
+  // exchanged for the bearer, which stays in this browser.
+  function finishSignIn(params) {
+    var kept = JSON.parse(read(sessionStorage, keys.pkce) || "null");
+    remove(sessionStorage, keys.pkce);
+    history.replaceState(null, "", location.pathname);
+    show("signin");
+    if (params.get("error")) {
+      note("signin-note", params.get("error") === "access_denied" ? "Not let in. Nothing changed." : "The address refused: " + params.get("error"));
+      return;
+    }
+    if (!kept || kept.state !== params.get("state")) {
+      note("signin-note", "This sign-in did not start here. Try again.");
+      return;
+    }
+    note("signin-note", "Let in. Finishing…");
+    var form = new URLSearchParams();
+    form.set("grant_type", "authorization_code");
+    form.set("code", params.get("code"));
+    form.set("redirect_uri", page);
+    form.set("client_id", read(localStorage, keys.client) || "");
+    form.set("code_verifier", kept.verifier);
+    fetch("/oauth/token", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: form.toString()
+    }).then(function (response) {
+      var minted = response.headers.get("x-proxy-target-device");
+      return json(response).then(function (issued) { return { issued: issued, minted: minted }; });
+    }).then(function (answer) {
+      write(localStorage, keys.bearer, answer.issued.access_token);
+      if (answer.minted) write(localStorage, keys.device, answer.minted);
+      else remove(localStorage, keys.device);
+      note("signin-note", "");
+      openChat();
+    }).catch(function (error) {
+      note("signin-note", "Could not finish signing in: " + error.message);
+    });
+  }
+
+  // Forget the bearer in this browser only. A 401 or 403 is never a reason
+  // to revoke: on an address with more than one Mac it can come from a Mac
+  // that did not mint the bearer, and revoking would end a good token.
+  function forget() {
+    bearer = null;
+    device = null;
+    remove(localStorage, keys.bearer);
+    remove(localStorage, keys.device);
+    remove(sessionStorage, keys.thread);
+    thread = null;
+    if (polling) clearTimeout(polling);
+    $("messages").textContent = "";
+    note("signin-note", "");
+    $("signin-button").disabled = false;
+    show("signin");
+  }
+
+  // The person pressed Sign out: the one place this page revokes its bearer.
+  function signOut() {
+    var token = bearer;
+    var headers = pinned({ "content-type": "application/x-www-form-urlencoded" });
+    forget();
+    if (token) {
+      var form = new URLSearchParams();
+      form.set("token", token);
+      fetch("/oauth/revoke", { method: "POST", headers: headers, body: form.toString() }).catch(function () {});
+    }
+  }
+
+  // --- The chat: the client API at this address, with the bearer ---
+
+  function pinned(headers) {
+    if (device) headers["x-proxy-target-device"] = device;
+    return headers;
+  }
+  function later(ms) { return new Promise(function (resolve) { setTimeout(resolve, ms); }); }
+
+  // Retry reads once on refusal or an offline Mac. A failed write may
+  // already have been accepted, so sending it again could run a turn twice.
+  function api(path, init, retried) {
+    init = init || {};
+    var method = (init.method || "GET").toUpperCase();
+    var readOnly = method === "GET" || method === "HEAD";
+    init.headers = pinned(Object.assign({ authorization: "Bearer " + bearer, accept: "application/json" }, init.headers || {}));
+    return fetch("/client/v1" + path, init).then(function (response) {
+      var refused = response.status === 401 || response.status === 403;
+      var offline = response.status === 502 || response.status === 503;
+      if (readOnly && (refused || offline) && !retried) {
+        note("chat-note", "Reconnecting…");
+        return later(1500).then(function () { return api(path, init, true); }).then(function (data) {
+          note("chat-note", "");
+          return data;
+        });
+      }
+      if (refused) {
+        forget();
+        note("signin-note", "This browser is no longer let in. Sign in again.");
+        throw new Error("signed out");
+      }
+      if (offline) {
+        if (!readOnly) throw new Error("The request may have gone through. Check the conversation before sending again.");
+        note("chat-note", "Your Proxy is offline. Open Proxy on that Mac; this page keeps trying.");
+        throw new Error("your Proxy is offline");
+      }
+      return response.json().then(function (body) {
+        if (!response.ok || !body || body.ok !== true) throw new Error(body && body.error ? body.error : "answered " + response.status);
+        return body.data;
+      });
+    });
+  }
+
+  function openChat() {
+    bearer = read(localStorage, keys.bearer);
+    device = read(localStorage, keys.device);
+    thread = read(sessionStorage, keys.thread);
+    show("chat");
+    note("chat-note", "");
+    $("draft").focus();
+    if (thread) poll();
+  }
+
+  // Each visit is a direct thread with the agent, opened on the first
+  // message, that the app shows.
+  function ensureThread() {
+    if (thread) return Promise.resolve(thread);
+    return api("/threads", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ title: agent.name + " on the web", participant: { agent_id: agent.id }, worksite: "none" })
+    }).then(function (opened) {
+      thread = opened.id;
+      write(sessionStorage, keys.thread, thread);
+      return thread;
+    });
+  }
+
+  function send(text) {
+    $("send").disabled = true;
+    ensureThread().then(function (id) {
+      return api("/threads/" + id + "/messages", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ content: text })
+      });
+    }).then(function () {
+      $("draft").value = "";
+      poll();
+    }).catch(function (error) {
+      if (error.message !== "signed out") note("chat-note", "Could not confirm delivery: " + error.message);
+    }).then(function () {
+      $("send").disabled = false;
+    });
+  }
+
+  function refresh() {
+    return api("/threads/" + thread + "/messages?limit=200").then(function (page) {
+      render(Array.isArray(page.items) ? page.items : []);
+    });
+  }
+
+  // Quick while the agent is working, slow once the thread is idle.
+  function poll() {
+    if (polling) clearTimeout(polling);
+    if (!thread || !bearer) return;
+    Promise.all([refresh(), api("/threads/" + thread + "/queue-idle")]).then(function (both) {
+      var idle = both[1].idle === true;
+      note("chat-note", idle ? "" : agent.name + " is thinking…");
+      polling = setTimeout(poll, idle ? 6000 : 1500);
+    }).catch(function (error) {
+      if (error.message !== "signed out") polling = setTimeout(poll, 6000);
+    });
+  }
+
+  function render(items) {
+    var list = $("messages");
+    list.textContent = "";
+    items.forEach(function (item) {
+      var said = (item.item_type === "message" || item.item_type === undefined) && typeof item.content === "string" && item.content.trim();
+      if (!said || (item.role !== "user" && item.role !== "assistant")) return;
+      var entry = document.createElement("li");
+      entry.className = item.role;
+      var who = document.createElement("span");
+      who.className = "who";
+      who.textContent = item.role === "user" ? "You" : (item.author_display_name || agent.name);
+      var text = document.createElement("p");
+      text.textContent = item.content.trim();
+      entry.appendChild(who);
+      entry.appendChild(text);
+      list.appendChild(entry);
+    });
+    if (items.length) window.scrollTo(0, document.body.scrollHeight);
+  }
+
+  $("signin-button").addEventListener("click", signIn);
+  $("signout").addEventListener("click", signOut);
+  $("composer").addEventListener("submit", function (event) {
+    event.preventDefault();
+    var text = $("draft").value.trim();
+    if (text) send(text);
+  });
+  $("draft").addEventListener("keydown", function (event) {
+    if (event.key === "Enter" && !event.shiftKey) {
+      event.preventDefault();
+      $("composer").requestSubmit();
+    }
+  });
+
+  var params = new URLSearchParams(location.search);
+  if (params.has("code") || params.has("error")) {
+    finishSignIn(params);
+  } else if (read(localStorage, keys.bearer)) {
+    openChat();
+  } else {
+    show("signin");
+  }
+})();
+</script>
+</body>
+</html>

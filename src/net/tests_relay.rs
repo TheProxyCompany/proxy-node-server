@@ -12,9 +12,7 @@ use super::tests_support::{
     FailingDeviceBook, StateOnlyRelayLog, encoded_devices, encoded_relay_response,
     raw_relay_ops_request, seal_kv_op, spawn_app, spawn_devices_response, spawn_relay_ops_response,
 };
-use super::{
-    DEFAULT_PULL_LIMIT, HeadPublisher, RelayCursorV2, RelayWireEntryV2, ServeState, router,
-};
+use super::{DEFAULT_PULL_LIMIT, HeadPublisher, RelayCursor, RelayWireEntry, ServeState, router};
 use crate::error::TransportError;
 use crate::hlc::Hlc;
 use crate::identity::{DeviceIdentity, encode_hex};
@@ -168,7 +166,7 @@ async fn devices_source_failure_is_not_signed_as_an_empty_book() {
 }
 
 #[tokio::test]
-async fn relay_v2_invalid_cursor_resets_before_querying_page() {
+async fn relay_invalid_cursor_resets_before_querying_page() {
     let serving = Arc::new(DeviceIdentity::generate());
     let caller = DeviceIdentity::generate();
     let page_calls = Arc::new(AtomicUsize::new(0));
@@ -187,20 +185,20 @@ async fn relay_v2_invalid_cursor_resets_before_querying_page() {
     .await;
 
     let state = client
-        .fetch_relay_head_v2(
+        .fetch_relay_head(
             &caller,
             serving.device_id(),
             &serving.public_key_sec1(),
-            RelayCursorV2::START,
+            RelayCursor::START,
         )
         .await
         .unwrap();
     let reset = client
-        .fetch_relay_ops_v2(
+        .fetch_relay_ops(
             &caller,
             serving.device_id(),
             &serving.public_key_sec1(),
-            RelayCursorV2 {
+            RelayCursor {
                 epoch: state.epoch,
                 after: u64::MAX,
             },
@@ -214,7 +212,7 @@ async fn relay_v2_invalid_cursor_resets_before_querying_page() {
 }
 
 #[tokio::test]
-async fn relay_v2_rejects_oversized_page_before_querying_source() {
+async fn relay_rejects_oversized_page_before_querying_source() {
     let serving = Arc::new(DeviceIdentity::generate());
     let caller = DeviceIdentity::generate();
     let page_calls = Arc::new(AtomicUsize::new(0));
@@ -234,11 +232,11 @@ async fn relay_v2_rejects_oversized_page_before_querying_source() {
     .with_limit(DEFAULT_PULL_LIMIT + 1);
 
     let error = client
-        .fetch_relay_ops_v2(
+        .fetch_relay_ops(
             &caller,
             serving.device_id(),
             &serving.public_key_sec1(),
-            RelayCursorV2::START,
+            RelayCursor::START,
         )
         .await
         .unwrap_err();
@@ -247,7 +245,7 @@ async fn relay_v2_rejects_oversized_page_before_querying_source() {
 }
 
 #[tokio::test]
-async fn relay_v2_rejects_unknown_caller_without_signed_response() {
+async fn relay_rejects_unknown_caller_without_signed_response() {
     let serving = Arc::new(DeviceIdentity::generate());
     let caller = DeviceIdentity::generate();
     let mut registry = DeviceRegistry::new();
@@ -263,7 +261,7 @@ async fn relay_v2_rejects_unknown_caller_without_signed_response() {
         &client,
         &caller,
         serving.device_id(),
-        RelayCursorV2::START,
+        RelayCursor::START,
         1,
         1,
         [0x31; 32],
@@ -275,7 +273,7 @@ async fn relay_v2_rejects_unknown_caller_without_signed_response() {
 }
 
 #[tokio::test]
-async fn relay_v2_fails_closed_when_caller_lookup_fails() {
+async fn relay_fails_closed_when_caller_lookup_fails() {
     let serving = Arc::new(DeviceIdentity::generate());
     let caller = DeviceIdentity::generate();
     let client = spawn_app(router(ServeState::new(
@@ -289,7 +287,7 @@ async fn relay_v2_fails_closed_when_caller_lookup_fails() {
         &client,
         &caller,
         serving.device_id(),
-        RelayCursorV2::START,
+        RelayCursor::START,
         1,
         1,
         [0x32; 32],
@@ -301,7 +299,7 @@ async fn relay_v2_fails_closed_when_caller_lookup_fails() {
 }
 
 #[tokio::test]
-async fn relay_v2_rejects_request_query_tampering() {
+async fn relay_rejects_request_query_tampering() {
     let serving = Arc::new(DeviceIdentity::generate());
     let caller = DeviceIdentity::generate();
     let mut registry = DeviceRegistry::new();
@@ -318,7 +316,7 @@ async fn relay_v2_rejects_request_query_tampering() {
         &client,
         &caller,
         serving.device_id(),
-        RelayCursorV2::START,
+        RelayCursor::START,
         1,
         2,
         [0x33; 32],
@@ -330,7 +328,7 @@ async fn relay_v2_rejects_request_query_tampering() {
 }
 
 #[tokio::test]
-async fn relay_v2_rejects_a_replayed_authenticated_request() {
+async fn relay_rejects_a_replayed_authenticated_request() {
     let serving = Arc::new(DeviceIdentity::generate());
     let caller = DeviceIdentity::generate();
     let mut registry = DeviceRegistry::new();
@@ -348,7 +346,7 @@ async fn relay_v2_rejects_a_replayed_authenticated_request() {
         &client,
         &caller,
         serving.device_id(),
-        RelayCursorV2::START,
+        RelayCursor::START,
         1,
         1,
         nonce,
@@ -360,7 +358,7 @@ async fn relay_v2_rejects_a_replayed_authenticated_request() {
         &client,
         &caller,
         serving.device_id(),
-        RelayCursorV2::START,
+        RelayCursor::START,
         1,
         1,
         nonce,
@@ -371,7 +369,7 @@ async fn relay_v2_rejects_a_replayed_authenticated_request() {
 }
 
 #[tokio::test]
-async fn relay_v2_never_evicts_an_unexpired_replay_nonce_at_capacity() {
+async fn relay_never_evicts_an_unexpired_replay_nonce_at_capacity() {
     let serving = Arc::new(DeviceIdentity::generate());
     let caller = DeviceIdentity::generate();
     let mut registry = DeviceRegistry::new();
@@ -396,7 +394,7 @@ async fn relay_v2_never_evicts_an_unexpired_replay_nonce_at_capacity() {
         &client,
         &caller,
         serving.device_id(),
-        RelayCursorV2::START,
+        RelayCursor::START,
         1,
         1,
         [0xff; 32],
@@ -408,7 +406,7 @@ async fn relay_v2_never_evicts_an_unexpired_replay_nonce_at_capacity() {
 }
 
 #[tokio::test]
-async fn relay_v2_delivers_a_late_lower_order_key_by_arrival_sequence() {
+async fn relay_delivers_a_late_lower_order_key_by_arrival_sequence() {
     let serving = Arc::new(DeviceIdentity::generate());
     let author = DeviceIdentity::generate();
     let high = seal_kv_op(&author, Hlc(30), "high", b"first");
@@ -428,11 +426,11 @@ async fn relay_v2_delivers_a_late_lower_order_key_by_arrival_sequence() {
     .await;
 
     let first = client
-        .fetch_relay_ops_v2(
+        .fetch_relay_ops(
             &author,
             serving.device_id(),
             &serving.public_key_sec1(),
-            RelayCursorV2::START,
+            RelayCursor::START,
         )
         .await
         .unwrap();
@@ -440,7 +438,7 @@ async fn relay_v2_delivers_a_late_lower_order_key_by_arrival_sequence() {
     assert_eq!(first.entries[0].seq, 1);
     assert_eq!(first.entries[0].op.id, high.id);
     let status = client
-        .fetch_relay_head_v2(
+        .fetch_relay_head(
             &author,
             serving.device_id(),
             &serving.public_key_sec1(),
@@ -454,7 +452,7 @@ async fn relay_v2_delivers_a_late_lower_order_key_by_arrival_sequence() {
 
     log.lock().unwrap().append(low.clone());
     let late = client
-        .fetch_relay_ops_v2(
+        .fetch_relay_ops(
             &author,
             serving.device_id(),
             &serving.public_key_sec1(),
@@ -468,7 +466,7 @@ async fn relay_v2_delivers_a_late_lower_order_key_by_arrival_sequence() {
 }
 
 #[tokio::test]
-async fn relay_v2_epoch_mismatch_returns_authenticated_reset() {
+async fn relay_epoch_mismatch_returns_authenticated_reset() {
     let serving = Arc::new(DeviceIdentity::generate());
     let author = DeviceIdentity::generate();
     let log = Arc::new(Mutex::new(OpLog::new()));
@@ -486,11 +484,11 @@ async fn relay_v2_epoch_mismatch_returns_authenticated_reset() {
     .await;
 
     let reset = client
-        .fetch_relay_ops_v2(
+        .fetch_relay_ops(
             &author,
             serving.device_id(),
             &serving.public_key_sec1(),
-            RelayCursorV2 {
+            RelayCursor {
                 epoch: [0x99; 32],
                 after: 1,
             },
@@ -504,7 +502,7 @@ async fn relay_v2_epoch_mismatch_returns_authenticated_reset() {
 }
 
 #[tokio::test]
-async fn relay_v2_watch_wakes_for_a_unique_late_lower_order_key() {
+async fn relay_watch_wakes_for_a_unique_late_lower_order_key() {
     let serving = Arc::new(DeviceIdentity::generate());
     let author = DeviceIdentity::generate();
     let high = seal_kv_op(&author, Hlc(30), "high", b"first");
@@ -528,11 +526,11 @@ async fn relay_v2_watch_wakes_for_a_unique_late_lower_order_key() {
     ))
     .await;
     let first = client
-        .fetch_relay_ops_v2(
+        .fetch_relay_ops(
             &author,
             serving.device_id(),
             &serving.public_key_sec1(),
-            RelayCursorV2::START,
+            RelayCursor::START,
         )
         .await
         .unwrap();
@@ -546,7 +544,7 @@ async fn relay_v2_watch_wakes_for_a_unique_late_lower_order_key() {
     });
     let start = Instant::now();
     let observed = client
-        .watch_relay_head_v2(
+        .watch_relay_head(
             &author,
             serving.device_id(),
             &serving.public_key_sec1(),
@@ -564,27 +562,27 @@ async fn relay_v2_watch_wakes_for_a_unique_late_lower_order_key() {
 }
 
 #[tokio::test]
-async fn relay_v2_rejects_tampered_sequence_body() {
+async fn relay_rejects_tampered_sequence_body() {
     let serving = Arc::new(DeviceIdentity::generate());
     let author = DeviceIdentity::generate();
     let envelope = seal_kv_op(&author, Hlc(10), "k", b"v").to_bytes().unwrap();
     let epoch = [0x44; 32];
-    let cursor = RelayCursorV2 { epoch, after: 0 };
+    let cursor = RelayCursor { epoch, after: 0 };
     let signed = encoded_relay_response(
         epoch,
         1,
         1,
-        vec![RelayWireEntryV2 {
+        vec![RelayWireEntry {
             seq: 1,
             envelope: envelope.clone(),
         }],
     );
-    let tampered = encoded_relay_response(epoch, 2, 2, vec![RelayWireEntryV2 { seq: 2, envelope }]);
+    let tampered = encoded_relay_response(epoch, 2, 2, vec![RelayWireEntry { seq: 2, envelope }]);
     let client =
         spawn_relay_ops_response(tampered, signed, Arc::clone(&serving), cursor, 10, None).await;
 
     let error = client
-        .fetch_relay_ops_v2(
+        .fetch_relay_ops(
             &serving,
             serving.device_id(),
             &serving.public_key_sec1(),
@@ -599,7 +597,7 @@ async fn relay_v2_rejects_tampered_sequence_body() {
 }
 
 #[tokio::test]
-async fn relay_v2_rejects_tampered_envelope_body() {
+async fn relay_rejects_tampered_envelope_body() {
     let serving = Arc::new(DeviceIdentity::generate());
     let author = DeviceIdentity::generate();
     let envelope = seal_kv_op(&author, Hlc(10), "k", b"v").to_bytes().unwrap();
@@ -607,13 +605,13 @@ async fn relay_v2_rejects_tampered_envelope_body() {
     let last = tampered_envelope.last_mut().unwrap();
     *last ^= 0x01;
     let epoch = [0x45; 32];
-    let cursor = RelayCursorV2 { epoch, after: 0 };
-    let signed = encoded_relay_response(epoch, 1, 1, vec![RelayWireEntryV2 { seq: 1, envelope }]);
+    let cursor = RelayCursor { epoch, after: 0 };
+    let signed = encoded_relay_response(epoch, 1, 1, vec![RelayWireEntry { seq: 1, envelope }]);
     let tampered = encoded_relay_response(
         epoch,
         1,
         1,
-        vec![RelayWireEntryV2 {
+        vec![RelayWireEntry {
             seq: 1,
             envelope: tampered_envelope,
         }],
@@ -622,7 +620,7 @@ async fn relay_v2_rejects_tampered_envelope_body() {
         spawn_relay_ops_response(tampered, signed, Arc::clone(&serving), cursor, 10, None).await;
 
     let error = client
-        .fetch_relay_ops_v2(
+        .fetch_relay_ops(
             &serving,
             serving.device_id(),
             &serving.public_key_sec1(),
@@ -637,29 +635,29 @@ async fn relay_v2_rejects_tampered_envelope_body() {
 }
 
 #[tokio::test]
-async fn relay_v2_rejects_signed_non_monotonic_sequences_before_envelopes() {
+async fn relay_rejects_signed_non_monotonic_sequences_before_envelopes() {
     let serving = Arc::new(DeviceIdentity::generate());
     let author = DeviceIdentity::generate();
     let envelope = seal_kv_op(&author, Hlc(10), "k", b"v").to_bytes().unwrap();
     let epoch = [0x55; 32];
-    let cursor = RelayCursorV2 { epoch, after: 0 };
+    let cursor = RelayCursor { epoch, after: 0 };
     let body = encoded_relay_response(
         epoch,
         2,
         1,
         vec![
-            RelayWireEntryV2 {
+            RelayWireEntry {
                 seq: 2,
                 envelope: envelope.clone(),
             },
-            RelayWireEntryV2 { seq: 1, envelope },
+            RelayWireEntry { seq: 1, envelope },
         ],
     );
     let client =
         spawn_relay_ops_response(body.clone(), body, Arc::clone(&serving), cursor, 10, None).await;
 
     let error = client
-        .fetch_relay_ops_v2(
+        .fetch_relay_ops(
             &serving,
             serving.device_id(),
             &serving.public_key_sec1(),
@@ -673,15 +671,15 @@ async fn relay_v2_rejects_signed_non_monotonic_sequences_before_envelopes() {
 }
 
 #[tokio::test]
-async fn relay_v2_rejects_signed_malformed_envelope() {
+async fn relay_rejects_signed_malformed_envelope() {
     let serving = Arc::new(DeviceIdentity::generate());
     let epoch = [0x66; 32];
-    let cursor = RelayCursorV2 { epoch, after: 0 };
+    let cursor = RelayCursor { epoch, after: 0 };
     let body = encoded_relay_response(
         epoch,
         1,
         1,
-        vec![RelayWireEntryV2 {
+        vec![RelayWireEntry {
             seq: 1,
             envelope: vec![0xff],
         }],
@@ -690,7 +688,7 @@ async fn relay_v2_rejects_signed_malformed_envelope() {
         spawn_relay_ops_response(body.clone(), body, Arc::clone(&serving), cursor, 10, None).await;
 
     let error = client
-        .fetch_relay_ops_v2(
+        .fetch_relay_ops(
             &serving,
             serving.device_id(),
             &serving.public_key_sec1(),
@@ -702,20 +700,20 @@ async fn relay_v2_rejects_signed_malformed_envelope() {
 }
 
 #[tokio::test]
-async fn relay_v2_checks_page_limit_before_decoding_envelopes() {
+async fn relay_checks_page_limit_before_decoding_envelopes() {
     let serving = Arc::new(DeviceIdentity::generate());
     let epoch = [0x67; 32];
-    let cursor = RelayCursorV2 { epoch, after: 0 };
+    let cursor = RelayCursor { epoch, after: 0 };
     let body = encoded_relay_response(
         epoch,
         2,
         2,
         vec![
-            RelayWireEntryV2 {
+            RelayWireEntry {
                 seq: 1,
                 envelope: vec![0xff],
             },
-            RelayWireEntryV2 {
+            RelayWireEntry {
                 seq: 2,
                 envelope: vec![0xff],
             },
@@ -725,7 +723,7 @@ async fn relay_v2_checks_page_limit_before_decoding_envelopes() {
         spawn_relay_ops_response(body.clone(), body, Arc::clone(&serving), cursor, 1, None).await;
 
     let error = client
-        .fetch_relay_ops_v2(
+        .fetch_relay_ops(
             &serving,
             serving.device_id(),
             &serving.public_key_sec1(),
@@ -737,16 +735,16 @@ async fn relay_v2_checks_page_limit_before_decoding_envelopes() {
 }
 
 #[tokio::test]
-async fn relay_v2_rejects_signature_from_an_unpinned_key() {
+async fn relay_rejects_signature_from_an_unpinned_key() {
     let serving = DeviceIdentity::generate();
     let attacker = Arc::new(DeviceIdentity::generate());
     let epoch = [0x77; 32];
-    let cursor = RelayCursorV2 { epoch, after: 0 };
+    let cursor = RelayCursor { epoch, after: 0 };
     let body = encoded_relay_response(epoch, 0, 0, Vec::new());
     let client = spawn_relay_ops_response(body.clone(), body, attacker, cursor, 10, None).await;
 
     let error = client
-        .fetch_relay_ops_v2(
+        .fetch_relay_ops(
             &serving,
             serving.device_id(),
             &serving.public_key_sec1(),

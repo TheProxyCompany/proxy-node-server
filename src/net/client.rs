@@ -15,12 +15,12 @@ use super::relay::{
 };
 use super::{
     DEFAULT_PULL_LIMIT, DEFAULT_REQUEST_TIMEOUT, DevicesResp, IdentityResp, PullResponse,
-    RelayCursorV2, RelayPageV2, RelayResponseV2, WATCH_MAX_WAIT, encode_order_key,
+    RelayCursor, RelayPage, RelayResponse, WATCH_MAX_WAIT, encode_order_key,
 };
 use crate::error::TransportError;
 use crate::identity::{DeviceId, DeviceIdentity, encode_hex};
 use crate::op::{OrderKey, SignedOp};
-use crate::pull_v3::{MAX_V3_RESPONSE_BYTES, PULL_PATH};
+use crate::pull::{MAX_PULL_RESPONSE_BYTES, PULL_PATH};
 use crate::transport::{Cursor, PullSource};
 
 /// Pulls a peer's op-log over HTTP.
@@ -181,20 +181,20 @@ impl HttpPullSource {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn request_relay_v2(
+    async fn request_relay(
         &self,
         local_identity: &DeviceIdentity,
         url: String,
         context: &[u8],
         request_context: &[u8],
         request_bound: u64,
-        cursor: RelayCursorV2,
+        cursor: RelayCursor,
         expected_peer: DeviceId,
         expected_public_key_sec1: &[u8; 33],
         max_entries: usize,
         status_only: bool,
         timeout: Option<Duration>,
-    ) -> Result<RelayPageV2, TransportError> {
+    ) -> Result<RelayPage, TransportError> {
         let mut nonce = [0u8; 32];
         OsRng
             .try_fill_bytes(&mut nonce)
@@ -228,7 +228,7 @@ impl HttpPullSource {
             response.status(),
             StatusCode::NOT_FOUND | StatusCode::NOT_IMPLEMENTED
         ) {
-            return Err(TransportError::RelayV2Unsupported {
+            return Err(TransportError::RelayRelayUnsupported {
                 status: response.status().as_u16(),
             });
         }
@@ -264,20 +264,20 @@ impl HttpPullSource {
             &body,
             &signature,
         )?;
-        let wire: RelayResponseV2 =
+        let wire: RelayResponse =
             postcard::from_bytes(&body).map_err(|e| TransportError::Wire(e.to_string()))?;
         decode_relay_response(wire, cursor, max_entries, status_only)
     }
 
     /// Pull a bounded, authenticated page from the peer's insertion-ordered v2
     /// relay stream.
-    pub async fn fetch_relay_ops_v2(
+    pub async fn fetch_relay_ops(
         &self,
         local_identity: &DeviceIdentity,
         expected_peer: DeviceId,
         expected_public_key_sec1: &[u8; 33],
-        cursor: RelayCursorV2,
-    ) -> Result<RelayPageV2, TransportError> {
+        cursor: RelayCursor,
+    ) -> Result<RelayPage, TransportError> {
         let url = format!(
             "{}/v2/ops?epoch={}&after={}&limit={}",
             self.base_url,
@@ -285,7 +285,7 @@ impl HttpPullSource {
             cursor.after,
             self.limit
         );
-        self.request_relay_v2(
+        self.request_relay(
             local_identity,
             url,
             RELAY_OPS_SIGNING_CONTEXT,
@@ -302,20 +302,20 @@ impl HttpPullSource {
     }
 
     /// Fetch authenticated relay stream bounds without transferring entries.
-    pub async fn fetch_relay_head_v2(
+    pub async fn fetch_relay_head(
         &self,
         local_identity: &DeviceIdentity,
         expected_peer: DeviceId,
         expected_public_key_sec1: &[u8; 33],
-        cursor: RelayCursorV2,
-    ) -> Result<RelayPageV2, TransportError> {
+        cursor: RelayCursor,
+    ) -> Result<RelayPage, TransportError> {
         let url = format!(
             "{}/v2/head?epoch={}&after={}",
             self.base_url,
             encode_hex(&cursor.epoch),
             cursor.after
         );
-        self.request_relay_v2(
+        self.request_relay(
             local_identity,
             url,
             RELAY_HEAD_SIGNING_CONTEXT,
@@ -333,14 +333,14 @@ impl HttpPullSource {
 
     /// Long-poll authenticated relay bounds, waking for every unique insertion
     /// even when its semantic [`OrderKey`] is below the existing v1 head.
-    pub async fn watch_relay_head_v2(
+    pub async fn watch_relay_head(
         &self,
         local_identity: &DeviceIdentity,
         expected_peer: DeviceId,
         expected_public_key_sec1: &[u8; 33],
-        cursor: RelayCursorV2,
+        cursor: RelayCursor,
         wait: Duration,
-    ) -> Result<RelayPageV2, TransportError> {
+    ) -> Result<RelayPage, TransportError> {
         let wait = wait.min(WATCH_MAX_WAIT);
         let wait_millis = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX);
         let url = format!(
@@ -350,7 +350,7 @@ impl HttpPullSource {
             cursor.after,
             wait_millis
         );
-        self.request_relay_v2(
+        self.request_relay(
             local_identity,
             url,
             RELAY_WATCH_SIGNING_CONTEXT,
@@ -367,8 +367,8 @@ impl HttpPullSource {
     }
 
     /// POST a signed v3 pull request envelope to [`PULL_PATH`] and return
-    /// `(status_code, raw_response_bytes)`, bounded by [`MAX_V3_RESPONSE_BYTES`].
-    pub async fn pull_v3_bytes(
+    /// `(status_code, raw_response_bytes)`, bounded by [`MAX_PULL_RESPONSE_BYTES`].
+    pub async fn pull_bytes(
         &self,
         signed_request: Vec<u8>,
     ) -> Result<(u16, Vec<u8>), TransportError> {
@@ -386,7 +386,7 @@ impl HttpPullSource {
         let status = response.status().as_u16();
         if response
             .content_length()
-            .is_some_and(|length| length > MAX_V3_RESPONSE_BYTES as u64)
+            .is_some_and(|length| length > MAX_PULL_RESPONSE_BYTES as u64)
         {
             return Err(TransportError::Wire("oversized v3 pull page".into()));
         }
@@ -394,7 +394,7 @@ impl HttpPullSource {
             .bytes()
             .await
             .map_err(|e| TransportError::Http(e.to_string()))?;
-        if bytes.len() > MAX_V3_RESPONSE_BYTES {
+        if bytes.len() > MAX_PULL_RESPONSE_BYTES {
             return Err(TransportError::Wire("oversized v3 pull page".into()));
         }
         Ok((status, bytes.to_vec()))

@@ -14,7 +14,7 @@ use super::relay::{
 use super::server::octet;
 use super::{
     DEFAULT_MAX_PARKED_WATCHES, DeviceEntry, DevicesResp, HeadPublisher, HttpPullSource,
-    RELAY_PROTOCOL_VERSION, RelayCursorV2, RelayResponseV2, RelayWireEntryV2, ServeState,
+    RELAY_PROTOCOL_VERSION, RelayCursor, RelayResponse, RelayWireEntry, ServeState,
     decode_fixed_hex, router,
 };
 use crate::hlc::Hlc;
@@ -83,9 +83,9 @@ pub(super) fn encoded_relay_response(
     epoch: [u8; 32],
     head: u64,
     next: u64,
-    entries: Vec<RelayWireEntryV2>,
+    entries: Vec<RelayWireEntry>,
 ) -> Vec<u8> {
-    postcard::to_allocvec(&RelayResponseV2 {
+    postcard::to_allocvec(&RelayResponse {
         v: RELAY_PROTOCOL_VERSION,
         epoch,
         head,
@@ -101,7 +101,7 @@ pub(super) async fn spawn_relay_ops_response(
     body: Vec<u8>,
     signed_body: Vec<u8>,
     signer: Arc<DeviceIdentity>,
-    cursor: RelayCursorV2,
+    cursor: RelayCursor,
     limit: u16,
     signing_nonce: Option<[u8; 32]>,
 ) -> HttpPullSource {
@@ -150,7 +150,7 @@ pub(super) async fn raw_relay_ops_request(
     client: &HttpPullSource,
     caller: &DeviceIdentity,
     serving_peer: DeviceId,
-    cursor: RelayCursorV2,
+    cursor: RelayCursor,
     signed_limit: u16,
     url_limit: u16,
     nonce: [u8; 32],

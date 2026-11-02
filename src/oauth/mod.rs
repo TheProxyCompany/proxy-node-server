@@ -24,6 +24,7 @@ use thiserror::Error;
 
 use crate::identity::encode_hex;
 
+pub mod ask_proof;
 #[cfg(feature = "pull-http")]
 pub mod net;
 mod server;

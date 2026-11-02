@@ -11,11 +11,11 @@ use crate::identity::{DeviceIdentity, encode_hex};
 use crate::kv::{KvOp, KvStore, kv_store_id};
 use crate::log::OpLog;
 use crate::net::{
-    CoverageVector, HttpPullSource, MeshPullSocket, OpLogPullSocket, PULL_PATH, PULL_V3_VERSION,
-    PullPageV3, PullPhase, PullRequestV3, RelayCursorV2, ResumeV3, ServeState, V3_PAGE_LIMIT_MAX,
-    V3Outcome, build_pull_page_v3, decode_epoch, decode_page_op, drain_v3_pages,
-    preview_head_window_v3, preview_resume_after, sign_pull_request_v3, sweep_store_v3, unix_ms,
-    v3_pull_router, validate_v3_reset, verify_pull_page_v3,
+    CoverageVector, HttpPullSource, MeshPullSocket, OpLogPullSocket, PULL_PAGE_LIMIT_MAX,
+    PULL_PATH, PULL_VERSION, PullOutcome, PullPage, PullPhase, PullRequest, RelayCursor, Resume,
+    ServeState, build_pull_page, decode_epoch, decode_page_op, drain_pull_pages,
+    preview_head_window, preview_resume_after, pull_router, sign_pull_request, sweep_store,
+    unix_ms, validate_pull_reset, verify_pull_page,
 };
 use crate::op::{ENVELOPE_VERSION, OpBody, OpId, OrderKey, SignedOp, StoreId};
 use crate::registry::DeviceRegistry;
@@ -61,7 +61,7 @@ fn seal_custom_store_op(
 }
 
 #[tokio::test]
-async fn http_pull_source_pull_v3_seals_posts_and_verifies_page() {
+async fn http_pull_source_pull_seals_posts_and_verifies_page() {
     let server = Arc::new(DeviceIdentity::generate());
     let client = DeviceIdentity::generate();
     let other = DeviceIdentity::generate();
@@ -76,7 +76,7 @@ async fn http_pull_source_pull_v3_seals_posts_and_verifies_page() {
     let devices = Arc::new(Mutex::new(reg));
 
     let state = ServeState::new(Arc::clone(&server), log, devices);
-    let app = v3_pull_router(state);
+    let app = pull_router(state);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -85,8 +85,8 @@ async fn http_pull_source_pull_v3_seals_posts_and_verifies_page() {
     });
 
     let source = HttpPullSource::new(format!("http://{addr}"));
-    let request = PullRequestV3 {
-        version: PULL_V3_VERSION,
+    let request = PullRequest {
+        version: PULL_VERSION,
         coverage: BTreeMap::new(),
         relay_epoch: "00".repeat(32),
         relay_after: 0,
@@ -98,7 +98,7 @@ async fn http_pull_source_pull_v3_seals_posts_and_verifies_page() {
     };
 
     let page = source
-        .pull_v3(
+        .pull(
             &request,
             &client,
             Hlc(80),
@@ -113,7 +113,7 @@ async fn http_pull_source_pull_v3_seals_posts_and_verifies_page() {
     assert_eq!(page.store.as_deref(), Some("trellis"));
 
     let wrong_peer = source
-        .pull_v3(
+        .pull(
             &request,
             &client,
             Hlc(81),
@@ -125,7 +125,7 @@ async fn http_pull_source_pull_v3_seals_posts_and_verifies_page() {
     assert!(matches!(wrong_peer, TransportError::Verify { .. }));
 
     let unregistered = source
-        .pull_v3(
+        .pull(
             &request,
             &other,
             Hlc(82),
@@ -138,7 +138,7 @@ async fn http_pull_source_pull_v3_seals_posts_and_verifies_page() {
 }
 
 #[tokio::test]
-async fn drain_v3_splits_channels_fronts_own_origin_and_advances_coverage() {
+async fn drain_splits_channels_fronts_own_origin_and_advances_coverage() {
     let server = Arc::new(DeviceIdentity::generate());
     let client = DeviceIdentity::generate();
     let lower_origin = loop {
@@ -169,7 +169,7 @@ async fn drain_v3_splits_channels_fronts_own_origin_and_advances_coverage() {
         Arc::clone(&server_log),
         devices.clone(),
     );
-    let app = v3_pull_router(state);
+    let app = pull_router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -192,9 +192,9 @@ async fn drain_v3_splits_channels_fronts_own_origin_and_advances_coverage() {
         coverage: &client_coverage,
         cursors: &client_cursors,
     };
-    let mut relay_cursor: Option<RelayCursorV2> = None;
+    let mut relay_cursor: Option<RelayCursor> = None;
 
-    let outcome = drain_v3_pages(
+    let outcome = drain_pull_pages(
         &socket,
         &source,
         &server.device_id(),
@@ -205,7 +205,7 @@ async fn drain_v3_splits_channels_fronts_own_origin_and_advances_coverage() {
     )
     .await
     .unwrap();
-    assert_eq!(outcome, V3Outcome::Applied(2));
+    assert_eq!(outcome, PullOutcome::Applied(2));
     assert_eq!(client_store.lock().unwrap().get("own"), Some(&b"1"[..]));
     assert_eq!(client_store.lock().unwrap().get("low"), Some(&b"2"[..]));
     assert_eq!(
@@ -224,7 +224,7 @@ async fn drain_v3_splits_channels_fronts_own_origin_and_advances_coverage() {
         .lock()
         .unwrap()
         .append(seal_kv_op(&lower_origin, 50, "late-below-claim", b"3"));
-    let second = drain_v3_pages(
+    let second = drain_pull_pages(
         &socket,
         &source,
         &server.device_id(),
@@ -235,7 +235,7 @@ async fn drain_v3_splits_channels_fronts_own_origin_and_advances_coverage() {
     )
     .await
     .unwrap();
-    assert_eq!(second, V3Outcome::Applied(1));
+    assert_eq!(second, PullOutcome::Applied(1));
     assert_eq!(
         client_store.lock().unwrap().get("late-below-claim"),
         Some(&b"3"[..])
@@ -244,7 +244,7 @@ async fn drain_v3_splits_channels_fronts_own_origin_and_advances_coverage() {
 }
 
 #[tokio::test]
-async fn build_pull_page_v3_pages_both_channels_through_resume_tokens() {
+async fn build_pull_page_pages_both_channels_through_resume_tokens() {
     let server = Arc::new(DeviceIdentity::generate());
     let client = DeviceIdentity::generate();
     let first = DeviceIdentity::generate();
@@ -267,7 +267,7 @@ async fn build_pull_page_v3_pages_both_channels_through_resume_tokens() {
     }
     let state = ServeState::new(Arc::clone(&server), log, Arc::new(Mutex::new(reg)));
 
-    let mut resume: Option<ResumeV3> = None;
+    let mut resume: Option<Resume> = None;
     let mut epoch = [0u8; 32];
     let mut after = 0u64;
     let mut delivered = HashSet::new();
@@ -276,8 +276,8 @@ async fn build_pull_page_v3_pages_both_channels_through_resume_tokens() {
     loop {
         pages += 1;
         assert!(pages < 16, "pagination must terminate");
-        let request = PullRequestV3 {
-            version: PULL_V3_VERSION,
+        let request = PullRequest {
+            version: PULL_VERSION,
             coverage: BTreeMap::new(),
             relay_epoch: encode_hex(&epoch),
             relay_after: after,
@@ -287,7 +287,7 @@ async fn build_pull_page_v3_pages_both_channels_through_resume_tokens() {
             store: None,
             issued_at_ms: unix_ms() as i64,
         };
-        let page = build_pull_page_v3(&state, &client.device_id(), &request).unwrap();
+        let page = build_pull_page(&state, &client.device_id(), &request).unwrap();
         assert!(!page.reset);
         assert!(page.backfill.len() + page.keyed.len() <= 1);
         epoch = decode_epoch(&page.epoch).unwrap();
@@ -341,7 +341,7 @@ async fn preview_and_store_sweep_operate_without_advancing_durable_cursors() {
     let devices = Arc::new(Mutex::new(reg));
 
     let state = ServeState::new(Arc::clone(&server), server_log, devices.clone());
-    let app = v3_pull_router(state);
+    let app = pull_router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -365,7 +365,7 @@ async fn preview_and_store_sweep_operate_without_advancing_durable_cursors() {
         cursors: &client_cursors,
     };
 
-    let (previewed, next_seq) = preview_head_window_v3(
+    let (previewed, next_seq) = preview_head_window(
         &socket,
         &source,
         &server.device_id(),
@@ -382,7 +382,7 @@ async fn preview_and_store_sweep_operate_without_advancing_durable_cursors() {
     assert!(client_cursors.lock().unwrap().is_empty());
     assert!(client_coverage.lock().unwrap().0.is_empty());
 
-    let swept = sweep_store_v3(
+    let swept = sweep_store(
         &socket,
         &source,
         &server.device_id(),
@@ -398,31 +398,31 @@ async fn preview_and_store_sweep_operate_without_advancing_durable_cursors() {
 }
 
 #[test]
-fn validate_v3_reset_and_preview_resume_after_enforce_protocol_invariants() {
-    let head = u64::from(V3_PAGE_LIMIT_MAX) * 3;
+fn validate_pull_reset_and_preview_resume_after_enforce_protocol_invariants() {
+    let head = u64::from(PULL_PAGE_LIMIT_MAX) * 3;
     assert_eq!(
         preview_resume_after(None, head),
-        head - u64::from(V3_PAGE_LIMIT_MAX)
+        head - u64::from(PULL_PAGE_LIMIT_MAX)
     );
     assert_eq!(preview_resume_after(Some(head - 5), head), head - 5);
     assert_eq!(
         preview_resume_after(Some(1), head),
-        head - u64::from(V3_PAGE_LIMIT_MAX)
+        head - u64::from(PULL_PAGE_LIMIT_MAX)
     );
 
-    let request = PullRequestV3 {
-        version: PULL_V3_VERSION,
+    let request = PullRequest {
+        version: PULL_VERSION,
         coverage: BTreeMap::new(),
         relay_epoch: encode_hex(&[1u8; 32]),
         relay_after: 5,
         resume: None,
-        limit: V3_PAGE_LIMIT_MAX,
+        limit: PULL_PAGE_LIMIT_MAX,
         audit: false,
         store: None,
         issued_at_ms: 1_000,
     };
-    let bad_floor = PullPageV3 {
-        version: PULL_V3_VERSION,
+    let bad_floor = PullPage {
+        version: PULL_VERSION,
         epoch: encode_hex(&[2u8; 32]),
         reset: true,
         floor: 10,
@@ -436,19 +436,19 @@ fn validate_v3_reset_and_preview_resume_after_enforce_protocol_invariants() {
         store: None,
     };
     assert!(
-        validate_v3_reset(&request, &bad_floor, [2u8; 32])
+        validate_pull_reset(&request, &bad_floor, [2u8; 32])
             .unwrap_err()
             .contains("invalid v3 reset")
     );
 
-    let valid_reset = PullPageV3 {
+    let valid_reset = PullPage {
         floor: 2,
         head_seq: 5,
         ..bad_floor
     };
     assert_eq!(
-        validate_v3_reset(&request, &valid_reset, [2u8; 32]).unwrap(),
-        RelayCursorV2::new([2u8; 32], 2)
+        validate_pull_reset(&request, &valid_reset, [2u8; 32]).unwrap(),
+        RelayCursor::new([2u8; 32], 2)
     );
 
     let _ = (
@@ -457,5 +457,5 @@ fn validate_v3_reset_and_preview_resume_after_enforce_protocol_invariants() {
         OpId::from_bytes([0; 32]),
         OrderKey::MIN,
     );
-    let _ = (sign_pull_request_v3, verify_pull_page_v3);
+    let _ = (sign_pull_request, verify_pull_page);
 }
