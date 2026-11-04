@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use crate::{DeviceId, Hlc, OpId, OrderKey};
-use rusqlite::params;
+use rusqlite::{OptionalExtension, params};
 
 use super::SqliteError as GCError;
 use super::coverage;
@@ -162,6 +162,63 @@ pub fn current_relay_floor(conn: &rusqlite::Connection) -> Result<u64, GCError> 
     .map_err(|e| GCError::Other(format!("compaction floor readback: {e}")))
 }
 
+fn horizon_relay_floor(conn: &rusqlite::Connection, cutoff: i64) -> Result<i64, GCError> {
+    let oldest: Option<(i64, i64)> = conn
+        .query_row(
+            "SELECT relay_seq, arrived_at FROM oplog_db.oplog_arrivals
+             ORDER BY relay_seq ASC LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|e| GCError::Other(format!("compaction oldest arrival: {e}")))?;
+    let Some((min_seq, min_arrived_at)) = oldest else {
+        return Ok(0);
+    };
+    if min_arrived_at > cutoff {
+        return Ok(0);
+    }
+    let newest: (i64, i64) = conn
+        .query_row(
+            "SELECT relay_seq, arrived_at FROM oplog_db.oplog_arrivals
+             ORDER BY relay_seq DESC LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|e| GCError::Other(format!("compaction newest arrival: {e}")))?;
+    if newest.1 <= cutoff {
+        return Ok(newest.0);
+    }
+    let mut lo = min_seq;
+    let mut hi = newest.0;
+    let mut best = min_seq;
+    let mut probe = conn
+        .prepare_cached(
+            "SELECT relay_seq, arrived_at FROM oplog_db.oplog_arrivals
+             WHERE relay_seq <= ?1
+             ORDER BY relay_seq DESC LIMIT 1",
+        )
+        .map_err(|e| GCError::Other(format!("compaction horizon probe prepare: {e}")))?;
+    while lo <= hi {
+        let mid = lo + (hi - lo) / 2;
+        let row: Option<(i64, i64)> = probe
+            .query_row(params![mid], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()
+            .map_err(|e| GCError::Other(format!("compaction horizon probe: {e}")))?;
+        let Some((seq, arrived_at)) = row else {
+            lo = mid + 1;
+            continue;
+        };
+        if arrived_at <= cutoff {
+            best = best.max(seq);
+            lo = mid + 1;
+        } else {
+            hi = seq - 1;
+        }
+    }
+    Ok(best)
+}
+
 pub fn safe_relay_floor(
     conn: &rusqlite::Connection,
     local_device: &DeviceId,
@@ -175,13 +232,7 @@ pub fn safe_relay_floor(
         )
         .map_err(|e| GCError::Other(format!("compaction peer count: {e}")))?;
     let cutoff = chrono::Utc::now().timestamp() - horizon.as_secs() as i64;
-    let horizon_floor: i64 = conn
-        .query_row(
-            "SELECT COALESCE(MAX(relay_seq), 0) FROM oplog_db.oplog_arrivals WHERE arrived_at <= ?1",
-            params![cutoff],
-            |row| row.get(0),
-        )
-        .map_err(|e| GCError::Other(format!("compaction relay floor: {e}")))?;
+    let horizon_floor = horizon_relay_floor(conn, cutoff)?;
     if peers == 0 {
         return Ok(CompactionBounds {
             peers,
@@ -549,11 +600,16 @@ fn trim_upsert_head_payloads(
 ) -> Result<(), GCError> {
     let mut stmt = conn
         .prepare(&format!(
-            "SELECT store_id, table_name, row_pk, payload
-             FROM oplog_db.oplog_heads
-             WHERE op_id IN ({placeholders})
-               AND store_id = 'proxydb'
-               AND LENGTH(payload) > 0"
+            "SELECT heads.store_id, heads.table_name, heads.row_pk, heads.payload
+             FROM oplog_db.oplog AS o
+             JOIN oplog_db.oplog_heads AS heads
+               ON heads.store_id = o.store_id
+              AND heads.table_name = o.table_name
+              AND heads.row_pk = o.row_pk
+              AND heads.op_id = o.op_id
+             WHERE o.op_id IN ({placeholders})
+               AND +o.store_id = 'proxydb'
+               AND LENGTH(heads.payload) > 0"
         ))
         .map_err(|e| GCError::Other(format!("compaction head trim select prepare: {e}")))?;
     let rows = stmt
