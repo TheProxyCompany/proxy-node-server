@@ -118,25 +118,53 @@ pub fn demote_head(conn: &rusqlite::Connection, op_id: &OpId) -> Result<(), GCEr
     if !is_head {
         return Ok(());
     }
-    let updated = conn
+    let replacement: Option<(i64, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> = conn
         .prepare_cached(
-            "UPDATE oplog_db.oplog_heads
-             SET (hlc, device_id, op_id, payload) = (
-                 SELECT hlc, device_id, op_id, payload
-                 FROM oplog_db.oplog INDEXED BY idx_oplog_lww
-                 WHERE store_id = ?1 AND table_name = ?2 AND row_pk = ?3 AND applied = 1
-                 ORDER BY hlc DESC, device_id DESC, op_id DESC
-                 LIMIT 1
-             )
-             WHERE store_id = ?1 AND table_name = ?2 AND row_pk = ?3
-               AND EXISTS (
-                 SELECT 1 FROM oplog_db.oplog INDEXED BY idx_oplog_lww
-                 WHERE store_id = ?1 AND table_name = ?2 AND row_pk = ?3 AND applied = 1
-               )",
+            "SELECT hlc, device_id, op_id, payload, envelope
+             FROM oplog_db.oplog INDEXED BY idx_oplog_lww
+             WHERE store_id = ?1 AND table_name = ?2 AND row_pk = ?3 AND applied = 1
+             ORDER BY hlc DESC, device_id DESC, op_id DESC
+             LIMIT 1",
         )
-        .and_then(|mut stmt| stmt.execute(params![store, table, row_pk]))
+        .and_then(|mut stmt| {
+            stmt.query_row(params![store, table, row_pk], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .optional()
+        })
+        .map_err(|e| GCError::Other(format!("oplog demote head select: {e}")))?;
+    if let Some((hlc, device_id, next_op_id, payload, envelope)) = replacement {
+        let resolved_payload = if !payload.is_empty() {
+            payload
+        } else {
+            SignedOp::from_bytes(&envelope)
+                .map(|op| op.body.payload)
+                .unwrap_or_default()
+        };
+        conn.prepare_cached(
+            "UPDATE oplog_db.oplog_heads
+             SET hlc = ?4, device_id = ?5, op_id = ?6, payload = ?7
+             WHERE store_id = ?1 AND table_name = ?2 AND row_pk = ?3",
+        )
+        .and_then(|mut stmt| {
+            stmt.execute(params![
+                store,
+                table,
+                row_pk,
+                hlc,
+                device_id,
+                next_op_id,
+                resolved_payload
+            ])
+        })
         .map_err(|e| GCError::Other(format!("oplog demote head rederive: {e}")))?;
-    if updated == 0 {
+    } else {
         conn.prepare_cached(
             "DELETE FROM oplog_db.oplog_heads
              WHERE store_id = ?1 AND table_name = ?2 AND row_pk = ?3",
@@ -162,25 +190,59 @@ pub fn rebuild_head(
     table: &str,
     row_pk: &str,
 ) -> Result<(), GCError> {
-    let rebuilt = conn
+    let newest: Option<(i64, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> = conn
         .prepare_cached(
+            "SELECT hlc, device_id, op_id, payload, envelope
+             FROM oplog_db.oplog INDEXED BY idx_oplog_lww
+             WHERE store_id = ?1 AND table_name = ?2 AND row_pk = ?3 AND applied = 1
+             ORDER BY hlc DESC, device_id DESC, op_id DESC
+             LIMIT 1",
+        )
+        .and_then(|mut stmt| {
+            stmt.query_row(params![store, table, row_pk], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .optional()
+        })
+        .map_err(|e| GCError::Other(format!("oplog rebuild head select: {e}")))?;
+    if let Some((hlc, device_id, op_id, payload, envelope)) = newest {
+        let resolved_payload = if !payload.is_empty() {
+            payload
+        } else {
+            SignedOp::from_bytes(&envelope)
+                .map(|op| op.body.payload)
+                .unwrap_or_default()
+        };
+        conn.prepare_cached(
             "INSERT OR REPLACE INTO oplog_db.oplog_heads
                 (store_id, table_name, row_pk, hlc, device_id, op_id, payload, origin_device)
-             SELECT ?1, ?2, ?3, newest.hlc, newest.device_id, newest.op_id, newest.payload,
-                    (SELECT device_id FROM oplog_db.oplog INDEXED BY idx_oplog_lww
-                     WHERE store_id = ?1 AND table_name = ?2 AND row_pk = ?3 AND applied = 1
-                     ORDER BY hlc ASC, device_id ASC, op_id ASC
-                     LIMIT 1)
-             FROM (
-                 SELECT hlc, device_id, op_id, payload FROM oplog_db.oplog INDEXED BY idx_oplog_lww
+             VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7,
+                (SELECT device_id FROM oplog_db.oplog INDEXED BY idx_oplog_lww
                  WHERE store_id = ?1 AND table_name = ?2 AND row_pk = ?3 AND applied = 1
-                 ORDER BY hlc DESC, device_id DESC, op_id DESC
-                 LIMIT 1
-             ) AS newest",
+                 ORDER BY hlc ASC, device_id ASC, op_id ASC
+                 LIMIT 1)
+             )",
         )
-        .and_then(|mut stmt| stmt.execute(params![store, table, row_pk]))
+        .and_then(|mut stmt| {
+            stmt.execute(params![
+                store,
+                table,
+                row_pk,
+                hlc,
+                device_id,
+                op_id,
+                resolved_payload
+            ])
+        })
         .map_err(|e| GCError::Other(format!("oplog rebuild head: {e}")))?;
-    if rebuilt == 0 {
+    } else {
         conn.prepare_cached(
             "DELETE FROM oplog_db.oplog_heads
              WHERE store_id = ?1 AND table_name = ?2 AND row_pk = ?3",

@@ -245,6 +245,23 @@ impl CompactionProbeIndex {
     }
 }
 
+fn is_self_draining_bulk_table(store: &str, table: &str) -> bool {
+    store == "proxydb"
+        && matches!(
+            table,
+            "items"
+                | "sequences"
+                | "widget_files"
+                | "party_files"
+                | "conversations"
+                | "conversation_participants"
+                | "conversation_jobs"
+                | "message_attachments"
+        )
+}
+
+const SELF_DRAINING_SQL_FILTER: &str = "(store_id = 'proxydb' AND table_name IN ('items', 'sequences', 'widget_files', 'party_files', 'conversations', 'conversation_participants', 'conversation_jobs', 'message_attachments'))";
+
 pub fn compaction_candidates(
     conn: &rusqlite::Connection,
     policy: &CompactionPolicy,
@@ -356,26 +373,29 @@ pub fn compaction_candidates(
             if std::time::Instant::now() >= deadline {
                 break 'scan;
             }
-            let shadowed = policy.keep_per_row == 0
-                || newer
-                    .exists(params![
-                        store,
-                        table,
-                        row_pk,
-                        hlc,
-                        device,
-                        op_id,
-                        i64::from(policy.keep_per_row) - 1
-                    ])
-                    .map_err(|e| GCError::Other(format!("compaction newer probe: {e}")))?;
-            if !shadowed {
-                continue;
-            }
-            let has_older = older
-                .exists(params![store, table, row_pk, hlc, device, op_id])
-                .map_err(|e| GCError::Other(format!("compaction older probe: {e}")))?;
-            if !has_older {
-                continue;
+            let bulk_drain = is_self_draining_bulk_table(&store, &table);
+            if !bulk_drain {
+                let shadowed = policy.keep_per_row == 0
+                    || newer
+                        .exists(params![
+                            store,
+                            table,
+                            row_pk,
+                            hlc,
+                            device,
+                            op_id,
+                            i64::from(policy.keep_per_row) - 1
+                        ])
+                        .map_err(|e| GCError::Other(format!("compaction newer probe: {e}")))?;
+                if !shadowed {
+                    continue;
+                }
+                let has_older = older
+                    .exists(params![store, table, row_pk, hlc, device, op_id])
+                    .map_err(|e| GCError::Other(format!("compaction older probe: {e}")))?;
+                if !has_older {
+                    continue;
+                }
             }
             if std::time::Instant::now() >= deadline {
                 break 'scan;
@@ -386,9 +406,10 @@ pub fn compaction_candidates(
                 || fire_pin
                     .exists(params![op_id])
                     .map_err(|e| GCError::Other(format!("compaction fire probe: {e}")))?
-                || head_pin
-                    .exists(params![store, table, row_pk, op_id])
-                    .map_err(|e| GCError::Other(format!("compaction head probe: {e}")))?
+                || (!bulk_drain
+                    && head_pin
+                        .exists(params![store, table, row_pk, op_id])
+                        .map_err(|e| GCError::Other(format!("compaction head probe: {e}")))?)
                 || projection_pin
                     .exists(params![op_id])
                     .map_err(|e| GCError::Other(format!("compaction projection probe: {e}")))?
@@ -435,14 +456,17 @@ pub fn delete_ops_chunk(
                     (SELECT op_id FROM external_row_replay_queue WHERE state != 'failed')";
     let oplog_pins = pins.replace("{alias}", "oplog");
     let arrival_pins = pins.replace("{alias}", "oplog_arrivals");
-    let oplog_head_pin = "NOT EXISTS (
+    let oplog_head_pin = format!(
+        "({SELF_DRAINING_SQL_FILTER} OR NOT EXISTS (
              SELECT 1 FROM oplog_db.oplog_heads AS heads
              WHERE heads.store_id = oplog.store_id
                AND heads.table_name = oplog.table_name
                AND heads.row_pk = oplog.row_pk
                AND heads.op_id = oplog.op_id
-         )";
-    let arrival_head_pin = "NOT EXISTS (
+         ))"
+    );
+    let arrival_head_pin = format!(
+        "NOT EXISTS (
              SELECT 1
              FROM oplog_db.oplog AS pinned_op
              JOIN oplog_db.oplog_heads AS heads
@@ -451,7 +475,9 @@ pub fn delete_ops_chunk(
               AND heads.row_pk = pinned_op.row_pk
               AND heads.op_id = pinned_op.op_id
              WHERE pinned_op.op_id = oplog_arrivals.op_id
-         )";
+               AND NOT (pinned_op.store_id = 'proxydb' AND pinned_op.table_name IN ('items', 'sequences', 'widget_files', 'party_files', 'conversations', 'conversation_participants', 'conversation_jobs', 'message_attachments'))
+         )"
+    );
 
     let (bytes, floor): (i64, i64) = conn
         .query_row(
@@ -468,6 +494,17 @@ pub fn delete_ops_chunk(
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .map_err(|e| GCError::Other(format!("compaction chunk stats: {e}")))?;
+    conn.execute(
+        &format!(
+            "UPDATE oplog_db.oplog_heads
+             SET payload = X''
+             WHERE op_id IN ({placeholders})
+               AND {SELF_DRAINING_SQL_FILTER}
+               AND LENGTH(payload) > 64"
+        ),
+        rusqlite::params_from_iter(ids.iter()),
+    )
+    .map_err(|e| GCError::Other(format!("compaction head payload trim: {e}")))?;
     conn.execute(
         &format!(
             "DELETE FROM oplog_db.oplog_arrivals
@@ -487,6 +524,15 @@ pub fn delete_ops_chunk(
             rusqlite::params_from_iter(ids.iter()),
         )
         .map_err(|e| GCError::Other(format!("compaction oplog delete: {e}")))?;
+    conn.execute(
+        &format!(
+            "DELETE FROM oplog_db.mesh_verified_ops
+             WHERE op_id IN ({placeholders})
+               AND op_id NOT IN (SELECT op_id FROM oplog_db.oplog)"
+        ),
+        rusqlite::params_from_iter(ids.iter()),
+    )
+    .map_err(|e| GCError::Other(format!("compaction verified_ops delete: {e}")))?;
     if deleted > 0 {
         conn.execute(
             "UPDATE oplog_db.mesh_relay_state

@@ -49,7 +49,7 @@ pub fn append(
                 op.body.hlc.0 as i64,
                 op.body.device.as_bytes().as_slice(),
                 op.body.store.as_str(),
-                op.body.payload,
+                &[] as &[u8],
                 envelope,
                 table,
                 row_pk,
@@ -433,7 +433,7 @@ pub fn newest_op_in_store(
         }
     }
     conn.prepare_cached(
-        "SELECT hlc, device_id, op_id, payload FROM oplog_db.oplog INDEXED BY idx_oplog_lww
+        "SELECT hlc, device_id, op_id, payload, envelope FROM oplog_db.oplog INDEXED BY idx_oplog_lww
          WHERE store_id = ?1 AND table_name = ?2 AND row_pk = ?3 AND applied = 1
            AND op_id != ?4
          ORDER BY hlc DESC, device_id DESC, op_id DESC
@@ -442,7 +442,19 @@ pub fn newest_op_in_store(
     .and_then(|mut stmt| {
         stmt.query_row(
             params![store, table, row_pk, exclude.as_bytes().as_slice()],
-            |row| Ok((order_key_from_row(row)?, row.get::<_, Vec<u8>>(3)?)),
+            |row| {
+                let key = order_key_from_row(row)?;
+                let payload: Vec<u8> = row.get(3)?;
+                let envelope: Vec<u8> = row.get(4)?;
+                let resolved = if !payload.is_empty() {
+                    payload
+                } else {
+                    SignedOp::from_bytes(&envelope)
+                        .map(|op| op.body.payload)
+                        .unwrap_or_default()
+                };
+                Ok((key, resolved))
+            },
         )
         .optional()
     })
