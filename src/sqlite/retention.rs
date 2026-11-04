@@ -261,6 +261,15 @@ fn is_self_draining_bulk_table(store: &str, table: &str) -> bool {
 }
 
 const SELF_DRAINING_SQL_FILTER: &str = "(store_id = 'proxydb' AND table_name IN ('items', 'sequences', 'widget_files', 'party_files', 'conversations', 'conversation_participants', 'conversation_jobs', 'message_attachments'))";
+const SELF_DRAINING_HEAD_TRIM_TABLES: &[&str] = &[
+    "items",
+    "sequences",
+    "widget_files",
+    "conversations",
+    "conversation_participants",
+    "conversation_jobs",
+    "message_attachments",
+];
 
 pub fn compaction_candidates(
     conn: &rusqlite::Connection,
@@ -465,8 +474,7 @@ pub fn delete_ops_chunk(
                AND heads.op_id = oplog.op_id
          ))"
     );
-    let arrival_head_pin = format!(
-        "NOT EXISTS (
+    let arrival_head_pin = "NOT EXISTS (
              SELECT 1
              FROM oplog_db.oplog AS pinned_op
              JOIN oplog_db.oplog_heads AS heads
@@ -476,8 +484,7 @@ pub fn delete_ops_chunk(
               AND heads.op_id = pinned_op.op_id
              WHERE pinned_op.op_id = oplog_arrivals.op_id
                AND NOT (pinned_op.store_id = 'proxydb' AND pinned_op.table_name IN ('items', 'sequences', 'widget_files', 'party_files', 'conversations', 'conversation_participants', 'conversation_jobs', 'message_attachments'))
-         )"
-    );
+         )";
 
     let (bytes, floor): (i64, i64) = conn
         .query_row(
@@ -494,17 +501,7 @@ pub fn delete_ops_chunk(
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .map_err(|e| GCError::Other(format!("compaction chunk stats: {e}")))?;
-    conn.execute(
-        &format!(
-            "UPDATE oplog_db.oplog_heads
-             SET payload = X''
-             WHERE op_id IN ({placeholders})
-               AND {SELF_DRAINING_SQL_FILTER}
-               AND LENGTH(payload) > 64"
-        ),
-        rusqlite::params_from_iter(ids.iter()),
-    )
-    .map_err(|e| GCError::Other(format!("compaction head payload trim: {e}")))?;
+    trim_upsert_head_payloads(conn, &placeholders, &ids)?;
     conn.execute(
         &format!(
             "DELETE FROM oplog_db.oplog_arrivals
@@ -543,4 +540,52 @@ pub fn delete_ops_chunk(
         .map_err(|e| GCError::Other(format!("compaction floor advance: {e}")))?;
     }
     Ok((deleted, bytes as u64))
+}
+
+fn trim_upsert_head_payloads(
+    conn: &rusqlite::Connection,
+    placeholders: &str,
+    ids: &[Vec<u8>],
+) -> Result<(), GCError> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT store_id, table_name, row_pk, payload
+             FROM oplog_db.oplog_heads
+             WHERE op_id IN ({placeholders})
+               AND store_id = 'proxydb'
+               AND LENGTH(payload) > 0"
+        ))
+        .map_err(|e| GCError::Other(format!("compaction head trim select prepare: {e}")))?;
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(ids.iter()), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+            ))
+        })
+        .map_err(|e| GCError::Other(format!("compaction head trim select: {e}")))?;
+    let mut clear_stmt = conn
+        .prepare_cached(
+            "UPDATE oplog_db.oplog_heads
+             SET payload = X''
+             WHERE store_id = ?1 AND table_name = ?2 AND row_pk = ?3",
+        )
+        .map_err(|e| GCError::Other(format!("compaction head trim update prepare: {e}")))?;
+    for row in rows {
+        let (store_id, table_name, row_pk, payload) =
+            row.map_err(|e| GCError::Other(format!("compaction head trim row: {e}")))?;
+        if !SELF_DRAINING_HEAD_TRIM_TABLES.contains(&table_name.as_str()) {
+            continue;
+        }
+        if let Ok(decoded) = crate::row_op::ProxyDbOp::decode_bytes(&payload) {
+            if matches!(decoded.mutation, crate::row_op::Mutation::Upsert { .. }) {
+                clear_stmt
+                    .execute(params![store_id, table_name, row_pk])
+                    .map_err(|e| GCError::Other(format!("compaction head trim update: {e}")))?;
+            }
+        }
+    }
+    Ok(())
 }
