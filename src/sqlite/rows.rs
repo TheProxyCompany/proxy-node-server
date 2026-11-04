@@ -648,6 +648,7 @@ pub fn row_divergence(
 ) -> Result<RowDivergence, SqliteError> {
     match newest_payload {
         None => Ok(RowDivergence::Uncovered),
+        Some([]) => Ok(RowDivergence::Covered),
         Some(payload) => match ProxyDbOp::decode_bytes(payload)
             .map_err(|e| SqliteError::Other(format!("decode row op: {e}")))?
             .mutation

@@ -118,22 +118,33 @@ pub fn ops_for_row_asc(
 ) -> Result<Vec<(OpId, Vec<u8>)>, GCError> {
     let mut stmt = conn
         .prepare(
-            "SELECT op_id, payload FROM oplog_db.oplog INDEXED BY idx_oplog_lww
+            "SELECT op_id, payload, envelope FROM oplog_db.oplog INDEXED BY idx_oplog_lww
              WHERE store_id = ?1 AND table_name = ?2 AND row_pk = ?3 AND applied = 1
              ORDER BY hlc ASC, device_id ASC, op_id ASC",
         )
         .map_err(|e| GCError::Other(format!("oplog ops_for_row_asc prepare: {e}")))?;
     let rows = stmt
         .query_map(params![store, table, row_pk], |row| {
-            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+            ))
         })
         .map_err(|e| GCError::Other(format!("oplog ops_for_row_asc query: {e}")))?;
     let mut ops = Vec::new();
     for row in rows {
-        let (op_id, payload) =
+        let (op_id, payload, envelope) =
             row.map_err(|e| GCError::Other(format!("oplog ops_for_row_asc row: {e}")))?;
+        let resolved = if !payload.is_empty() {
+            payload
+        } else {
+            SignedOp::from_bytes(&envelope)
+                .map(|op| op.body.payload)
+                .unwrap_or_default()
+        };
         if let Ok(arr) = <[u8; 32]>::try_from(op_id.as_slice()) {
-            ops.push((OpId::from_bytes(arr), payload));
+            ops.push((OpId::from_bytes(arr), resolved));
         }
     }
     Ok(ops)
