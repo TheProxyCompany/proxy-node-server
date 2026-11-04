@@ -600,11 +600,16 @@ fn trim_upsert_head_payloads(
 ) -> Result<(), GCError> {
     let mut stmt = conn
         .prepare(&format!(
-            "SELECT store_id, table_name, row_pk, payload
-             FROM oplog_db.oplog_heads
-             WHERE op_id IN ({placeholders})
-               AND store_id = 'proxydb'
-               AND LENGTH(payload) > 0"
+            "SELECT heads.store_id, heads.table_name, heads.row_pk, heads.payload
+             FROM oplog_db.oplog AS o
+             JOIN oplog_db.oplog_heads AS heads
+               ON heads.store_id = o.store_id
+              AND heads.table_name = o.table_name
+              AND heads.row_pk = o.row_pk
+              AND heads.op_id = o.op_id
+             WHERE o.op_id IN ({placeholders})
+               AND +o.store_id = 'proxydb'
+               AND LENGTH(heads.payload) > 0"
         ))
         .map_err(|e| GCError::Other(format!("compaction head trim select prepare: {e}")))?;
     let rows = stmt
