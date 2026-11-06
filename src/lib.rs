@@ -15,11 +15,13 @@ pub mod hlc;
 pub mod identity;
 pub mod kv;
 pub mod log;
+pub mod mail;
 #[cfg(feature = "pull-http")]
 pub mod net;
 pub mod oauth;
 pub mod op;
 pub mod ports;
+pub mod profile;
 pub mod pull;
 pub mod registry;
 pub mod row_op;
