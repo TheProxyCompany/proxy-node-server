@@ -188,3 +188,22 @@ pub enum MailError {
     #[error("outbound mail delivery failed: {0}")]
     Delivery(String),
 }
+
+pub fn humanize_slug(slug: &str) -> String {
+    let words: Vec<String> = slug
+        .split(['-', '_', '.'])
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect();
+    if words.is_empty() {
+        "Proxy".to_string()
+    } else {
+        words.join(" ")
+    }
+}

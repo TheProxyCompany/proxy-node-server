@@ -14,10 +14,9 @@ use serde_json::json;
 
 use super::{
     InboundEmailPayload, MailDraft, MailError, MailMessagePatch, MailStore, SendEmailRequest,
-    build_raw_rfc5322, store::random_hex_id,
+    build_raw_rfc5322, humanize_slug, store::random_hex_id,
 };
 use crate::address_web::escape_html;
-use crate::profile::humanize_slug;
 
 const WEBMAIL_HTML: &str = include_str!("webmail.html");
 

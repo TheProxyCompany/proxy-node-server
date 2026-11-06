@@ -12,9 +12,8 @@ use serde_json::Value;
 
 use super::{
     InboundEmailPayload, MAIL_FOLDERS, MailAccountStatus, MailDraft, MailError, MailFolderCount,
-    MailMessage, SendEmailRequest, parse_raw_rfc5322,
+    MailMessage, SendEmailRequest, humanize_slug, parse_raw_rfc5322,
 };
-use crate::profile::humanize_slug;
 
 /// Flag and folder mutation payload for `POST/PATCH /messages/{id}`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
