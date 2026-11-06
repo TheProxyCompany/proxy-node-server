@@ -136,8 +136,18 @@ pub mod usage;
 
 #[cfg(feature = "pull-http")]
 pub mod address_web;
+#[cfg(feature = "pull-http")]
+pub mod mail;
 #[cfg(feature = "daemon")]
 pub mod mcp_protocol;
 
 #[cfg(feature = "pull-http")]
 pub mod mcp_server;
+#[cfg(feature = "pull-http")]
+pub mod profile;
+
+#[cfg(feature = "pull-http")]
+pub use profile::{
+    ProfileConfig, PublicAgentItem, PublicPageItem, PublicPartyItem, PublicProfile, humanize_slug,
+    profile_json_response, profile_page_response, read_profile_config,
+};

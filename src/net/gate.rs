@@ -27,6 +27,7 @@ pub const DEVICE_SIGNATURE_HEADER: &str = "x-proxy-device-signature";
 pub const DEVICE_REQUEST_MAX_SKEW_SECONDS: u64 = 300;
 pub const MAX_DEVICE_DISPATCH_BODY_BYTES: usize = 32 * 1024 * 1024;
 pub const PARTY_BEARER_METADATA_KEY: &str = "party_bearer";
+pub const EDGE_MAIL_DELIVERY_HEADER: &str = "x-proxy-edge-mail-delivery";
 pub const RESOLVE_IN_PROXY: &str = "This Move can only be made from Proxy. A client on the address holds a bearer, not this Mac's trusted device key. Open the Move in Proxy and decide there.";
 
 pub const DEVICE_CLAIM_HEADERS: &[&str] = &[
@@ -107,13 +108,22 @@ pub fn is_inference_path(path: &str) -> bool {
 
 pub fn is_public_pages_request(method: &Method, path: &str) -> bool {
     (method == Method::GET || method == Method::HEAD)
-        && ["/client/p", "/p"]
+        && ["/client/p", "/p", "/inbox", "/client/inbox"]
             .iter()
             .any(|prefix| path == *prefix || path.starts_with(&format!("{prefix}/")))
 }
 
+pub fn is_edge_mail_inbound_request(method: &Method, path: &str, headers: &HeaderMap) -> bool {
+    *method == Method::POST
+        && (path == "/client/v1/proxy-ing/mail/inbound" || path == "/v1/mail/inbound")
+        && header_str(headers, EDGE_MAIL_DELIVERY_HEADER) == Some("1")
+}
+
 pub fn family_of(method: &Method, path: &str) -> Option<&'static str> {
     let under = |prefix: &str| path == prefix || path.starts_with(&format!("{prefix}/"));
+    if under("/client/v1/proxy-ing/mail") || under("/v1/mail") {
+        return Some("mail");
+    }
     if under("/client/v1/threads") || under("/client/v1/content") {
         return Some("threads");
     }

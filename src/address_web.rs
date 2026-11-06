@@ -10,6 +10,11 @@ use axum::{
 use serde::Deserialize;
 use serde_json::json;
 
+pub use crate::profile::{
+    ProfileConfig, PublicAgentItem, PublicPageItem, PublicPartyItem, PublicProfile, humanize_slug,
+    profile_json_response, profile_page_response, read_profile_config,
+};
+
 const STYLE: &str = include_str!("address_web/page.css");
 const AGENT_PAGE: &str = include_str!("address_web/agent.html");
 const NOT_FOUND_PAGE: &str = include_str!("address_web/not_found.html");
