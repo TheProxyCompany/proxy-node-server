@@ -46,14 +46,14 @@ pub use crate::net::{
 /// Wire version spoken on [`PULL_PATH`].
 pub const PULL_VERSION: u8 = 1;
 
-/// Route the v3 pull request posts to. Absence (404/405) is the mixed-fleet
+/// Route the pull request posts to. Absence (404/405) is the mixed-fleet
 /// feature-detect: the link falls back to the v2 loop.
-pub const PULL_PATH: &str = "/mesh/v3/pull";
+pub const PULL_PATH: &str = "/mesh/pull";
 
-/// Signed-envelope store id for a v3 pull request.
+/// Signed-envelope store id for a pull request.
 pub const PULL_REQUEST_STORE_ID: &str = "mesh-pull-request";
 
-/// Signed-envelope store id for a v3 pull response page.
+/// Signed-envelope store id for a pull response page.
 pub const PULL_PAGE_STORE_ID: &str = "mesh-pull-page";
 
 /// Alias for [`PULL_PAGE_STORE_ID`].
@@ -68,10 +68,10 @@ pub const PULL_PAGE_LIMIT_MAX: u32 = PAGE_LIMIT_MAX as u32;
 /// Byte governor for one v3 page before cutting with a resume token.
 pub const PULL_PAGE_BYTE_BUDGET: usize = 32 * 1024 * 1024;
 
-/// Body cap for a v3 pull request.
+/// Body cap for a pull request.
 pub const MAX_PULL_REQUEST_BYTES: usize = 256 * 1024;
 
-/// Body cap for a v3 pull response page.
+/// Body cap for a pull response page.
 pub const MAX_PULL_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 
 /// Accepted clock skew on a signed pull request, matching the v2 tier.
@@ -233,7 +233,7 @@ pub fn sign_pull_request(
     hlc: Hlc,
 ) -> Result<Vec<u8>, String> {
     let payload =
-        serde_json::to_vec(request).map_err(|error| format!("encode pull v3 request: {error}"))?;
+        serde_json::to_vec(request).map_err(|error| format!("encode pull request: {error}"))?;
     let store = StoreId::new(PULL_REQUEST_STORE_ID).map_err(|error| error.to_string())?;
     let op = SignedOp::seal(
         OpBody {
@@ -245,9 +245,9 @@ pub fn sign_pull_request(
         },
         identity,
     )
-    .map_err(|error| format!("sign pull v3 request: {error}"))?;
+    .map_err(|error| format!("sign pull request: {error}"))?;
     op.to_bytes()
-        .map_err(|error| format!("encode pull v3 request envelope: {error}"))
+        .map_err(|error| format!("encode pull request envelope: {error}"))
 }
 
 /// Verify a signed [`PullRequest`] envelope against the requester's stored
@@ -325,12 +325,12 @@ pub fn verify_pull_page(
     peer_key: &[u8; 33],
 ) -> Result<PullPage, String> {
     let op = SignedOp::from_bytes(bytes)
-        .map_err(|error| format!("invalid v3 pull page envelope: {error}"))?;
+        .map_err(|error| format!("invalid pull page envelope: {error}"))?;
     if op.body.store.as_str() != PULL_PAGE_STORE_ID {
-        return Err("v3 pull page used an invalid signature domain".to_string());
+        return Err("pull page used an invalid signature domain".to_string());
     }
     if op.body.device != *peer {
-        return Err("v3 pull page was signed by another device".to_string());
+        return Err("pull page was signed by another device".to_string());
     }
     op.verify_with_sec1(peer_key).map_err(|error| match error {
         OpError::Identity(
@@ -339,15 +339,15 @@ pub fn verify_pull_page(
             format!("invalid pinned peer key: {error}")
         }
         OpError::DeviceMismatch => "pinned peer key does not derive the peer".to_string(),
-        other => format!("invalid v3 pull page signature: {other}"),
+        other => format!("invalid pull page signature: {other}"),
     })?;
     let page: PullPage = serde_json::from_slice(&op.body.payload)
-        .map_err(|error| format!("decode v3 pull page: {error}"))?;
+        .map_err(|error| format!("decode pull page: {error}"))?;
     if page.version != PULL_VERSION {
-        return Err("unsupported v3 pull page version".to_string());
+        return Err("unsupported pull page version".to_string());
     }
     if page.backfill.len() > PAGE_LIMIT_MAX || page.keyed.len() > PAGE_LIMIT_MAX {
-        return Err("oversized v3 pull page".to_string());
+        return Err("oversized pull page".to_string());
     }
     Ok(page)
 }
@@ -447,7 +447,7 @@ mod tests {
         );
         assert_eq!(
             cross_domain.unwrap_err(),
-            "v3 pull page used an invalid signature domain"
+            "pull page used an invalid signature domain"
         );
     }
 }

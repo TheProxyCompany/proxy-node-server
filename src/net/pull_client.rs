@@ -133,13 +133,13 @@ pub fn pull_http_client() -> reqwest::Client {
 pub fn decode_page_op(encoded: &str, peer: &DeviceId) -> Result<SignedOp, String> {
     let bytes = BASE64.decode(encoded).map_err(|error| {
         format!(
-            "v3 pull peer={} sent an undecodable entry: {error}",
+            "pull peer={} sent an undecodable entry: {error}",
             peer.to_hex()
         )
     })?;
     SignedOp::from_bytes(&bytes).map_err(|error| {
         format!(
-            "v3 pull peer={} sent an invalid envelope: {error}",
+            "pull peer={} sent an invalid envelope: {error}",
             peer.to_hex()
         )
     })
@@ -153,11 +153,11 @@ pub fn validate_pull_reset(
     response_epoch: [u8; 32],
 ) -> Result<RelayCursor, String> {
     if !page.reset {
-        return Err("invalid v3 reset: response was not marked as a reset".to_string());
+        return Err("invalid pull reset: response was not marked as a reset".to_string());
     }
     if page.floor > page.head_seq {
         return Err(format!(
-            "invalid v3 reset: floor {} exceeds signed head {}",
+            "invalid pull reset: floor {} exceeds signed head {}",
             page.floor, page.head_seq
         ));
     }
@@ -170,7 +170,7 @@ pub fn validate_pull_reset(
         || page.store.is_some()
     {
         return Err(
-            "invalid v3 reset: reset page carried data, progress, or resume state".to_string(),
+            "invalid pull reset: reset page carried data, progress, or resume state".to_string(),
         );
     }
 
@@ -183,7 +183,7 @@ pub fn validate_pull_reset(
     };
     if !pull_needs_reset(request_epoch, request.relay_after, &response_state) {
         return Err(
-            "invalid v3 reset: signed stream state does not invalidate the requested cursor"
+            "invalid pull reset: signed stream state does not invalidate the requested cursor"
                 .to_string(),
         );
     }
@@ -230,12 +230,12 @@ where
     S: MeshPullSocket + Sync + ?Sized,
 {
     let epoch = decode_epoch(&page.epoch)
-        .ok_or_else(|| S::protocol_error("v3 pull page carries an invalid epoch"))?;
+        .ok_or_else(|| S::protocol_error("pull page carries an invalid epoch"))?;
     let mut current = match *cursor {
         Some(current) if current.epoch == epoch => current,
         Some(_) => {
             return Err(S::protocol_error(format!(
-                "v3 pull peer={} changed stream epoch without a reset",
+                "pull peer={} changed stream epoch without a reset",
                 peer.to_hex()
             )));
         }
@@ -251,7 +251,7 @@ where
     for (seq, encoded) in &page.backfill {
         if *seq <= last_seq {
             return Err(S::protocol_error(format!(
-                "v3 pull peer={} returned non-advancing sequence {seq} at or behind {}",
+                "pull peer={} returned non-advancing sequence {seq} at or behind {}",
                 peer.to_hex(),
                 current.after
             )));
@@ -303,7 +303,7 @@ where
             Some((origin, ops, keys)) if *origin == key.device => {
                 if last_key.is_some_and(|last| key <= last) {
                     return Err(S::protocol_error(format!(
-                        "v3 pull peer={} returned a non-ascending keyed entry for origin {}",
+                        "pull peer={} returned a non-ascending keyed entry for origin {}",
                         peer.to_hex(),
                         origin.to_hex()
                     )));
@@ -314,7 +314,7 @@ where
             Some((origin, _, _)) => {
                 if run_count > 1 && key.device < *origin {
                     return Err(S::protocol_error(format!(
-                        "v3 pull peer={} returned keyed origins out of order",
+                        "pull peer={} returned keyed origins out of order",
                         peer.to_hex()
                     )));
                 }
@@ -441,17 +441,14 @@ where
         let envelope = sign_pull_request(&request, socket.local_identity(), socket.next_hlc())
             .map_err(S::protocol_error)?;
         let (status, bytes) = source.pull_bytes(envelope).await.map_err(|error| {
-            S::protocol_error(format!(
-                "v3 store sweep from peer {}: {error}",
-                peer.to_hex()
-            ))
+            S::protocol_error(format!("store sweep from peer {}: {error}", peer.to_hex()))
         })?;
         if matches!(status, 404 | 405 | 503) {
             return Ok(applied);
         }
         if !(200..300).contains(&status) {
             return Err(S::protocol_error(format!(
-                "peer {} refused the v3 store sweep (HTTP {status})",
+                "peer {} refused the store sweep (HTTP {status})",
                 peer.to_hex()
             )));
         }
@@ -480,7 +477,7 @@ where
             .map(|r| (r.origin.clone(), r.after_key.clone()));
         if position == last_resume {
             return Err(S::protocol_error(format!(
-                "v3 store sweep peer={} returned a non-advancing resume",
+                "store sweep peer={} returned a non-advancing resume",
                 peer.to_hex()
             )));
         }
@@ -533,7 +530,7 @@ where
         let envelope = sign_pull_request(&request, socket.local_identity(), socket.next_hlc())
             .map_err(S::protocol_error)?;
         let (status, bytes) = source.pull_bytes(envelope).await.map_err(|error| {
-            S::protocol_error(format!("v3 pull from peer {}: {error}", peer.to_hex()))
+            S::protocol_error(format!("pull from peer {}: {error}", peer.to_hex()))
         })?;
         if status == 404 || status == 405 {
             return Ok(PullOutcome::Unsupported);
@@ -543,7 +540,7 @@ where
         }
         if !(200..300).contains(&status) {
             return Err(S::protocol_error(format!(
-                "peer {} refused the v3 pull (HTTP {status}): {}",
+                "peer {} refused the pull (HTTP {status}): {}",
                 peer.to_hex(),
                 String::from_utf8_lossy(&bytes).trim()
             )));
@@ -551,7 +548,7 @@ where
         let page = verify_pull_page(&bytes, peer, peer_sec1).map_err(S::protocol_error)?;
         let epoch = decode_epoch(&page.epoch).ok_or_else(|| {
             S::protocol_error(format!(
-                "v3 pull peer={} returned an invalid stream epoch",
+                "pull peer={} returned an invalid stream epoch",
                 peer.to_hex()
             ))
         })?;
@@ -559,7 +556,7 @@ where
         if page.snapshot_recommended {
             if recommendation_overridden {
                 return Err(S::protocol_error(format!(
-                    "v3 pull peer={} kept recommending a snapshot on resumed requests",
+                    "pull peer={} kept recommending a snapshot on resumed requests",
                     peer.to_hex()
                 )));
             }
@@ -585,7 +582,7 @@ where
         if page.reset {
             if reset_seen {
                 return Err(S::protocol_error(format!(
-                    "v3 pull peer={} repeated its stream reset",
+                    "pull peer={} repeated its stream reset",
                     peer.to_hex()
                 )));
             }
@@ -630,7 +627,7 @@ where
             stalled += 1;
             if stalled >= PULL_NO_PROGRESS_LIMIT {
                 return Err(S::protocol_error(format!(
-                    "v3 pull peer={} returned {stalled} pages without advancing",
+                    "pull peer={} returned {stalled} pages without advancing",
                     peer.to_hex()
                 )));
             }

@@ -46,7 +46,7 @@ pub fn save_cursor(data_dir: &Path, peer: &DeviceId, cursor: OrderKey) -> std::i
 fn relay_cursor_path(data_dir: &Path, peer: &DeviceId) -> PathBuf {
     data_dir
         .join("cursors")
-        .join(format!("{}.relay-v2.cursor", peer.to_hex()))
+        .join(format!("{}.relay.cursor", peer.to_hex()))
 }
 
 /// Load a peer's persisted `(epoch, relay sequence)` cursor.
@@ -68,7 +68,7 @@ pub fn load_relay_cursor(data_dir: &Path, peer: &DeviceId) -> RelayCursor {
     RelayCursor { epoch, after }
 }
 
-/// Durably persist a relay-v2 cursor in a file distinct from the v1 semantic
+/// Durably persist a relay cursor in a file distinct from the v1 semantic
 /// cursor.
 pub fn save_relay_cursor(
     data_dir: &Path,

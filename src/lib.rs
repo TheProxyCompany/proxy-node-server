@@ -136,6 +136,8 @@ pub mod usage;
 
 #[cfg(feature = "pull-http")]
 pub mod address_web;
+#[cfg(feature = "pull-http")]
+pub mod mail;
 #[cfg(feature = "daemon")]
 pub mod mcp_protocol;
 
