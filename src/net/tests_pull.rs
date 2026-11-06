@@ -438,7 +438,7 @@ fn validate_pull_reset_and_preview_resume_after_enforce_protocol_invariants() {
     assert!(
         validate_pull_reset(&request, &bad_floor, [2u8; 32])
             .unwrap_err()
-            .contains("invalid v3 reset")
+            .contains("invalid pull reset")
     );
 
     let valid_reset = PullPage {

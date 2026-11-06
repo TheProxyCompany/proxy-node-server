@@ -1,5 +1,5 @@
 //! Peer registration, key gossip, and incremental op-log sync rounds (v1 and
-//! Relay v2).
+//! Relay).
 
 use std::sync::Mutex;
 
@@ -232,7 +232,7 @@ pub struct RelaySyncOutcome {
     pub reset: bool,
 }
 
-/// Pull one authenticated relay-v2 page from a pinned peer.
+/// Pull one authenticated relay page from a pinned peer.
 #[allow(clippy::too_many_arguments)]
 pub async fn sync_relay_once<S>(
     source: &HttpPullSource,

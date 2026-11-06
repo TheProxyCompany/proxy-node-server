@@ -1,5 +1,5 @@
 //! Unified HTTP pull & sync surface (feature `pull-http`): v1 semantic pull,
-//! Relay v2 insertion-ordered stream, Pull v3 two-channel sync, the
+//! Relay insertion-ordered stream, Pull two-channel sync, the
 //! [`MeshPullSocket`] ("Female Socket") storage trait, and peer transport
 //! confidentiality policy.
 

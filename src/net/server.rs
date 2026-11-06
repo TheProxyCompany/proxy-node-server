@@ -1,4 +1,4 @@
-//! Axum serving state and HTTP handlers for v1 semantic pull, Relay v2, and
+//! Axum serving state and HTTP handlers for v1 semantic pull, Relay, and
 //! `/devices`.
 
 use std::collections::HashMap;

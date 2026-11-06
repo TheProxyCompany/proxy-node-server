@@ -1,4 +1,4 @@
-//! Cryptographic signing, verification, and wire decoding for Relay v2 and
+//! Cryptographic signing, verification, and wire decoding for Relay and
 //! attested `/devices` responses.
 
 use std::collections::HashMap;

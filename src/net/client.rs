@@ -1,5 +1,5 @@
-//! HTTP pull client ([`HttpPullSource`]) for v1 semantic pull, Relay v2, and
-//! Pull v3.
+//! HTTP pull client ([`HttpPullSource`]) for v1 semantic pull, Relay, and
+//! Pull.
 
 use std::time::Duration;
 
@@ -366,7 +366,7 @@ impl HttpPullSource {
         .await
     }
 
-    /// POST a signed v3 pull request envelope to [`PULL_PATH`] and return
+    /// POST a signed pull request envelope to [`PULL_PATH`] and return
     /// `(status_code, raw_response_bytes)`, bounded by [`MAX_PULL_RESPONSE_BYTES`].
     pub async fn pull_bytes(
         &self,
@@ -388,14 +388,14 @@ impl HttpPullSource {
             .content_length()
             .is_some_and(|length| length > MAX_PULL_RESPONSE_BYTES as u64)
         {
-            return Err(TransportError::Wire("oversized v3 pull page".into()));
+            return Err(TransportError::Wire("oversized pull page".into()));
         }
         let bytes = response
             .bytes()
             .await
             .map_err(|e| TransportError::Http(e.to_string()))?;
         if bytes.len() > MAX_PULL_RESPONSE_BYTES {
-            return Err(TransportError::Wire("oversized v3 pull page".into()));
+            return Err(TransportError::Wire("oversized pull page".into()));
         }
         Ok((status, bytes.to_vec()))
     }

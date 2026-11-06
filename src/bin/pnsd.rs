@@ -48,7 +48,7 @@ enum Command {
         #[arg(long = "peer")]
         peers: Vec<String>,
         /// Use the legacy semantic-order v1 pull/watch protocol. This is never
-        /// selected automatically when relay v2 is unavailable.
+        /// selected automatically when relay is unavailable.
         #[arg(long)]
         legacy_v1: bool,
         /// Fallback poll interval, in seconds, used when a watch errors.
@@ -251,7 +251,7 @@ mod serve {
     use super::{KEY_FILE, OPLOG_FILE, read_scalar};
 
     /// How long a peer stays poll-only after its selected protocol's `/watch`
-    /// errors before the loop re-probes it. Relay-v2 errors never select v1.
+    /// errors before the loop re-probes it. Relay errors never select v1.
     const WATCH_REPROBE_INTERVAL: Duration = Duration::from_secs(300);
 
     /// One resolved peer to pull from: its client, device id, resume cursor, and
@@ -548,8 +548,8 @@ mod serve {
             }
         }
 
-        // `--pull-interval` is the per-link fallback/jitter cadence. A relay-v2
-        // watch failure switches only that link to relay-v2 polling; it never
+        // `--pull-interval` is the per-link fallback/jitter cadence. A relay
+        // watch failure switches only that link to relay polling; it never
         // selects the legacy protocol.
         let interval = Duration::from_secs(pull_interval);
         loop {
@@ -714,7 +714,7 @@ mod serve {
                 match outcome {
                     Some((idx, Err(e))) => {
                         eprintln!(
-                            "relay watch {}: {e}; polling relay v2 until re-probe",
+                            "relay watch {}: {e}; polling relay until re-probe",
                             links[idx].peer_id
                         );
                         links[idx].poll_only_until = Some(Instant::now() + WATCH_REPROBE_INTERVAL);

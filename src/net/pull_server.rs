@@ -326,7 +326,7 @@ pub fn classify_pull_request_error(message: &str) -> StatusCode {
     }
 }
 
-/// Verify a signed v3 pull request envelope against `socket`'s key lookup,
+/// Verify a signed pull request envelope against `socket`'s key lookup,
 /// peer trust check, and coverage priming gate.
 pub fn authenticate_pull_request<S: MeshPullSocket + ?Sized>(
     socket: &S,
