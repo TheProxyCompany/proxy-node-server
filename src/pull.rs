@@ -48,7 +48,7 @@ pub const PULL_VERSION: u8 = 1;
 
 /// Route the v3 pull request posts to. Absence (404/405) is the mixed-fleet
 /// feature-detect: the link falls back to the v2 loop.
-pub const PULL_PATH: &str = "/mesh/v3/pull";
+pub const PULL_PATH: &str = "/mesh/pull";
 
 /// Signed-envelope store id for a v3 pull request.
 pub const PULL_REQUEST_STORE_ID: &str = "mesh-pull-request";

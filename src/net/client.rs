@@ -279,7 +279,7 @@ impl HttpPullSource {
         cursor: RelayCursor,
     ) -> Result<RelayPage, TransportError> {
         let url = format!(
-            "{}/v2/ops?epoch={}&after={}&limit={}",
+            "{}/relay/ops?epoch={}&after={}&limit={}",
             self.base_url,
             encode_hex(&cursor.epoch),
             cursor.after,
@@ -310,7 +310,7 @@ impl HttpPullSource {
         cursor: RelayCursor,
     ) -> Result<RelayPage, TransportError> {
         let url = format!(
-            "{}/v2/head?epoch={}&after={}",
+            "{}/relay/head?epoch={}&after={}",
             self.base_url,
             encode_hex(&cursor.epoch),
             cursor.after
@@ -344,7 +344,7 @@ impl HttpPullSource {
         let wait = wait.min(WATCH_MAX_WAIT);
         let wait_millis = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX);
         let url = format!(
-            "{}/v2/watch?epoch={}&after={}&wait={}",
+            "{}/relay/watch?epoch={}&after={}&wait={}",
             self.base_url,
             encode_hex(&cursor.epoch),
             cursor.after,

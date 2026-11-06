@@ -143,8 +143,8 @@ pub struct RelayWireEntry {
     pub envelope: Vec<u8>,
 }
 
-/// Exact postcard body returned by all three relay-local v2 routes. `/v2/head`
-/// and `/v2/watch` carry no entries; `/v2/ops` carries a bounded page.
+/// Exact postcard body returned by all three relay-local routes. `/relay/head`
+/// and `/relay/watch` carry no entries; `/relay/ops` carries a bounded page.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RelayResponse {
     pub v: u8,

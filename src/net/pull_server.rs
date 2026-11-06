@@ -373,7 +373,7 @@ pub fn authenticate_pull_request<S: MeshPullSocket + ?Sized>(
     Ok((peer, request))
 }
 
-/// Server-side handler contract for [`PULL_PATH`] (`POST /mesh/v3/pull`).
+/// Server-side handler contract for [`PULL_PATH`] (`POST /mesh/pull`).
 pub trait PullHandler: Clone + Send + Sync + 'static {
     /// Identity used to sign outgoing [`PullPage`] envelopes.
     fn identity(&self) -> &DeviceIdentity;
@@ -417,7 +417,7 @@ pub trait PullHandler: Clone + Send + Sync + 'static {
     fn serve_pull(&self, peer: &DeviceId, request: PullRequest) -> Result<PullPage, String>;
 }
 
-/// Mount `POST /mesh/v3/pull` ([`PULL_PATH`]) backed by `handler`.
+/// Mount `POST /mesh/pull` ([`PULL_PATH`]) backed by `handler`.
 pub fn pull_router<H: PullHandler>(handler: H) -> axum::Router {
     async fn post_pull<H: PullHandler>(
         State(handler): State<H>,
