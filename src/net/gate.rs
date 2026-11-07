@@ -108,9 +108,11 @@ pub fn is_inference_path(path: &str) -> bool {
 
 pub fn is_public_pages_request(method: &Method, path: &str) -> bool {
     (method == Method::GET || method == Method::HEAD)
-        && ["/client/p", "/p", "/inbox", "/client/inbox"]
-            .iter()
-            .any(|prefix| path == *prefix || path.starts_with(&format!("{prefix}/")))
+        && (path == "/v1/public-profile"
+            || path == "/client/v1/public-profile"
+            || ["/client/p", "/p", "/inbox", "/client/inbox"]
+                .iter()
+                .any(|prefix| path == *prefix || path.starts_with(&format!("{prefix}/"))))
 }
 
 pub fn is_edge_mail_inbound_request(method: &Method, path: &str, headers: &HeaderMap) -> bool {
