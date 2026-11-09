@@ -1,0 +1,501 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{email_address}} · Proxy Mail</title>
+<style>
+  :root {
+    color-scheme: dark light;
+    --bg: #09090b;
+    --panel: #121216;
+    --panel-alt: #18181f;
+    --border: rgba(255, 255, 255, 0.08);
+    --border-strong: rgba(255, 255, 255, 0.16);
+    --text: #fafafa;
+    --muted: #a1a1aa;
+    --accent: #3dd2c6;
+    --accent-dim: rgba(61, 210, 198, 0.14);
+    --verified: #22c55e;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f4f4f5;
+      --panel: #ffffff;
+      --panel-alt: #fafafa;
+      --border: rgba(0, 0, 0, 0.08);
+      --border-strong: rgba(0, 0, 0, 0.16);
+      --text: #09090b;
+      --muted: #52525b;
+      --accent: #0d9488;
+      --accent-dim: rgba(13, 148, 136, 0.12);
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Inter", system-ui, sans-serif;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+  a { color: inherit; text-decoration: none; }
+  header.topbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 12px 20px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+  }
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-weight: 600;
+  }
+  .brand-badge {
+    padding: 3px 9px;
+    border-radius: 999px;
+    background: var(--accent-dim);
+    color: var(--accent);
+    font-size: 12px;
+  }
+  .nav-tabs {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .nav-tab {
+    padding: 6px 12px;
+    border-radius: 8px;
+    font-size: 13px;
+    color: var(--muted);
+    border: 1px solid transparent;
+  }
+  .nav-tab.active, .nav-tab:hover {
+    color: var(--text);
+    border-color: var(--border);
+    background: var(--panel-alt);
+  }
+  .workspace {
+    flex: 1;
+    display: grid;
+    grid-template-columns: 220px 340px 1fr;
+    min-height: 0;
+  }
+  @media (max-width: 900px) {
+    .workspace { grid-template-columns: 180px 1fr; }
+    .reader-pane { grid-column: 1 / -1; }
+  }
+  .sidebar {
+    padding: 16px;
+    border-right: 1px solid var(--border);
+    background: var(--panel);
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .compose-btn {
+    padding: 10px 14px;
+    border-radius: 10px;
+    border: 0;
+    background: var(--accent);
+    color: #042f2e;
+    font-weight: 600;
+    cursor: pointer;
+    margin-bottom: 10px;
+  }
+  .folder-btn {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 8px 12px;
+    border-radius: 8px;
+    border: 0;
+    background: transparent;
+    color: var(--muted);
+    font: inherit;
+    cursor: pointer;
+    text-align: left;
+  }
+  .folder-btn.active, .folder-btn:hover {
+    background: var(--panel-alt);
+    color: var(--text);
+  }
+  .list-pane {
+    border-right: 1px solid var(--border);
+    background: var(--bg);
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+  }
+  .search-bar {
+    padding: 12px;
+    border-bottom: 1px solid var(--border);
+  }
+  .search-bar input {
+    width: 100%;
+    padding: 8px 12px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: var(--panel);
+    color: var(--text);
+    font: inherit;
+  }
+  .msg-list {
+    flex: 1;
+    overflow-y: auto;
+    list-style: none;
+    margin: 0;
+    padding: 0;
+  }
+  .msg-row {
+    padding: 12px 14px;
+    border-bottom: 1px solid var(--border);
+    cursor: pointer;
+  }
+  .msg-row:hover, .msg-row.selected {
+    background: var(--panel);
+  }
+  .msg-row.unread .msg-subject {
+    font-weight: 700;
+    color: var(--text);
+  }
+  .msg-from {
+    display: flex;
+    justify-content: space-between;
+    font-size: 12px;
+    color: var(--muted);
+    margin-bottom: 3px;
+  }
+  .msg-subject {
+    font-size: 13px;
+    margin-bottom: 2px;
+  }
+  .msg-snippet {
+    font-size: 12px;
+    color: var(--muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .reader-pane {
+    padding: 24px;
+    overflow-y: auto;
+    background: var(--panel);
+  }
+  .reader-head {
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 16px;
+    margin-bottom: 18px;
+  }
+  .reader-title {
+    font-size: 20px;
+    margin: 0 0 8px;
+  }
+  .reader-meta {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 10px;
+    font-size: 12px;
+    color: var(--muted);
+  }
+  .auth-badge {
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: 11px;
+    background: rgba(34, 197, 94, 0.14);
+    color: var(--verified);
+    border: 1px solid rgba(34, 197, 94, 0.35);
+  }
+  .reader-actions {
+    margin-top: 12px;
+    display: flex;
+    gap: 8px;
+  }
+  .action-btn {
+    padding: 6px 12px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: var(--panel-alt);
+    color: var(--text);
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .reader-body {
+    white-space: pre-wrap;
+    line-height: 1.6;
+    font-size: 14px;
+  }
+  .modal-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.65);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 16px;
+  }
+  .modal-backdrop[hidden] { display: none; }
+  .modal {
+    width: 100%;
+    max-width: 560px;
+    background: var(--panel);
+    border: 1px solid var(--border-strong);
+    border-radius: 16px;
+    padding: 20px;
+  }
+  .modal h3 { margin: 0 0 12px; }
+  .modal input, .modal textarea {
+    width: 100%;
+    padding: 9px 12px;
+    margin-bottom: 10px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: var(--bg);
+    color: var(--text);
+    font: inherit;
+  }
+  .modal-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+  }
+</style>
+</head>
+<body data-username="{{username}}" data-email="{{email_address}}">
+<header class="topbar">
+  <div class="brand">
+    <span>{{display_name}}</span>
+    <span class="brand-badge" id="account-badge">{{email_address}}</span>
+  </div>
+  <nav class="nav-tabs">
+    <a class="nav-tab" href="/?view=profile">Profile / Home</a>
+    <a class="nav-tab" href="/?view=profile#pages">Pages</a>
+    <a class="nav-tab" href="/?view=profile#agents">Agents</a>
+    <a class="nav-tab active" href="/inbox">Inbox</a>
+  </nav>
+</header>
+
+<div class="workspace">
+  <aside class="sidebar">
+    <button class="compose-btn" id="open-compose" type="button">+ Compose</button>
+    <button class="folder-btn active" data-folder="inbox" type="button"><span>Inbox</span><span id="count-inbox">0</span></button>
+    <button class="folder-btn" data-folder="unread" type="button"><span>Unread</span><span id="count-unread">0</span></button>
+    <button class="folder-btn" data-folder="sent" type="button"><span>Sent</span><span id="count-sent">0</span></button>
+    <button class="folder-btn" data-folder="drafts" type="button"><span>Drafts</span><span id="count-drafts">0</span></button>
+    <button class="folder-btn" data-folder="archive" type="button"><span>Archive</span><span id="count-archive">0</span></button>
+  </aside>
+
+  <section class="list-pane">
+    <div class="search-bar">
+      <input id="mail-search" type="search" placeholder="Search {{email_address}}…">
+    </div>
+    <ul class="msg-list" id="msg-list"></ul>
+  </section>
+
+  <main class="reader-pane" id="reader-pane">
+    <p style="color: var(--muted);">Select a message in {{email_address}} or compose a new email.</p>
+  </main>
+</div>
+
+<div class="modal-backdrop" id="compose-modal" hidden>
+  <form class="modal" id="compose-form">
+    <h3>New Message from {{email_address}}</h3>
+    <input id="compose-to" placeholder="To (comma-separated emails)" required>
+    <input id="compose-subject" placeholder="Subject" required>
+    <textarea id="compose-body" rows="7" placeholder="Write your message…"></textarea>
+    <div class="modal-actions">
+      <button class="action-btn" id="close-compose" type="button">Cancel</button>
+      <button class="compose-btn" style="margin:0;" type="submit">Send Email</button>
+    </div>
+  </form>
+</div>
+
+<script>
+(function () {
+  var state = { folder: "inbox", query: "", messages: [], selectedId: null };
+  var apiBase = "/client/v1/proxy-ing/mail";
+
+  function $(id) { return document.getElementById(id); }
+
+  function apiFetch(path, opts) {
+    return fetch(apiBase + path, opts).then(function (r) {
+      if (r.status === 404) {
+        apiBase = "/v1/mail";
+        return fetch(apiBase + path, opts);
+      }
+      return r;
+    }).then(function (r) { return r.json(); });
+  }
+
+  function loadFolders() {
+    apiFetch("/folders").then(function (folders) {
+      if (!Array.isArray(folders)) return;
+      folders.forEach(function (f) {
+        if (f.folder === "inbox") {
+          $("count-inbox").textContent = f.total;
+          $("count-unread").textContent = f.unread;
+        } else if ($("count-" + f.folder)) {
+          $("count-" + f.folder).textContent = f.total;
+        }
+      });
+    }).catch(function () {});
+  }
+
+  function loadMessages() {
+    if (state.folder === "drafts") {
+      apiFetch("/drafts").then(function (res) {
+        var drafts = (res && res.drafts) || [];
+        $("count-drafts").textContent = drafts.length;
+        state.messages = drafts.map(function (d) {
+          return {
+            id: d.id,
+            from: (d.to || []).join(", ") || "(draft)",
+            subject: d.subject || "(no subject)",
+            snippet: d.text_body || "",
+            text_body: d.text_body || "",
+            received_at: d.updated_at || "",
+            unread: false
+          };
+        });
+        renderList();
+      }).catch(function () {});
+      return;
+    }
+    var params = new URLSearchParams();
+    if (state.folder === "unread") {
+      params.set("folder", "inbox");
+      params.set("unread_only", "true");
+    } else {
+      params.set("folder", state.folder);
+    }
+    if (state.query) params.set("q", state.query);
+    apiFetch("/messages?" + params.toString()).then(function (res) {
+      state.messages = (res && res.messages) || [];
+      renderList();
+      loadFolders();
+    }).catch(function () {});
+  }
+
+  function renderList() {
+    var list = $("msg-list");
+    list.textContent = "";
+    if (!state.messages.length) {
+      var empty = document.createElement("li");
+      empty.className = "msg-row";
+      empty.textContent = "No messages in " + state.folder + ".";
+      list.appendChild(empty);
+      return;
+    }
+    state.messages.forEach(function (m) {
+      var li = document.createElement("li");
+      li.className = "msg-row" + (m.unread ? " unread" : "") + (m.id === state.selectedId ? " selected" : "");
+      var fromRow = document.createElement("div");
+      fromRow.className = "msg-from";
+      fromRow.innerHTML = "<span></span><span></span>";
+      fromRow.children[0].textContent = m.from_name ? (m.from_name + " <" + m.from + ">") : m.from;
+      fromRow.children[1].textContent = m.received_at || "";
+      var subj = document.createElement("div");
+      subj.className = "msg-subject";
+      subj.textContent = m.subject;
+      var snip = document.createElement("div");
+      snip.className = "msg-snippet";
+      snip.textContent = m.snippet || "";
+      li.appendChild(fromRow);
+      li.appendChild(subj);
+      li.appendChild(snip);
+      li.addEventListener("click", function () { selectMessage(m); });
+      list.appendChild(li);
+    });
+  }
+
+  function selectMessage(m) {
+    state.selectedId = m.id;
+    if (m.unread) {
+      m.unread = false;
+      apiFetch("/messages/" + encodeURIComponent(m.id), {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ unread: false })
+      }).then(loadFolders).catch(function () {});
+    }
+    renderList();
+    var pane = $("reader-pane");
+    pane.innerHTML =
+      '<div class="reader-head">' +
+        '<h2 class="reader-title" id="r-subj"></h2>' +
+        '<div class="reader-meta">' +
+          '<span id="r-from"></span>' +
+          '<span id="r-to"></span>' +
+          '<span class="auth-badge">SPF/DKIM Verified</span>' +
+        '</div>' +
+        '<div class="reader-actions">' +
+          '<button class="action-btn" id="btn-reply" type="button">Reply</button>' +
+          '<button class="action-btn" id="btn-archive" type="button">Archive</button>' +
+        '</div>' +
+      '</div>' +
+      '<div class="reader-body" id="r-body"></div>';
+    $("r-subj").textContent = m.subject;
+    $("r-from").textContent = "From: " + (m.from_name ? (m.from_name + " <" + m.from + ">") : m.from);
+    $("r-to").textContent = "To: " + ((m.to || []).join(", ") || "");
+    $("r-body").textContent = m.text_body || "";
+    $("btn-reply").addEventListener("click", function () {
+      $("compose-to").value = m.reply_to || m.from || "";
+      $("compose-subject").value = m.subject.indexOf("Re:") === 0 ? m.subject : ("Re: " + m.subject);
+      $("compose-modal").hidden = false;
+    });
+    $("btn-archive").addEventListener("click", function () {
+      apiFetch("/messages/" + encodeURIComponent(m.id), {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ folder: "archive" })
+      }).then(loadMessages);
+    });
+  }
+
+  document.querySelectorAll(".folder-btn").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      document.querySelectorAll(".folder-btn").forEach(function (b) { b.classList.remove("active"); });
+      btn.classList.add("active");
+      state.folder = btn.dataset.folder;
+      loadMessages();
+    });
+  });
+
+  $("mail-search").addEventListener("input", function (ev) {
+    state.query = ev.target.value.trim();
+    loadMessages();
+  });
+
+  $("open-compose").addEventListener("click", function () { $("compose-modal").hidden = false; });
+  $("close-compose").addEventListener("click", function () { $("compose-modal").hidden = true; });
+  $("compose-form").addEventListener("submit", function (ev) {
+    ev.preventDefault();
+    var toList = $("compose-to").value.split(",").map(function (s) { return s.trim(); }).filter(Boolean);
+    var payload = {
+      to: toList,
+      subject: $("compose-subject").value.trim(),
+      text_body: $("compose-body").value
+    };
+    apiFetch("/send", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload)
+    }).then(function () {
+      $("compose-modal").hidden = true;
+      $("compose-form").reset();
+      loadMessages();
+    });
+  });
+
+  loadMessages();
+})();
+</script>
+</body>
+</html>

@@ -106,7 +106,7 @@ pub(super) async fn spawn_relay_ops_response(
     signing_nonce: Option<[u8; 32]>,
 ) -> HttpPullSource {
     let app = Router::new().route(
-        "/v2/ops",
+        "/relay/ops",
         get(move |headers: HeaderMap| {
             let body = body.clone();
             let signed_body = signed_body.clone();
@@ -167,7 +167,7 @@ pub(super) async fn raw_relay_ops_request(
     client
         .client
         .get(format!(
-            "{}/v2/ops?epoch={}&after={}&limit={url_limit}",
+            "{}/relay/ops?epoch={}&after={}&limit={url_limit}",
             client.base_url,
             encode_hex(&cursor.epoch),
             cursor.after,

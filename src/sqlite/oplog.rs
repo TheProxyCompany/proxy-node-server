@@ -138,7 +138,7 @@ pub fn relay_since(
 }
 
 /// The same feed as [`relay_since`], keeping each verbatim envelope beside its
-/// decoded operation. Pull v3 serves this: it filters on the decoded order key
+/// decoded operation. Pull serves this: it filters on the decoded order key
 /// but must forward the bytes the origin device signed, not a re-encoding.
 pub fn relay_since_with_envelopes(
     conn: &rusqlite::Connection,

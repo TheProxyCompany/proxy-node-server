@@ -1,6 +1,6 @@
 //! Open-source external thread sync interface ([`ThreadSourceAdapter`]),
 //! built-in harness provider descriptors, and node-to-node signed thread-control
-//! wire envelopes (`/thread-sources/v2/challenge`, `/thread-sources/v2/send`).
+//! wire envelopes (`/thread-sources/challenge`, `/thread-sources/send`).
 
 use std::time::Duration;
 
@@ -23,8 +23,8 @@ pub const CHALLENGE_REQUEST_STORE_ID: &str = "thread-control-challenge-request";
 pub const CHALLENGE_GRANT_STORE_ID: &str = "thread-control-challenge-grant";
 pub const SEND_COMMAND_STORE_ID: &str = "thread-control-send";
 pub const SEND_RESULT_STORE_ID: &str = "thread-control-result";
-pub const CHALLENGE_PATH: &str = "/thread-sources/v2/challenge";
-pub const SEND_PATH: &str = "/thread-sources/v2/send";
+pub const CHALLENGE_PATH: &str = "/thread-sources/challenge";
+pub const SEND_PATH: &str = "/thread-sources/send";
 pub const CONTROL_VERSION: u8 = 2;
 pub const CHALLENGE_TTL: Duration = Duration::from_secs(30);
 pub const REQUEST_CLOCK_SKEW: Duration = Duration::from_secs(120);

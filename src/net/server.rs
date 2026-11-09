@@ -1,4 +1,4 @@
-//! Axum serving state and HTTP handlers for v1 semantic pull, Relay v2, and
+//! Axum serving state and HTTP handlers for v1 semantic pull, Relay, and
 //! `/devices`.
 
 use std::collections::HashMap;
@@ -93,21 +93,21 @@ pub fn router<L: LogSource, D: DeviceBook>(state: ServeState<L, D>) -> Router {
         .route("/ops", get(get_ops::<L, D>))
         .route("/head", get(get_head::<L, D>))
         .route("/watch", get(get_watch::<L, D>))
-        .route("/v2/ops", get(get_relay_ops::<L, D>))
-        .route("/v2/head", get(get_relay_head::<L, D>))
-        .route("/v2/watch", get(get_relay_watch::<L, D>))
+        .route("/relay/ops", get(get_relay_ops::<L, D>))
+        .route("/relay/head", get(get_relay_head::<L, D>))
+        .route("/relay/watch", get(get_relay_watch::<L, D>))
         .route("/devices", get(get_devices::<L, D>))
         .with_state(state)
 }
 
-/// Build the authenticated relay-v2 production routes without exposing the
+/// Build the authenticated relay production routes without exposing the
 /// legacy unauthenticated semantic-log endpoints.
 pub fn relay_router<L: LogSource, D: DeviceBook>(state: ServeState<L, D>) -> Router {
     Router::new()
         .route("/identity", get(get_identity::<L, D>))
-        .route("/v2/ops", get(get_relay_ops::<L, D>))
-        .route("/v2/head", get(get_relay_head::<L, D>))
-        .route("/v2/watch", get(get_relay_watch::<L, D>))
+        .route("/relay/ops", get(get_relay_ops::<L, D>))
+        .route("/relay/head", get(get_relay_head::<L, D>))
+        .route("/relay/watch", get(get_relay_watch::<L, D>))
         .route("/devices", get(get_devices::<L, D>))
         .with_state(state)
 }
