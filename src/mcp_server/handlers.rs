@@ -43,9 +43,28 @@ fn mint_session_id(session_prefix: &str) -> String {
     format!("{}{}", session_prefix, hex::encode(bytes))
 }
 
-fn supported_protocol_version(version: &str) -> bool {
+fn is_valid_mcp_date_version(version: &str) -> bool {
     let version = version.trim();
-    !version.is_empty() && version <= MCP_PROTOCOL_VERSION
+    let bytes = version.as_bytes();
+    bytes.len() == 10
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes[..4].iter().all(u8::is_ascii_digit)
+        && bytes[5..7].iter().all(u8::is_ascii_digit)
+        && bytes[8..10].iter().all(u8::is_ascii_digit)
+        && version >= "2024-11-05"
+}
+
+fn clamp_supported_protocol_version(version: &str) -> Option<String> {
+    let version = version.trim();
+    if !is_valid_mcp_date_version(version) {
+        return None;
+    }
+    if version <= MCP_PROTOCOL_VERSION {
+        Some(version.to_string())
+    } else {
+        Some(MCP_PROTOCOL_VERSION.to_string())
+    }
 }
 
 fn header_string(headers: &HeaderMap, name: impl header::AsHeaderName) -> Option<String> {
@@ -329,7 +348,9 @@ fn resolve_or_recover_session_protocol(
         .insert(sid.to_string());
     if newly_inserted {
         tracing::debug!(session_id = %sid, method = %method, "Recovering unknown MCP session");
-        let recovered = mcp_protocol_version.unwrap_or("2025-03-26").to_string();
+        let recovered = mcp_protocol_version
+            .and_then(clamp_supported_protocol_version)
+            .unwrap_or_else(|| "2025-03-26".to_string());
         state
             .session_protocol_versions
             .lock()
@@ -357,13 +378,17 @@ fn resolve_or_recover_session_protocol(
         })?;
 
     if let Some(version) = mcp_protocol_version.filter(|v| *v != expected) {
-        tracing::warn!(got = %version, expected = %expected, "Invalid MCP-Protocol-Version header");
-        return Err(build_plain_http_response(
-            StatusCode::BAD_REQUEST,
-            Body::from(format!(
-                "Invalid or unsupported MCP-Protocol-Version: {version}"
-            )),
-        ));
+        let clamped_matches = clamp_supported_protocol_version(version)
+            .is_some_and(|clamped| clamped == expected);
+        if !clamped_matches {
+            tracing::warn!(got = %version, expected = %expected, "Invalid MCP-Protocol-Version header");
+            return Err(build_plain_http_response(
+                StatusCode::BAD_REQUEST,
+                Body::from(format!(
+                    "Invalid or unsupported MCP-Protocol-Version: {version}"
+                )),
+            ));
+        }
     }
 
     Ok(expected)
@@ -465,18 +490,20 @@ pub async fn message_handler(
         }
     } else {
         match mcp_protocol_version.as_deref() {
-            Some(version) if supported_protocol_version(version) => Some(version.to_string()),
-            Some(version) => {
-                tracing::warn!(got = %version, latest_supported = MCP_PROTOCOL_VERSION, "Invalid MCP-Protocol-Version header");
-                return build_plain_http_response(
-                    StatusCode::BAD_REQUEST,
-                    Body::from(format!(
-                        "Invalid or unsupported MCP-Protocol-Version: {version}"
-                    )),
-                );
-            }
+            Some(version) => match clamp_supported_protocol_version(version) {
+                Some(clamped) => Some(clamped),
+                None => {
+                    tracing::warn!(got = %version, latest_supported = MCP_PROTOCOL_VERSION, "Invalid MCP-Protocol-Version header");
+                    return build_plain_http_response(
+                        StatusCode::BAD_REQUEST,
+                        Body::from(format!(
+                            "Invalid or unsupported MCP-Protocol-Version: {version}"
+                        )),
+                    );
+                }
+            },
             None => {
-                tracing::warn!(
+                tracing::debug!(
                     assumed_protocol_version = "2025-03-26",
                     "Missing MCP-Protocol-Version header"
                 );
