@@ -54,6 +54,9 @@ pub(super) async fn handle_request(
         "resources/list" => {
             JsonRpcResponse::success(request.id, serde_json::json!({ "resources": [] }))
         }
+        "resources/templates/list" => {
+            JsonRpcResponse::success(request.id, serde_json::json!({ "resourceTemplates": [] }))
+        }
         "prompts/list" => {
             JsonRpcResponse::success(request.id, serde_json::json!({ "prompts": [] }))
         }
