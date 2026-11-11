@@ -378,8 +378,8 @@ fn resolve_or_recover_session_protocol(
         })?;
 
     if let Some(version) = mcp_protocol_version.filter(|v| *v != expected) {
-        let clamped_matches = clamp_supported_protocol_version(version)
-            .is_some_and(|clamped| clamped == expected);
+        let clamped_matches =
+            clamp_supported_protocol_version(version).is_some_and(|clamped| clamped == expected);
         if !clamped_matches {
             tracing::warn!(got = %version, expected = %expected, "Invalid MCP-Protocol-Version header");
             return Err(build_plain_http_response(
