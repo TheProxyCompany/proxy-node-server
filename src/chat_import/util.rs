@@ -58,8 +58,31 @@ pub fn collect_files_bounded(
     Ok(())
 }
 
+#[cfg(all(test, feature = "sqlite"))]
+thread_local! {
+    static TEST_HOME_DIR: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(test, feature = "sqlite"))]
+pub(crate) fn with_test_home_dir<T>(home: &Path, f: impl FnOnce() -> T) -> T {
+    struct Guard(Option<PathBuf>);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            let prev = self.0.take();
+            TEST_HOME_DIR.with(|slot| *slot.borrow_mut() = prev);
+        }
+    }
+    let prev = TEST_HOME_DIR.with(|slot| slot.borrow_mut().replace(home.to_path_buf()));
+    let _guard = Guard(prev);
+    f()
+}
+
 /// Resolve the current user's home directory from `HOME` or `USERPROFILE`.
 pub fn user_home_dir() -> Option<PathBuf> {
+    #[cfg(all(test, feature = "sqlite"))]
+    if let Some(overridden) = TEST_HOME_DIR.with(|slot| slot.borrow().clone()) {
+        return Some(overridden);
+    }
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .filter(|s| !s.is_empty())

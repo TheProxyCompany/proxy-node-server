@@ -7,6 +7,10 @@ use std::path::{Path, PathBuf};
 #[cfg(feature = "sqlite")]
 use rusqlite::{Connection, OpenFlags, params};
 
+use super::{
+    HERMES_MESH_SPEC, HERMES_PROVIDERS, mesh_load_conversations, mesh_resolve_source,
+    mesh_scan_manifests,
+};
 #[cfg(feature = "sqlite")]
 use super::{has_sqlite_table, sqlite_opt_col, sqlite_table_columns};
 use crate::chat_import::{
@@ -26,20 +30,32 @@ impl ChatImportAdapter for HermesAdapter {
         ChatImportAdapterDescriptor {
             adapter_id: HERMES_ADAPTER_ID.to_string(),
             display_name: "Hermes Agent".to_string(),
-            subtitle: "Local Hermes Agent SQLite sessions and facts (~/.hermes)".to_string(),
-            export_hint: "Automatically discovered from ~/.hermes (state.db and memory_store.db)"
+            subtitle: "Local or mesh-synced Hermes Agent sessions and facts".to_string(),
+            export_hint: "Automatically discovered from ~/.hermes and mesh-synced proxy.db threads"
                 .to_string(),
             icon_name: "bolt.horizontal.circle".to_string(),
             source_kind: ChatImportSourceKind::LocalStore.into(),
-            extensions: ["db", "sqlite", "sqlite3"]
-                .into_iter()
-                .map(str::to_string)
-                .collect(),
+            extensions: vec!["db".into(), "sqlite".into(), "sqlite3".into()],
+            brand_id: "hermes".to_string(),
+            default_agent_id: "proxy".to_string(),
         }
     }
 
     fn default_local_path(&self, _data_root: Option<&Path>) -> Option<PathBuf> {
         user_home_dir().map(|home| home.join(".hermes"))
+    }
+
+    fn resolve_source(
+        &self,
+        custom_path: Option<&Path>,
+        data_root: Option<&Path>,
+    ) -> Result<(Option<String>, bool), String> {
+        mesh_resolve_source(
+            custom_path,
+            self.default_local_path(data_root),
+            data_root,
+            HERMES_PROVIDERS,
+        )
     }
 
     fn sniff(&self, path: &Path, head: &[u8]) -> u8 {
@@ -52,20 +68,40 @@ impl ChatImportAdapter for HermesAdapter {
         sniff_sqlite_file(path)
     }
 
-    fn scan_manifests(&self, path: &Path) -> Result<Vec<ConversationManifest>, String> {
-        scan_hermes_path(path)
-    }
-
     fn parse_conversations(&self, path: &Path) -> Result<Vec<ImportedConversation>, String> {
         parse_hermes_path(path, None)
     }
 
-    fn parse_selected_conversations(
+    fn scan_manifests(
         &self,
-        path: &Path,
+        custom_path: Option<&Path>,
+        data_root: Option<&Path>,
+    ) -> Result<Vec<ConversationManifest>, String> {
+        mesh_scan_manifests(
+            custom_path,
+            self.default_local_path(data_root),
+            data_root,
+            HERMES_PROVIDERS,
+            &HERMES_MESH_SPEC,
+            scan_hermes_path,
+        )
+    }
+
+    fn load_conversations(
+        &self,
+        custom_path: Option<&Path>,
+        data_root: Option<&Path>,
         selected_ids: Option<&HashSet<String>>,
     ) -> Result<Vec<ImportedConversation>, String> {
-        parse_hermes_path(path, selected_ids)
+        mesh_load_conversations(
+            custom_path,
+            self.default_local_path(data_root),
+            data_root,
+            HERMES_PROVIDERS,
+            &HERMES_MESH_SPEC,
+            selected_ids,
+            parse_hermes_path,
+        )
     }
 }
 
@@ -139,15 +175,11 @@ fn sniff_sqlite_file(path: &Path) -> u8 {
         return 97;
     }
     if has_sqlite_table(&conn, "facts") && !has_sqlite_table(&conn, "conversations") {
-        let fname = path
+        let is_mem = path
             .file_name()
             .and_then(|s| s.to_str())
-            .unwrap_or_default();
-        return if fname.eq_ignore_ascii_case("memory_store.db") {
-            96
-        } else {
-            88
-        };
+            .is_some_and(|f| f.eq_ignore_ascii_case("memory_store.db"));
+        return if is_mem { 96 } else { 88 };
     }
     0
 }
@@ -211,9 +243,11 @@ fn scan_sessions_manifests(
         sqlite_opt_col(&cols, &["started_at", "created_at"], ""),
         sqlite_opt_col(&cols, &["last_activity_at", "ended_at", "updated_at"], ""),
     );
-    let mut stmt = conn
-        .prepare(&sql)
-        .map_err(|e| format!("sessions sql: {e}"))?;
+    let (mut stmt, mut out) = (
+        conn.prepare(&sql)
+            .map_err(|e| format!("sessions sql: {e}"))?,
+        Vec::new(),
+    );
     let rows = stmt
         .query_map([], |r| {
             Ok((
@@ -226,7 +260,6 @@ fn scan_sessions_manifests(
             ))
         })
         .map_err(|e| format!("sessions rows: {e}"))?;
-    let mut out = Vec::new();
     for (sid, raw_title, disp, s_raw, u_raw, count_raw) in rows.flatten() {
         let msg_count = usize::try_from(count_raw.max(0)).unwrap_or(0);
         if msg_count == 0 {
@@ -243,14 +276,9 @@ fn scan_sessions_manifests(
             .max(created_at);
         let title = disp
             .as_deref()
+            .or(raw_title.as_deref())
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .or_else(|| {
-                raw_title
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-            })
             .map(|t| truncate_chars(t, 120))
             .unwrap_or_else(|| format!("Hermes Session ({sid})"));
         out.push(ConversationManifest {
@@ -327,9 +355,7 @@ fn parse_sessions_table(
         sqlite_opt_col(&cols, &["started_at", "created_at"], ""),
         sqlite_opt_col(&cols, &["ended_at", "updated_at"], ""),
     );
-    let mut stmt = conn
-        .prepare(&sql)
-        .map_err(|e| format!("sessions query: {e}"))?;
+    let mut stmt = conn.prepare(&sql).map_err(|e| format!("sessions: {e}"))?;
     let sessions: Vec<SessionRow> = stmt
         .query_map([], |r| {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
@@ -346,9 +372,8 @@ fn parse_sessions_table(
     );
     let mut msg_stmt = conn
         .prepare(&msg_sql)
-        .map_err(|e| format!("messages query: {e}"))?;
+        .map_err(|e| format!("messages: {e}"))?;
     let mut out = Vec::new();
-
     for (sid, raw_title, disp, s_raw, e_raw) in sessions {
         let source_id = format!("hermes:session:{sid}");
         if selected.is_some_and(|ids| !ids.contains(&source_id)) {
@@ -371,7 +396,7 @@ fn parse_sessions_table(
                 ))
             })
             .map_err(|e| format!("messages {sid}: {e}"))?
-            .filter_map(Result::ok)
+            .flatten()
             .filter_map(|(role_raw, content, ts_str)| {
                 let role = normalize_role(&role_raw);
                 (role != "system" && !content.trim().is_empty()).then(|| ImportedTurn {
@@ -422,9 +447,7 @@ fn parse_facts_table(
         "SELECT CAST(content AS TEXT), {cat}, {} FROM facts ORDER BY rowid ASC",
         sqlite_opt_col(&cols, &["created_at"], ""),
     );
-    let mut stmt = conn
-        .prepare(&sql)
-        .map_err(|e| format!("facts query: {e}"))?;
+    let mut stmt = conn.prepare(&sql).map_err(|e| format!("facts: {e}"))?;
     let (mut turns, mut min_ts, mut max_ts) = (Vec::new(), None, fallback_ts);
     let rows = stmt
         .query_map([], |r| {
@@ -436,7 +459,8 @@ fn parse_facts_table(
         })
         .map_err(|e| format!("facts rows: {e}"))?;
     for (content, cat, ts_raw) in rows.flatten() {
-        if !content.trim().is_empty() {
+        let trimmed = content.trim();
+        if !trimmed.is_empty() {
             let ts = ts_raw
                 .as_deref()
                 .and_then(parse_timestamp_str)
@@ -445,7 +469,7 @@ fn parse_facts_table(
             max_ts = max_ts.max(ts);
             turns.push(ImportedTurn {
                 role: "assistant".to_string(),
-                content: format!("[{cat}] {}", content.trim()),
+                content: format!("[{cat}] {trimmed}"),
                 timestamp: ts,
             });
         }

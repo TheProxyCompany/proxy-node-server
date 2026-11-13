@@ -85,6 +85,10 @@ pub struct ChatImportAdapterDescriptor {
     pub icon_name: String,
     pub source_kind: String,
     pub extensions: Vec<String>,
+    #[serde(default)]
+    pub brand_id: String,
+    #[serde(default)]
+    pub default_agent_id: String,
 }
 
 /// Canonical normalized turn within an imported conversation.
@@ -226,6 +230,28 @@ pub trait ChatImportAdapter: Send + Sync {
         None
     }
 
+    /// Resolve `(source_path, available)` for automatic local discovery or an explicit `custom_path`.
+    fn resolve_source(
+        &self,
+        custom_path: Option<&Path>,
+        data_root: Option<&Path>,
+    ) -> Result<(Option<String>, bool), String> {
+        if let Some(explicit) = custom_path {
+            if !explicit.exists() {
+                return Err(format!(
+                    "import path does not exist: {}",
+                    explicit.display()
+                ));
+            }
+            return Ok((Some(explicit.to_string_lossy().into_owned()), true));
+        }
+        let Some(local) = self.default_local_path(data_root) else {
+            return Ok((None, false));
+        };
+        let available = local.exists();
+        Ok((Some(local.to_string_lossy().into_owned()), available))
+    }
+
     /// Return a confidence score in `0..=100` for whether `path` belongs to this adapter.
     fn sniff(&self, path: &Path, head: &[u8]) -> u8;
 
@@ -233,35 +259,62 @@ pub trait ChatImportAdapter: Send + Sync {
     fn parse_conversations(&self, path: &Path) -> Result<Vec<ImportedConversation>, String>;
 
     /// Scan lightweight conversation manifests without retaining turn bodies.
-    fn scan_manifests(&self, path: &Path) -> Result<Vec<ConversationManifest>, String> {
+    fn scan_manifests(
+        &self,
+        custom_path: Option<&Path>,
+        data_root: Option<&Path>,
+    ) -> Result<Vec<ConversationManifest>, String> {
+        let target = resolve_adapter_target(self, custom_path, data_root)?;
         Ok(self
-            .parse_conversations(path)?
+            .parse_conversations(&target)?
             .iter()
             .map(ImportedConversation::summary)
             .collect())
     }
 
     /// Lightweight `(conversation_count, total_message_count)` scan for `overview()`.
-    fn overview_counts(&self, path: &Path) -> Result<(usize, usize), String> {
-        let manifests = self.scan_manifests(path)?;
+    fn overview_counts(&self, data_root: Option<&Path>) -> Result<(usize, usize), String> {
+        let manifests = self.scan_manifests(None, data_root)?;
         Ok((
             manifests.len(),
             manifests.iter().map(|m| m.message_count).sum(),
         ))
     }
 
-    /// Parse conversations at `path`, optionally filtering early to `selected_ids`.
-    fn parse_selected_conversations(
+    /// Load conversations from `custom_path` or local/mesh stores, optionally filtering to `selected_ids`.
+    fn load_conversations(
         &self,
-        path: &Path,
+        custom_path: Option<&Path>,
+        data_root: Option<&Path>,
         selected_ids: Option<&HashSet<String>>,
     ) -> Result<Vec<ImportedConversation>, String> {
-        let mut convs = self.parse_conversations(path)?;
+        let target = resolve_adapter_target(self, custom_path, data_root)?;
+        let mut convs = self.parse_conversations(&target)?;
         if let Some(selected) = selected_ids {
             convs.retain(|c| selected.contains(&c.source_id));
         }
         Ok(convs)
     }
+}
+
+fn resolve_adapter_target<A: ChatImportAdapter + ?Sized>(
+    adapter: &A,
+    custom_path: Option<&Path>,
+    data_root: Option<&Path>,
+) -> Result<PathBuf, String> {
+    let target = custom_path
+        .map(Path::to_path_buf)
+        .or_else(|| adapter.default_local_path(data_root))
+        .ok_or_else(|| {
+            format!(
+                "adapter '{}' requires an explicit file path",
+                adapter.descriptor().adapter_id
+            )
+        })?;
+    if !target.exists() {
+        return Err(format!("import path does not exist: {}", target.display()));
+    }
+    Ok(target)
 }
 
 /// Extensible registry of [`ChatImportAdapter`] implementations.
@@ -339,24 +392,16 @@ impl ChatImportRegistry {
         best
     }
 
-    /// Check `default_local_path` for every registered adapter and scan lightweight counts
-    /// whenever a local store exists on disk.
+    /// Check local/mesh store availability for every registered adapter and scan lightweight counts.
     pub fn overview(&self, data_root: Option<&Path>) -> Vec<AdapterOverview> {
         self.adapters
             .iter()
             .map(|adapter| {
                 let descriptor = adapter.descriptor();
-                let Some(local_path) = adapter.default_local_path(data_root) else {
-                    return AdapterOverview {
-                        descriptor,
-                        source_path: None,
-                        available: false,
-                        conversation_count: 0,
-                        total_message_count: 0,
-                    };
-                };
-                let source_path = Some(local_path.to_string_lossy().into_owned());
-                if !local_path.exists() {
+                let (source_path, available) = adapter
+                    .resolve_source(None, data_root)
+                    .unwrap_or((None, false));
+                if !available {
                     return AdapterOverview {
                         descriptor,
                         source_path,
@@ -365,7 +410,7 @@ impl ChatImportRegistry {
                         total_message_count: 0,
                     };
                 }
-                match adapter.overview_counts(&local_path) {
+                match adapter.overview_counts(data_root) {
                     Ok((conversation_count, total_message_count)) => AdapterOverview {
                         descriptor,
                         source_path,
@@ -396,30 +441,8 @@ impl ChatImportRegistry {
             .get(adapter_id)
             .ok_or_else(|| format!("unknown chat import adapter: {adapter_id}"))?;
         let descriptor = adapter.descriptor();
-        let resolved = match custom_path {
-            Some(explicit) => {
-                if !explicit.exists() {
-                    return Err(format!(
-                        "import path does not exist: {}",
-                        explicit.display()
-                    ));
-                }
-                Some(explicit.to_path_buf())
-            }
-            None => adapter.default_local_path(data_root),
-        };
-        let Some(target) = resolved else {
-            return Ok(AdapterInventory {
-                descriptor,
-                source_path: None,
-                available: false,
-                conversation_count: 0,
-                total_message_count: 0,
-                conversations: Vec::new(),
-            });
-        };
-        let source_path = Some(target.to_string_lossy().into_owned());
-        if !target.exists() {
+        let (source_path, available) = adapter.resolve_source(custom_path, data_root)?;
+        if !available {
             return Ok(AdapterInventory {
                 descriptor,
                 source_path,
@@ -429,7 +452,7 @@ impl ChatImportRegistry {
                 conversations: Vec::new(),
             });
         }
-        let mut conversations = adapter.scan_manifests(&target)?;
+        let mut conversations = adapter.scan_manifests(custom_path, data_root)?;
         conversations.sort_by(|a, b| {
             b.updated_at
                 .cmp(&a.updated_at)
@@ -458,14 +481,7 @@ impl ChatImportRegistry {
         let adapter = self
             .get(adapter_id)
             .ok_or_else(|| format!("unknown chat import adapter: {adapter_id}"))?;
-        let target = custom_path
-            .map(Path::to_path_buf)
-            .or_else(|| adapter.default_local_path(data_root))
-            .ok_or_else(|| format!("adapter '{adapter_id}' requires an explicit file path"))?;
-        if !target.exists() {
-            return Err(format!("import path does not exist: {}", target.display()));
-        }
-        let mut convs = adapter.parse_selected_conversations(&target, selected_ids)?;
+        let mut convs = adapter.load_conversations(custom_path, data_root, selected_ids)?;
         if let Some(selected) = selected_ids {
             convs.retain(|c| selected.contains(&c.source_id));
         }

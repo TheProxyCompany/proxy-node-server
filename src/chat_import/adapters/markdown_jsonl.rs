@@ -28,6 +28,8 @@ impl ChatImportAdapter for MarkdownJsonlAdapter {
                 "jsonl".to_string(),
                 "txt".to_string(),
             ],
+            brand_id: "markdown".to_string(),
+            default_agent_id: "proxy".to_string(),
         }
     }
 

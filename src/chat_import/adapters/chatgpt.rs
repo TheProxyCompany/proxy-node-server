@@ -27,6 +27,8 @@ impl ChatImportAdapter for ChatGptAdapter {
             icon_name: "bubble.left.and.bubble.right".to_string(),
             source_kind: ChatImportSourceKind::ExportFile.into(),
             extensions: vec!["zip".to_string(), "json".to_string()],
+            brand_id: "openai".to_string(),
+            default_agent_id: "gpt".to_string(),
         }
     }
 

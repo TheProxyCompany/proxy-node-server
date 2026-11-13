@@ -75,23 +75,28 @@ fn build_single_file_zip(entry_name: &str, payload: &[u8], deflate: bool) -> Vec
 #[test]
 fn builtin_registry_exposes_all_seven_descriptors() {
     let reg = ChatImportRegistry::builtin();
-    let ids: Vec<String> = reg
+    let meta: Vec<(String, String, String)> = reg
         .descriptors()
         .into_iter()
-        .map(|d| d.adapter_id)
+        .map(|d| (d.adapter_id, d.brand_id, d.default_agent_id))
         .collect();
     assert_eq!(
-        ids,
+        meta,
         vec![
-            "chatgpt",
-            "claude_export",
-            "claude_code",
-            "codex",
-            "hermes",
-            "proxy_threads",
-            "markdown_jsonl",
+            ("chatgpt".into(), "openai".into(), "gpt".into()),
+            ("claude_export".into(), "anthropic".into(), "claude".into()),
+            ("claude_code".into(), "claude_code".into(), "claude".into()),
+            ("codex".into(), "codex".into(), "gpt".into()),
+            ("hermes".into(), "hermes".into(), "proxy".into()),
+            ("proxy_threads".into(), "proxy".into(), "proxy".into()),
+            ("markdown_jsonl".into(), "markdown".into(), "proxy".into()),
         ]
     );
+    let legacy: ChatImportAdapterDescriptor = serde_json::from_str(
+        r#"{"adapter_id":"x","display_name":"X","subtitle":"s","export_hint":"h","icon_name":"i","source_kind":"export_file","extensions":[]}"#,
+    )
+    .expect("serde default brand/agent fields");
+    assert!(legacy.brand_id.is_empty() && legacy.default_agent_id.is_empty());
 }
 
 #[test]
@@ -306,14 +311,16 @@ fn hermes_and_proxy_threads_sqlite_stores_scan_and_overview() {
         .expect("seed proxy.db");
     }
 
-    let overview = reg.overview(Some(&proxy_root));
-    let pt_overview = overview
-        .iter()
-        .find(|o| o.descriptor.adapter_id == "proxy_threads")
-        .expect("proxy_threads overview");
-    assert!(pt_overview.available);
-    assert_eq!(pt_overview.conversation_count, 2);
-    assert_eq!(pt_overview.total_message_count, 2);
+    util::with_test_home_dir(dir.path(), || {
+        let overview = reg.overview(Some(&proxy_root));
+        let pt_overview = overview
+            .iter()
+            .find(|o| o.descriptor.adapter_id == "proxy_threads")
+            .expect("proxy_threads overview");
+        assert!(pt_overview.available);
+        assert_eq!(pt_overview.conversation_count, 2);
+        assert_eq!(pt_overview.total_message_count, 2);
+    });
 
     let pt_convs = reg
         .load_conversations("proxy_threads", None, Some(&proxy_root), None)
@@ -369,6 +376,77 @@ fn import_job_tracker_tracks_progress_and_cancellation() {
     let listed = tracker.list_jobs_for_agent("agent-mogul");
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].job_id, "job-1");
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn mesh_synced_proxy_db_populates_adapters_and_scopes_proxy_threads() {
+    let dir = tempdir().expect("tempdir");
+    let fake_home = dir.path().join("fake-home");
+    fs::create_dir_all(&fake_home).expect("mkdir fake_home");
+    // Seed local ~/.claude/projects (with overlapping sess-shared) and ~/.codex/sessions,
+    // while leaving ~/.hermes completely absent on disk!
+    let cc_dir = fake_home.join(".claude").join("projects").join("p1");
+    let cx_dir = fake_home.join(".codex").join("sessions");
+    fs::create_dir_all(&cc_dir).expect("mkdir cc");
+    fs::create_dir_all(&cx_dir).expect("mkdir cx");
+    fs::write(
+        cc_dir.join("sess-shared.jsonl"),
+        serde_json::json!({ "type": "user", "sessionId": "sess-shared", "timestamp": "2026-11-12T10:00:00Z", "message": { "content": "Local claude turn" } }).to_string(),
+    )
+    .expect("write local cc");
+    fs::write(
+        cx_dir.join("cx-local.jsonl"),
+        serde_json::json!({ "type": "event_msg", "timestamp": "2026-11-12T10:00:00Z", "payload": { "id": "m1", "type": "user_message", "message": "Local codex turn" } }).to_string(),
+    )
+    .expect("write local cx");
+
+    let proxy_root = dir.path().join("mesh-data");
+    fs::create_dir_all(&proxy_root).expect("mkdir proxy_root");
+    let conn = rusqlite::Connection::open(proxy_root.join("proxy.db")).expect("open proxy.db");
+    conn.execute_batch(
+        "CREATE TABLE conversations (id TEXT PRIMARY KEY, source_provider TEXT, source_id TEXT, title TEXT, kind TEXT, archived INTEGER, created_at TEXT, updated_at TEXT);
+         CREATE TABLE items (id TEXT PRIMARY KEY, conversation_id TEXT, type TEXT, role TEXT, content TEXT, created_at TEXT);
+         INSERT INTO conversations VALUES ('ext-h1', 'hermes', 'h-mesh-1', 'Mesh Hermes Run', 'direct', 0, '2026-11-12T12:00:00Z', '2026-11-12T12:05:00Z');
+         INSERT INTO conversations VALUES ('ext-cc1', 'claude_code', 'sess-shared', 'Dup Claude', 'direct', 0, '2026-11-12T12:00:00Z', '2026-11-12T12:05:00Z');
+         INSERT INTO conversations VALUES ('ext-cc2', 'claude-code', 'sess-mesh-2', 'Mesh Claude 2', 'direct', 0, '2026-11-12T12:10:00Z', '2026-11-12T12:15:00Z');
+         INSERT INTO conversations VALUES ('ext-cx1', 'codex', 'cx-mesh-1', 'Mesh Codex Run', 'direct', 0, '2026-11-12T12:20:00Z', '2026-11-12T12:25:00Z');
+         INSERT INTO conversations VALUES ('proxy.direct.1', 'proxy', NULL, 'Native Direct', 'direct', 0, '2026-11-12T12:30:00Z', '2026-11-12T12:35:00Z');
+         INSERT INTO conversations VALUES ('party.ops', NULL, NULL, 'Native Null Provider', 'party', 0, '2026-11-12T12:40:00Z', '2026-11-12T12:45:00Z');
+         INSERT INTO items VALUES ('m1', 'ext-h1', 'message', 'user', 'Sync hermes', '2026-11-12T12:01:00Z');
+         INSERT INTO items VALUES ('m2', 'ext-h1', 'message', 'assistant', 'Synced.', '2026-11-12T12:02:00Z');
+         INSERT INTO items VALUES ('m3', 'ext-cc1', 'message', 'user', 'Dup turn', '2026-11-12T12:01:00Z');
+         INSERT INTO items VALUES ('m4', 'ext-cc2', 'message', 'assistant', 'Remote claude', '2026-11-12T12:11:00Z');
+         INSERT INTO items VALUES ('m5', 'ext-cx1', 'message', 'user', 'Remote codex', '2026-11-12T12:21:00Z');
+         INSERT INTO items VALUES ('m6', 'proxy.direct.1', 'message', 'user', 'Hello Proxy', '2026-11-12T12:31:00Z');
+         INSERT INTO items VALUES ('m7', 'party.ops', 'message', 'assistant', 'Party ready', '2026-11-12T12:41:00Z');",
+    )
+    .expect("seed mixed proxy.db");
+    drop(conn);
+
+    util::with_test_home_dir(&fake_home, || {
+        assert!(!fake_home.join(".hermes").exists());
+        let reg = ChatImportRegistry::builtin();
+        let ov = reg.overview(Some(&proxy_root));
+        let stat = |id: &str| {
+            let o = ov.iter().find(|o| o.descriptor.adapter_id == id).unwrap();
+            (o.available, o.conversation_count, o.total_message_count)
+        };
+        assert_eq!(stat("hermes"), (true, 1, 2));
+        assert_eq!(stat("claude_code"), (true, 2, 2));
+        assert_eq!(stat("codex"), (true, 2, 2));
+        assert_eq!(stat("proxy_threads"), (true, 2, 2));
+        let h_convs = reg
+            .load_conversations("hermes", None, Some(&proxy_root), None)
+            .expect("load mesh hermes without ~/.hermes");
+        assert_eq!(h_convs.len(), 1);
+        assert_eq!(h_convs[0].source_id, "hermes:session:h-mesh-1");
+        let pt_convs = reg
+            .load_conversations("proxy_threads", None, Some(&proxy_root), None)
+            .expect("load scoped proxy_threads");
+        assert_eq!(pt_convs.len(), 2);
+        assert!(pt_convs.iter().all(|c| c.adapter_id == "proxy_threads"));
+    });
 }
 
 #[test]

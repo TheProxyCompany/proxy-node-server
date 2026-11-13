@@ -26,6 +26,8 @@ impl ChatImportAdapter for ClaudeExportAdapter {
             icon_name: "sparkles".to_string(),
             source_kind: ChatImportSourceKind::ExportFile.into(),
             extensions: vec!["zip".to_string(), "json".to_string()],
+            brand_id: "anthropic".to_string(),
+            default_agent_id: "claude".to_string(),
         }
     }
 

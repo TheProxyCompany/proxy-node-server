@@ -1,13 +1,17 @@
 //! Anthropic Claude Code CLI `~/.claude/projects/**/*.jsonl` local session store adapter.
 
 use std::collections::HashSet;
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
 use super::claude_export::extract_claude_msg_text;
+use super::{
+    CLAUDE_CODE_MESH_SPEC, CLAUDE_CODE_PROVIDERS, mesh_load_conversations, mesh_resolve_source,
+    mesh_scan_manifests,
+};
 use crate::chat_import::{
     CLAUDE_CODE_ADAPTER_ID, ChatImportAdapter, ChatImportAdapterDescriptor, ChatImportSourceKind,
     ConversationManifest, ImportedConversation, ImportedTurn, collect_files_bounded,
@@ -22,16 +26,34 @@ impl ChatImportAdapter for ClaudeCodeAdapter {
         ChatImportAdapterDescriptor {
             adapter_id: CLAUDE_CODE_ADAPTER_ID.to_string(),
             display_name: "Claude Code".to_string(),
-            subtitle: "Local Claude Code CLI project transcripts (~/.claude/projects)".to_string(),
-            export_hint: "Automatically discovered from ~/.claude/projects".to_string(),
+            subtitle: "Local or mesh-synced Claude Code CLI transcripts (~/.claude/projects)"
+                .to_string(),
+            export_hint:
+                "Automatically discovered from ~/.claude/projects and mesh-synced proxy.db threads"
+                    .to_string(),
             icon_name: "terminal".to_string(),
             source_kind: ChatImportSourceKind::LocalStore.into(),
             extensions: vec!["jsonl".to_string()],
+            brand_id: "claude_code".to_string(),
+            default_agent_id: "claude".to_string(),
         }
     }
 
     fn default_local_path(&self, _data_root: Option<&Path>) -> Option<PathBuf> {
         user_home_dir().map(|home| home.join(".claude").join("projects"))
+    }
+
+    fn resolve_source(
+        &self,
+        custom_path: Option<&Path>,
+        data_root: Option<&Path>,
+    ) -> Result<(Option<String>, bool), String> {
+        mesh_resolve_source(
+            custom_path,
+            self.default_local_path(data_root),
+            data_root,
+            CLAUDE_CODE_PROVIDERS,
+        )
     }
 
     fn sniff(&self, path: &Path, head: &[u8]) -> u8 {
@@ -61,88 +83,89 @@ impl ChatImportAdapter for ClaudeCodeAdapter {
         0
     }
 
-    fn overview_counts(&self, path: &Path) -> Result<(usize, usize), String> {
-        let files = if path.is_dir() {
-            list_jsonl_files(path)?
-        } else {
-            vec![path.to_path_buf()]
-        };
-        let (mut convs, mut msgs) = (0_usize, 0_usize);
-        for f in files {
-            let Ok(raw) = fs::read(&f) else {
-                continue;
-            };
-            let mut n = 0_usize;
-            for line in raw.split(|&b| b == b'\n') {
-                let head = String::from_utf8_lossy(&line[..line.len().min(320)]);
-                if head.contains("\"type\":\"user\"")
-                    || head.contains("\"type\": \"user\"")
-                    || head.contains("\"type\":\"assistant\"")
-                    || head.contains("\"type\": \"assistant\"")
-                {
-                    n += 1;
-                }
-            }
-            if n > 0 {
-                convs += 1;
-                msgs += n;
-            }
-        }
-        Ok((convs, msgs))
-    }
-
-    fn scan_manifests(&self, path: &Path) -> Result<Vec<ConversationManifest>, String> {
-        if path.is_dir() {
-            let files = list_jsonl_files(path)?;
-            let mut seen_ids = HashSet::new();
-            let mut out = Vec::new();
-            for f in files {
-                if let Ok(Some(m)) = scan_claude_code_manifest(&f)
-                    && seen_ids.insert(m.source_id.clone())
-                {
-                    out.push(m);
-                }
-            }
-            return Ok(out);
-        }
-        Ok(scan_claude_code_manifest(path)?.into_iter().collect())
-    }
-
     fn parse_conversations(&self, path: &Path) -> Result<Vec<ImportedConversation>, String> {
-        self.parse_selected_conversations(path, None)
+        parse_claude_code_path(path, None)
     }
 
-    fn parse_selected_conversations(
+    fn scan_manifests(
         &self,
-        path: &Path,
+        custom_path: Option<&Path>,
+        data_root: Option<&Path>,
+    ) -> Result<Vec<ConversationManifest>, String> {
+        mesh_scan_manifests(
+            custom_path,
+            self.default_local_path(data_root),
+            data_root,
+            CLAUDE_CODE_PROVIDERS,
+            &CLAUDE_CODE_MESH_SPEC,
+            scan_claude_code_path,
+        )
+    }
+
+    fn load_conversations(
+        &self,
+        custom_path: Option<&Path>,
+        data_root: Option<&Path>,
         selected_ids: Option<&HashSet<String>>,
     ) -> Result<Vec<ImportedConversation>, String> {
-        if path.is_dir() {
-            let files = list_jsonl_files(path)?;
-            let mut seen_ids = HashSet::new();
-            let mut out = Vec::new();
-            for f in files {
-                if let Some(sel) = selected_ids
-                    && let Some(stem) = f.file_stem().and_then(|s| s.to_str())
-                    && !sel.contains(&format!("claude_code:{stem}"))
-                    && file_head_has_matching_session(&f, stem)
-                {
-                    continue;
-                }
-                if let Ok(convs) = parse_claude_code_jsonl(&f) {
-                    for conv in convs {
-                        if selected_ids.is_none_or(|sel| sel.contains(&conv.source_id))
-                            && seen_ids.insert(conv.source_id.clone())
-                        {
-                            out.push(conv);
-                        }
+        mesh_load_conversations(
+            custom_path,
+            self.default_local_path(data_root),
+            data_root,
+            CLAUDE_CODE_PROVIDERS,
+            &CLAUDE_CODE_MESH_SPEC,
+            selected_ids,
+            parse_claude_code_path,
+        )
+    }
+}
+
+fn scan_claude_code_path(path: &Path) -> Result<Vec<ConversationManifest>, String> {
+    if path.is_dir() {
+        let files = list_jsonl_files(path)?;
+        let mut seen_ids = HashSet::new();
+        let mut out = Vec::new();
+        for f in files {
+            if let Ok(Some(m)) = scan_claude_code_manifest(&f)
+                && seen_ids.insert(m.source_id.clone())
+            {
+                out.push(m);
+            }
+        }
+        return Ok(out);
+    }
+    Ok(scan_claude_code_manifest(path)?.into_iter().collect())
+}
+
+fn parse_claude_code_path(
+    path: &Path,
+    selected_ids: Option<&HashSet<String>>,
+) -> Result<Vec<ImportedConversation>, String> {
+    if path.is_dir() {
+        let files = list_jsonl_files(path)?;
+        let mut seen_ids = HashSet::new();
+        let mut out = Vec::new();
+        for f in files {
+            if let Some(sel) = selected_ids
+                && let Some(stem) = f.file_stem().and_then(|s| s.to_str())
+                && !sel.contains(&format!("claude_code:{stem}"))
+                && file_head_has_matching_session(&f, stem)
+            {
+                continue;
+            }
+            if let Ok(convs) = parse_claude_code_jsonl(&f) {
+                for conv in convs {
+                    if selected_ids.is_none_or(|sel| sel.contains(&conv.source_id))
+                        && seen_ids.insert(conv.source_id.clone())
+                    {
+                        out.push(conv);
                     }
                 }
             }
-            return Ok(out);
         }
-        parse_claude_code_jsonl(path)
+        return Ok(out);
     }
+    parse_claude_code_jsonl(path)
 }
 
 fn list_jsonl_files(path: &Path) -> Result<Vec<PathBuf>, String> {

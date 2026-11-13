@@ -9,9 +9,122 @@ pub mod hermes;
 pub mod markdown_jsonl;
 pub mod proxy_threads;
 
+use std::collections::HashSet;
 use std::io::Read;
+use std::path::{Path, PathBuf};
 
 use flate2::read::DeflateDecoder;
+
+use crate::chat_import::{
+    CLAUDE_CODE_ADAPTER_ID, CODEX_ADAPTER_ID, ConversationManifest, HERMES_ADAPTER_ID,
+    ImportedConversation, PROXY_THREADS_ADAPTER_ID,
+};
+
+#[cfg_attr(not(feature = "sqlite"), allow(dead_code))]
+#[derive(Clone, Copy)]
+pub(crate) enum ProviderFilter {
+    NativeProxy,
+    External(&'static [&'static str]),
+}
+
+#[cfg_attr(not(feature = "sqlite"), allow(dead_code))]
+#[derive(Clone, Copy)]
+pub(crate) struct ProxyDbAdapterSpec {
+    pub adapter_id: &'static str,
+    pub filter: ProviderFilter,
+    pub default_title: &'static str,
+    pub default_participants: &'static [&'static str],
+    pub fixed_owner_scope: bool,
+    pub make_source_id: fn(&str, Option<&str>) -> String,
+}
+
+fn strip_ext_id<'a>(cid: &'a str, ext_sid: Option<&'a str>, prefixes: &[&str]) -> &'a str {
+    let raw = ext_sid
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| cid.trim());
+    for p in prefixes {
+        if let Some(rest) = raw.strip_prefix(p) {
+            return rest;
+        }
+    }
+    raw
+}
+
+fn proxy_native_source_id(cid: &str, _: Option<&str>) -> String {
+    format!("proxy_threads:{cid}")
+}
+
+fn hermes_proxy_source_id(cid: &str, ext_sid: Option<&str>) -> String {
+    let raw = ext_sid
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| cid.trim());
+    if raw.starts_with("hermes:session:") || raw.starts_with("hermes:facts:") {
+        return raw.to_string();
+    }
+    let s = strip_ext_id(cid, ext_sid, &["hermes:", "hermes-agent:", "ext.hermes."]);
+    format!("hermes:session:{s}")
+}
+
+fn claude_code_proxy_source_id(cid: &str, ext_sid: Option<&str>) -> String {
+    let s = strip_ext_id(
+        cid,
+        ext_sid,
+        &[
+            "claude_code:",
+            "claude-code:",
+            "ext.claude_code.",
+            "ext.claude-code.",
+        ],
+    );
+    format!("claude_code:{s}")
+}
+
+fn codex_proxy_source_id(cid: &str, ext_sid: Option<&str>) -> String {
+    let s = strip_ext_id(cid, ext_sid, &["codex:", "ext.codex."]);
+    format!("codex:{s}")
+}
+
+pub(crate) const HERMES_PROVIDERS: &[&str] = &["hermes", "hermes-agent"];
+pub(crate) const CLAUDE_CODE_PROVIDERS: &[&str] = &["claude_code", "claude-code"];
+pub(crate) const CODEX_PROVIDERS: &[&str] = &["codex"];
+
+pub(crate) const PROXY_NATIVE_SPEC: ProxyDbAdapterSpec = ProxyDbAdapterSpec {
+    adapter_id: PROXY_THREADS_ADAPTER_ID,
+    filter: ProviderFilter::NativeProxy,
+    default_title: "",
+    default_participants: &["owner", "Proxy"],
+    fixed_owner_scope: false,
+    make_source_id: proxy_native_source_id,
+};
+
+pub(crate) const HERMES_MESH_SPEC: ProxyDbAdapterSpec = ProxyDbAdapterSpec {
+    adapter_id: HERMES_ADAPTER_ID,
+    filter: ProviderFilter::External(HERMES_PROVIDERS),
+    default_title: "Hermes Session",
+    default_participants: &["user", "Hermes"],
+    fixed_owner_scope: true,
+    make_source_id: hermes_proxy_source_id,
+};
+
+pub(crate) const CLAUDE_CODE_MESH_SPEC: ProxyDbAdapterSpec = ProxyDbAdapterSpec {
+    adapter_id: CLAUDE_CODE_ADAPTER_ID,
+    filter: ProviderFilter::External(CLAUDE_CODE_PROVIDERS),
+    default_title: "Claude Code Session",
+    default_participants: &["user", "Claude Code"],
+    fixed_owner_scope: true,
+    make_source_id: claude_code_proxy_source_id,
+};
+
+pub(crate) const CODEX_MESH_SPEC: ProxyDbAdapterSpec = ProxyDbAdapterSpec {
+    adapter_id: CODEX_ADAPTER_ID,
+    filter: ProviderFilter::External(CODEX_PROVIDERS),
+    default_title: "Codex Session",
+    default_participants: &["user", "Codex"],
+    fixed_owner_scope: true,
+    make_source_id: codex_proxy_source_id,
+};
 
 /// Extract matching entries from a standard PKZIP archive (`Store` = 0, `Deflate` = 8)
 /// by walking the Central Directory.
@@ -149,4 +262,168 @@ pub(crate) fn sqlite_opt_col(cols: &[String], candidates: &[&str], prefix: &str)
             }
         })
         .unwrap_or_else(|| "NULL".to_string())
+}
+
+pub(crate) fn mesh_resolve_source(
+    custom_path: Option<&Path>,
+    local_default: Option<PathBuf>,
+    data_root: Option<&Path>,
+    providers: &'static [&'static str],
+) -> Result<(Option<String>, bool), String> {
+    if let Some(explicit) = custom_path {
+        if !explicit.exists() {
+            return Err(format!(
+                "import path does not exist: {}",
+                explicit.display()
+            ));
+        }
+        return Ok((Some(explicit.to_string_lossy().into_owned()), true));
+    }
+    if let Some(ref local) = local_default
+        && local.exists()
+    {
+        return Ok((Some(local.to_string_lossy().into_owned()), true));
+    }
+    if proxy_threads::proxy_db_has_provider(data_root, providers)
+        && let Some(db) = proxy_threads::resolve_proxy_db_path(data_root)
+    {
+        return Ok((Some(db.to_string_lossy().into_owned()), true));
+    }
+    Ok((
+        local_default.map(|p| p.to_string_lossy().into_owned()),
+        false,
+    ))
+}
+
+fn is_auto_or_default_target(
+    custom_path: Option<&Path>,
+    local_default: Option<&Path>,
+    proxy_db: Option<&Path>,
+) -> bool {
+    custom_path.is_none()
+        || (custom_path.is_some() && (custom_path == local_default || custom_path == proxy_db))
+}
+
+pub(crate) fn mesh_scan_manifests<F>(
+    custom_path: Option<&Path>,
+    local_default: Option<PathBuf>,
+    data_root: Option<&Path>,
+    providers: &'static [&'static str],
+    spec: &ProxyDbAdapterSpec,
+    scan_local: F,
+) -> Result<Vec<ConversationManifest>, String>
+where
+    F: FnOnce(&Path) -> Result<Vec<ConversationManifest>, String>,
+{
+    let proxy_db = proxy_threads::resolve_proxy_db_path(data_root);
+    if !is_auto_or_default_target(custom_path, local_default.as_deref(), proxy_db.as_deref()) {
+        let explicit = custom_path.expect("checked non-none custom_path");
+        if !explicit.exists() {
+            return Err(format!(
+                "import path does not exist: {}",
+                explicit.display()
+            ));
+        }
+        if proxy_threads::is_proxy_db_file(explicit) {
+            return Ok(
+                proxy_threads::parse_proxy_db_for_spec(explicit, spec, None)?
+                    .iter()
+                    .map(ImportedConversation::summary)
+                    .collect(),
+            );
+        }
+        return scan_local(explicit);
+    }
+
+    let local_existing = local_default.as_deref().filter(|p| p.exists());
+    let has_mesh = proxy_threads::proxy_db_has_provider(data_root, providers);
+    if local_existing.is_none() && !has_mesh {
+        return match local_default {
+            Some(p) => Err(format!("import path does not exist: {}", p.display())),
+            None => Err(format!(
+                "adapter '{}' requires an explicit file path",
+                spec.adapter_id
+            )),
+        };
+    }
+
+    let (mut seen, mut out) = (HashSet::new(), Vec::new());
+    if let Some(local_dir) = local_existing {
+        for m in scan_local(local_dir)? {
+            if seen.insert(m.source_id.clone()) {
+                out.push(m);
+            }
+        }
+    }
+    if has_mesh {
+        for c in proxy_threads::parse_optional_mesh_proxy_db(data_root, spec, None)? {
+            if seen.insert(c.source_id.clone()) {
+                out.push(c.summary());
+            }
+        }
+    }
+    Ok(out)
+}
+
+pub(crate) fn mesh_load_conversations<F>(
+    custom_path: Option<&Path>,
+    local_default: Option<PathBuf>,
+    data_root: Option<&Path>,
+    providers: &'static [&'static str],
+    spec: &ProxyDbAdapterSpec,
+    selected: Option<&HashSet<String>>,
+    load_local: F,
+) -> Result<Vec<ImportedConversation>, String>
+where
+    F: FnOnce(&Path, Option<&HashSet<String>>) -> Result<Vec<ImportedConversation>, String>,
+{
+    let proxy_db = proxy_threads::resolve_proxy_db_path(data_root);
+    if !is_auto_or_default_target(custom_path, local_default.as_deref(), proxy_db.as_deref()) {
+        let explicit = custom_path.expect("checked non-none custom_path");
+        if !explicit.exists() {
+            return Err(format!(
+                "import path does not exist: {}",
+                explicit.display()
+            ));
+        }
+        if proxy_threads::is_proxy_db_file(explicit) {
+            return proxy_threads::parse_proxy_db_for_spec(explicit, spec, selected);
+        }
+        let mut convs = load_local(explicit, selected)?;
+        if let Some(sel) = selected {
+            convs.retain(|c| sel.contains(&c.source_id));
+        }
+        return Ok(convs);
+    }
+
+    let local_existing = local_default.as_deref().filter(|p| p.exists());
+    let has_mesh = proxy_threads::proxy_db_has_provider(data_root, providers);
+    if local_existing.is_none() && !has_mesh {
+        return match local_default {
+            Some(p) => Err(format!("import path does not exist: {}", p.display())),
+            None => Err(format!(
+                "adapter '{}' requires an explicit file path",
+                spec.adapter_id
+            )),
+        };
+    }
+
+    let (mut seen, mut out) = (HashSet::new(), Vec::new());
+    if let Some(local_dir) = local_existing {
+        for c in load_local(local_dir, selected)? {
+            if selected.is_none_or(|s| s.contains(&c.source_id)) && seen.insert(c.source_id.clone())
+            {
+                out.push(c);
+            }
+        }
+    }
+    if has_mesh {
+        for c in proxy_threads::parse_optional_mesh_proxy_db(data_root, spec, selected)? {
+            if selected.is_none_or(|s| s.contains(&c.source_id)) && seen.insert(c.source_id.clone())
+            {
+                out.push(c);
+            }
+        }
+    }
+    Ok(out)
 }

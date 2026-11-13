@@ -1,12 +1,16 @@
 //! OpenAI Codex CLI `~/.codex/sessions/**/*.jsonl` (`response_item` / `event_msg`) adapter.
 
 use std::collections::HashSet;
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
+use super::{
+    CODEX_MESH_SPEC, CODEX_PROVIDERS, mesh_load_conversations, mesh_resolve_source,
+    mesh_scan_manifests,
+};
 use crate::chat_import::{
     CODEX_ADAPTER_ID, ChatImportAdapter, ChatImportAdapterDescriptor, ChatImportSourceKind,
     ConversationManifest, ImportedConversation, ImportedTurn, collect_files_bounded,
@@ -21,16 +25,34 @@ impl ChatImportAdapter for CodexAdapter {
         ChatImportAdapterDescriptor {
             adapter_id: CODEX_ADAPTER_ID.to_string(),
             display_name: "Codex".to_string(),
-            subtitle: "Local OpenAI Codex CLI session logs (~/.codex/sessions)".to_string(),
-            export_hint: "Automatically discovered from ~/.codex/sessions".to_string(),
+            subtitle: "Local or mesh-synced OpenAI Codex CLI sessions (~/.codex/sessions)"
+                .to_string(),
+            export_hint:
+                "Automatically discovered from ~/.codex/sessions and mesh-synced proxy.db threads"
+                    .to_string(),
             icon_name: "chevron.left.forwardslash.chevron.right".to_string(),
             source_kind: ChatImportSourceKind::LocalStore.into(),
             extensions: vec!["jsonl".to_string()],
+            brand_id: "codex".to_string(),
+            default_agent_id: "gpt".to_string(),
         }
     }
 
     fn default_local_path(&self, _data_root: Option<&Path>) -> Option<PathBuf> {
         user_home_dir().map(|home| home.join(".codex").join("sessions"))
+    }
+
+    fn resolve_source(
+        &self,
+        custom_path: Option<&Path>,
+        data_root: Option<&Path>,
+    ) -> Result<(Option<String>, bool), String> {
+        mesh_resolve_source(
+            custom_path,
+            self.default_local_path(data_root),
+            data_root,
+            CODEX_PROVIDERS,
+        )
     }
 
     fn sniff(&self, path: &Path, head: &[u8]) -> u8 {
@@ -55,75 +77,80 @@ impl ChatImportAdapter for CodexAdapter {
         u8::from(path_str.contains(".codex")) * 90
     }
 
-    fn overview_counts(&self, path: &Path) -> Result<(usize, usize), String> {
-        let files = if path.is_dir() {
-            list_codex_files(path)?
-        } else {
-            vec![path.to_path_buf()]
-        };
-        let (mut convs, mut msgs) = (0_usize, 0_usize);
-        for f in files {
-            let Ok(raw) = fs::read(&f) else {
-                continue;
-            };
-            let (mut ev_count, mut item_count) = (0_usize, 0_usize);
-            for line in raw.split(|&b| b == b'\n') {
-                let head = String::from_utf8_lossy(&line[..line.len().min(320)]);
-                if head.contains("\"user_message\"") || head.contains("\"agent_message\"") {
-                    ev_count += 1;
-                } else if head.contains("\"response_item\"")
-                    && (head.contains("\"role\":\"user\"")
-                        || head.contains("\"role\": \"user\"")
-                        || head.contains("\"role\":\"assistant\"")
-                        || head.contains("\"role\": \"assistant\""))
-                {
-                    item_count += 1;
-                }
-            }
-            let n = if ev_count > 0 { ev_count } else { item_count };
-            if n > 0 {
-                convs += 1;
-                msgs += n;
-            }
-        }
-        Ok((convs, msgs))
-    }
-
-    fn scan_manifests(&self, path: &Path) -> Result<Vec<ConversationManifest>, String> {
-        if path.is_dir() {
-            let files = list_codex_files(path)?;
-            let mut seen_ids = HashSet::new();
-            let mut out = Vec::new();
-            for f in files {
-                if let Ok(Some(m)) = scan_codex_manifest(&f)
-                    && seen_ids.insert(m.source_id.clone())
-                {
-                    out.push(m);
-                }
-            }
-            return Ok(out);
-        }
-        Ok(scan_codex_manifest(path)?.into_iter().collect())
-    }
-
     fn parse_conversations(&self, path: &Path) -> Result<Vec<ImportedConversation>, String> {
-        if path.is_dir() {
-            let files = list_codex_files(path)?;
-            let mut seen_ids = HashSet::new();
-            let mut out = Vec::new();
-            for f in files {
-                if let Ok(convs) = parse_codex_jsonl(&f) {
-                    for conv in convs {
-                        if seen_ids.insert(conv.source_id.clone()) {
-                            out.push(conv);
-                        }
+        parse_codex_path(path, None)
+    }
+
+    fn scan_manifests(
+        &self,
+        custom_path: Option<&Path>,
+        data_root: Option<&Path>,
+    ) -> Result<Vec<ConversationManifest>, String> {
+        mesh_scan_manifests(
+            custom_path,
+            self.default_local_path(data_root),
+            data_root,
+            CODEX_PROVIDERS,
+            &CODEX_MESH_SPEC,
+            scan_codex_path,
+        )
+    }
+
+    fn load_conversations(
+        &self,
+        custom_path: Option<&Path>,
+        data_root: Option<&Path>,
+        selected_ids: Option<&HashSet<String>>,
+    ) -> Result<Vec<ImportedConversation>, String> {
+        mesh_load_conversations(
+            custom_path,
+            self.default_local_path(data_root),
+            data_root,
+            CODEX_PROVIDERS,
+            &CODEX_MESH_SPEC,
+            selected_ids,
+            parse_codex_path,
+        )
+    }
+}
+
+fn scan_codex_path(path: &Path) -> Result<Vec<ConversationManifest>, String> {
+    if path.is_dir() {
+        let files = list_codex_files(path)?;
+        let mut seen_ids = HashSet::new();
+        let mut out = Vec::new();
+        for f in files {
+            if let Ok(Some(m)) = scan_codex_manifest(&f)
+                && seen_ids.insert(m.source_id.clone())
+            {
+                out.push(m);
+            }
+        }
+        return Ok(out);
+    }
+    Ok(scan_codex_manifest(path)?.into_iter().collect())
+}
+
+fn parse_codex_path(
+    path: &Path,
+    _selected: Option<&HashSet<String>>,
+) -> Result<Vec<ImportedConversation>, String> {
+    if path.is_dir() {
+        let files = list_codex_files(path)?;
+        let mut seen_ids = HashSet::new();
+        let mut out = Vec::new();
+        for f in files {
+            if let Ok(convs) = parse_codex_jsonl(&f) {
+                for conv in convs {
+                    if seen_ids.insert(conv.source_id.clone()) {
+                        out.push(conv);
                     }
                 }
             }
-            return Ok(out);
         }
-        parse_codex_jsonl(path)
+        return Ok(out);
     }
+    parse_codex_jsonl(path)
 }
 
 fn list_codex_files(path: &Path) -> Result<Vec<PathBuf>, String> {
