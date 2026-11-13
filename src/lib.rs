@@ -4,6 +4,7 @@
 //! replication engine with pluggable stores.
 
 pub mod address;
+pub mod chat_import;
 #[cfg(feature = "discovery")]
 pub mod discovery;
 pub mod durable;
