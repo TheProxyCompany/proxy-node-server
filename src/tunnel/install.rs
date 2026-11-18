@@ -93,6 +93,7 @@ impl TunnelManager {
         .await;
 
         let response = reqwest::Client::builder()
+            .user_agent("Proxy/1.0")
             .timeout(Duration::from_secs(180))
             .build()
             .map_err(|err| format!("Failed to build HTTP client: {}", err))?
@@ -194,5 +195,23 @@ impl TunnelManager {
         .await;
 
         Ok(())
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cloudflared_release_url_is_https_and_tls_client_builds() {
+        let (url, _) = cloudflared_release_url();
+        assert!(url.starts_with("https://"), "expected https url, got {url}");
+        let client = reqwest::Client::builder()
+            .user_agent("Proxy/1.0")
+            .https_only(true)
+            .build()
+            .expect("reqwest must have TLS enabled to download cloudflared over HTTPS");
+        drop(client);
     }
 }
