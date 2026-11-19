@@ -220,9 +220,16 @@ mod tests {
             .no_proxy()
             .build()
             .unwrap();
+        let http_err = tokio::time::timeout(
+            Duration::from_secs(2),
+            client.get(format!("http://{addr}/")).send(),
+        )
+        .await
+        .expect("https_only rejection must fail immediately without connecting")
+        .expect_err("production cloudflared client must reject plaintext HTTP URLs");
         assert!(
-            client.get(format!("http://{addr}/")).send().await.is_err(),
-            "production cloudflared client must reject plaintext HTTP URLs"
+            http_err.is_builder(),
+            "expected reqwest builder rejection for plain http, got: {http_err:?}"
         );
         let hello = async {
             let (mut stream, _) = listener.accept().await.unwrap();
