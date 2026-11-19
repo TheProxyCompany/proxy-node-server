@@ -24,6 +24,13 @@ pub fn managed_cloudflared_path() -> Result<PathBuf, String> {
     }
 }
 
+fn cloudflared_release_client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .user_agent("Proxy/1.0")
+        .https_only(true)
+        .timeout(Duration::from_secs(180))
+}
+
 fn cloudflared_release_url() -> (&'static str, bool) {
     if cfg!(target_os = "macos") {
         if cfg!(target_arch = "x86_64") {
@@ -92,8 +99,7 @@ impl TunnelManager {
         }))
         .await;
 
-        let response = reqwest::Client::builder()
-            .timeout(Duration::from_secs(180))
+        let response = cloudflared_release_client_builder()
             .build()
             .map_err(|err| format!("Failed to build HTTP client: {}", err))?
             .get(url)
@@ -194,5 +200,48 @@ impl TunnelManager {
         .await;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cloudflared_release_client_starts_tls() {
+        use tokio::io::AsyncReadExt;
+
+        let (url, _) = cloudflared_release_url();
+        assert!(url.starts_with("https://"), "expected https url, got {url}");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("https://{addr}/");
+        let client = cloudflared_release_client_builder()
+            .no_proxy()
+            .build()
+            .unwrap();
+        let http_err = tokio::time::timeout(
+            Duration::from_secs(2),
+            client.get(format!("http://{addr}/")).send(),
+        )
+        .await
+        .expect("https_only rejection must fail immediately without connecting")
+        .expect_err("production cloudflared client must reject plaintext HTTP URLs");
+        assert!(
+            http_err.is_builder(),
+            "expected reqwest builder rejection for plain http, got: {http_err:?}"
+        );
+        let hello = async {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut prefix = [0; 6];
+            stream.read_exact(&mut prefix).await.unwrap();
+            assert_eq!((prefix[0], prefix[1], prefix[5]), (22, 3, 1));
+        };
+        tokio::select! {
+            result = client.get(url).send() => panic!("Request ended before ClientHello: {result:?}"),
+            result = tokio::time::timeout(std::time::Duration::from_secs(5), hello) => {
+                result.expect("ClientHello timed out")
+            }
+        }
     }
 }

@@ -50,7 +50,7 @@ hex = "0.4"
 clap = { version = "4", features = ["derive"], optional = true }
 axum = { version = "0.8", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "sync", "process", "io-util", "fs"], optional = true }
-reqwest = { version = "0.13", default-features = false, features = ["stream", "json"], optional = true }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "json"], optional = true }
 mdns-sd = { version = "0.20", optional = true }
 futures-util = { version = "0.3", default-features = false, features = ["alloc"], optional = true }
 rusqlite = { version = "0.39", features = ["bundled"], optional = true }
