@@ -94,6 +94,7 @@ impl TunnelManager {
 
         let response = reqwest::Client::builder()
             .user_agent("Proxy/1.0")
+            .https_only(true)
             .timeout(Duration::from_secs(180))
             .build()
             .map_err(|err| format!("Failed to build HTTP client: {}", err))?
@@ -202,15 +203,24 @@ impl TunnelManager {
 mod tests {
     use super::*;
 
-    #[test]
-    fn cloudflared_release_url_is_https_and_tls_client_builds() {
+    // Nothing listens on the loopback discard port. A client with TLS gets as far as
+    // the refused connection; a client built without TLS rejects the https scheme first.
+    #[tokio::test]
+    async fn cloudflared_release_url_is_https_and_the_client_speaks_tls() {
         let (url, _) = cloudflared_release_url();
         assert!(url.starts_with("https://"), "expected https url, got {url}");
-        let client = reqwest::Client::builder()
+        let err = reqwest::Client::builder()
             .user_agent("Proxy/1.0")
             .https_only(true)
             .build()
-            .expect("reqwest must have TLS enabled to download cloudflared over HTTPS");
-        drop(client);
+            .unwrap()
+            .get("https://127.0.0.1:9/")
+            .send()
+            .await
+            .unwrap_err();
+        assert!(
+            !format!("{err:?}").contains("scheme is not http"),
+            "reqwest was built without TLS: {err:?}"
+        );
     }
 }
