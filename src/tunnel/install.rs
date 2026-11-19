@@ -203,24 +203,31 @@ impl TunnelManager {
 mod tests {
     use super::*;
 
-    // Nothing listens on the loopback discard port. A client with TLS gets as far as
-    // the refused connection; a client built without TLS rejects the https scheme first.
     #[tokio::test]
-    async fn cloudflared_release_url_is_https_and_the_client_speaks_tls() {
+    async fn cloudflared_release_client_starts_tls() {
+        use tokio::io::AsyncReadExt;
+
         let (url, _) = cloudflared_release_url();
         assert!(url.starts_with("https://"), "expected https url, got {url}");
-        let err = reqwest::Client::builder()
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("https://{}/", listener.local_addr().unwrap());
+        let client = reqwest::Client::builder()
             .user_agent("Proxy/1.0")
             .https_only(true)
+            .no_proxy()
             .build()
-            .unwrap()
-            .get("https://127.0.0.1:9/")
-            .send()
-            .await
-            .unwrap_err();
-        assert!(
-            !format!("{err:?}").contains("scheme is not http"),
-            "reqwest was built without TLS: {err:?}"
-        );
+            .unwrap();
+        let hello = async {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut prefix = [0; 6];
+            stream.read_exact(&mut prefix).await.unwrap();
+            assert_eq!((prefix[0], prefix[1], prefix[5]), (22, 3, 1));
+        };
+        tokio::select! {
+            result = client.get(url).send() => panic!("Request ended before ClientHello: {result:?}"),
+            result = tokio::time::timeout(std::time::Duration::from_secs(5), hello) => {
+                result.expect("ClientHello timed out")
+            }
+        }
     }
 }
