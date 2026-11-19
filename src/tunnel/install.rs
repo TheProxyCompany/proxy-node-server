@@ -198,7 +198,6 @@ impl TunnelManager {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
