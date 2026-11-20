@@ -4,7 +4,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use super::{MeshPullSocket, decode_order_key};
 use crate::identity::{DeviceId, encode_hex};
 use crate::op::OrderKey;
-use crate::pull::{CoverageVector, PULL_SINGLETON_ROW_MAX_BYTES, PullPhase, Resume};
+use crate::pull::{CoverageVector, MAX_PULL_RESPONSE_BYTES, PullPhase, Resume};
 
 pub(super) enum Admission {
     Push(String),
@@ -12,25 +12,30 @@ pub(super) enum Admission {
     Quarantine,
 }
 
-pub(super) fn admit_row(
+pub(super) fn admit_row<E>(
+    superseded: impl FnOnce(&OrderKey) -> Result<bool, E>,
     key: OrderKey,
     envelope: &[u8],
     occupied: bool,
     bytes: &mut usize,
     budget: usize,
-) -> Admission {
+) -> Result<Admission, E> {
     let encoded_bytes = base64::encoded_len(envelope.len(), true).unwrap_or(usize::MAX);
-    if encoded_bytes > PULL_SINGLETON_ROW_MAX_BYTES {
+    // Reserve room for the signed page, cursor and fixed-width identifiers.
+    if encoded_bytes > MAX_PULL_RESPONSE_BYTES - 4096 {
+        if superseded(&key)? {
+            return Ok(Admission::Quarantine);
+        }
         tracing::warn!(origin = %key.device.to_hex(), order_key = %encode_hex(&key.to_wire()),
             op_id = %key.op_id.to_hex(), raw_bytes = envelope.len(), encoded_bytes,
             "oversized pull row quarantined at source; skipping row");
-        return Admission::Quarantine;
+        return Ok(Admission::Quarantine);
     }
     if occupied && encoded_bytes > budget.saturating_sub(*bytes) {
-        return Admission::Defer;
+        return Ok(Admission::Defer);
     }
     *bytes += encoded_bytes;
-    Admission::Push(BASE64.encode(envelope))
+    Ok(Admission::Push(BASE64.encode(envelope)))
 }
 
 /// Append admissible rows, returning the number consumed and the last consumed key.
@@ -40,10 +45,30 @@ pub fn encode_origin_rows(
     bytes: &mut usize,
     byte_budget: usize,
 ) -> (usize, Option<OrderKey>) {
+    let Ok(result) = encode_checked(rows, keyed, bytes, byte_budget, |_| {
+        Ok::<_, std::convert::Infallible>(false)
+    });
+    result
+}
+
+fn encode_checked<E>(
+    rows: Vec<(OrderKey, Vec<u8>)>,
+    keyed: &mut Vec<String>,
+    bytes: &mut usize,
+    byte_budget: usize,
+    superseded: impl Fn(&OrderKey) -> Result<bool, E>,
+) -> Result<(usize, Option<OrderKey>), E> {
     let mut consumed = 0;
     let mut last_key = None;
     for (key, envelope) in rows {
-        match admit_row(key, &envelope, !keyed.is_empty(), bytes, byte_budget) {
+        match admit_row(
+            &superseded,
+            key,
+            &envelope,
+            !keyed.is_empty(),
+            bytes,
+            byte_budget,
+        )? {
             Admission::Defer => break,
             Admission::Push(row) => keyed.push(row),
             Admission::Quarantine => {}
@@ -54,7 +79,7 @@ pub fn encode_origin_rows(
             break;
         }
     }
-    (consumed, last_key)
+    Ok((consumed, last_key))
 }
 
 /// Build a [`PullPhase::Keyed`] resume token positioned at `(origin, last_key)`.
@@ -108,7 +133,10 @@ pub fn build_keyed_channel<S: MeshPullSocket + ?Sized>(
         };
         let rows = socket.origin_since(own, claim, store, remaining)?;
         let fetched = rows.len();
-        let (consumed, last_key) = encode_origin_rows(rows, &mut keyed, &mut bytes, byte_budget);
+        let (consumed, last_key) =
+            encode_checked(rows, &mut keyed, &mut bytes, byte_budget, |key| {
+                socket.is_superseded(key)
+            })?;
         remaining -= consumed;
         if remaining == 0 || consumed < fetched || bytes >= byte_budget {
             return Ok((keyed, Some(keyed_resume(own, last_key))));
@@ -131,7 +159,10 @@ pub fn build_keyed_channel<S: MeshPullSocket + ?Sized>(
         };
         let rows = socket.origin_since(origin, after, store, remaining)?;
         let fetched = rows.len();
-        let (consumed, last_key) = encode_origin_rows(rows, &mut keyed, &mut bytes, byte_budget);
+        let (consumed, last_key) =
+            encode_checked(rows, &mut keyed, &mut bytes, byte_budget, |key| {
+                socket.is_superseded(key)
+            })?;
         let count_exhausted = fetched == remaining;
         remaining -= consumed;
         if count_exhausted || consumed < fetched || bytes >= byte_budget {

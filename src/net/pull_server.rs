@@ -175,12 +175,13 @@ pub fn build_pull_page<S: MeshPullSocket + ?Sized>(
             continue;
         }
         match admit_row(
+            |key| socket.is_superseded(key),
             op.order_key(),
             &envelope,
             page_bytes > 0,
             &mut page_bytes,
             PULL_PAGE_BYTE_BUDGET,
-        ) {
+        )? {
             Admission::Push(row) => backfill.push((seq, row)),
             Admission::Defer => {
                 byte_cut = true;

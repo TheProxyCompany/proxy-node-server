@@ -378,7 +378,7 @@ impl HttpPullSource {
             .post(&url)
             .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
             .header(reqwest::header::ACCEPT, "application/octet-stream")
-            .timeout(Duration::from_secs(180))
+            .timeout(Duration::from_secs(60))
             .body(signed_request)
             .send()
             .await

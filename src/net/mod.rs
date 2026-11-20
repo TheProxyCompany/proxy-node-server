@@ -35,9 +35,8 @@ use crate::op::{OrderKey, SignedOp};
 pub use crate::pull::{
     CoverageVector, MAX_PULL_REQUEST_BYTES, MAX_PULL_RESPONSE_BYTES, MAX_REQUEST_SKEW_MS,
     OriginHead, PAGE_LIMIT_MAX, PULL_PAGE_BYTE_BUDGET, PULL_PAGE_LIMIT_MAX, PULL_PAGE_STORE_ID,
-    PULL_PATH, PULL_REQUEST_STORE_ID, PULL_RESPONSE_STORE_ID, PULL_SINGLETON_ROW_MAX_BYTES,
-    PULL_VERSION, PullPage, PullPhase, PullRequest, Resume, seal_pull_page, sign_pull_request,
-    verify_pull_page, verify_pull_request,
+    PULL_PATH, PULL_REQUEST_STORE_ID, PULL_RESPONSE_STORE_ID, PULL_VERSION, PullPage, PullPhase,
+    PullRequest, Resume, seal_pull_page, sign_pull_request, verify_pull_page, verify_pull_request,
 };
 pub use client::HttpPullSource;
 pub use persistence::{

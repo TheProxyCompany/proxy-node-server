@@ -459,5 +459,3 @@ fn validate_pull_reset_and_preview_resume_after_enforce_protocol_invariants() {
     );
     let _ = (sign_pull_request, verify_pull_page);
 }
-
-mod budget;
