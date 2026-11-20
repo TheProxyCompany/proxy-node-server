@@ -1,8 +1,8 @@
 //! Anthropic Claude web and desktop export (`conversations.json`, `projects.json`, `.zip`) adapter.
 //!
-//! A Claude Project (`projects.json`) becomes one conversation of `user` turns, since the
-//! person wrote all of it: its description, its instructions (`prompt_template`), then one
-//! turn per knowledge document.
+//! A Claude Project (`projects.json`) becomes one conversation: a turn is `user` only when the
+//! person typed it into Claude in their own voice (`description`, `prompt_template`); uploaded
+//! material (`docs[]`) becomes `note` turns so reference documents never write personal preferences.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -53,10 +53,14 @@ impl ChatImportAdapter for ClaudeExportAdapter {
             return u8::from(
                 entries
                     .iter()
-                    .any(|(_, p)| looks_like_claude_export(&p[..p.len().min(16_384)])),
+                    .any(|(name, p)| looks_like_claude_export(name, &p[..p.len().min(16_384)])),
             ) * 96;
         }
-        u8::from(looks_like_claude_export(head)) * 95
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        u8::from(looks_like_claude_export(file_name, head)) * 95
     }
 
     fn parse_conversations(&self, path: &Path) -> Result<Vec<ImportedConversation>, String> {
@@ -73,19 +77,23 @@ impl ChatImportAdapter for ClaudeExportAdapter {
             for file in files {
                 let raw =
                     fs::read(&file).map_err(|e| format!("reading {}: {e}", file.display()))?;
-                out.extend(parse_anthropic_json(&raw, fallback_ts)?);
+                let parsed = parse_anthropic_json(&raw, fallback_ts)
+                    .map_err(|e| format!("{}: {e}", file.display()))?;
+                out.extend(parsed);
             }
             return Ok(out);
         }
         let raw = fs::read(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
         if raw.starts_with(b"PK\x03\x04") {
             let mut out = Vec::new();
-            for (_, payload) in read_zip_entries(&raw, is_export_name)? {
-                out.extend(parse_anthropic_json(&payload, fallback_ts)?);
+            for (name, payload) in read_zip_entries(&raw, is_export_name)? {
+                let parsed = parse_anthropic_json(&payload, fallback_ts)
+                    .map_err(|e| format!("{name}: {e}"))?;
+                out.extend(parsed);
             }
             return Ok(out);
         }
-        parse_anthropic_json(&raw, fallback_ts)
+        parse_anthropic_json(&raw, fallback_ts).map_err(|e| format!("{}: {e}", path.display()))
     }
 }
 
@@ -105,11 +113,20 @@ fn is_export_name(name: &str) -> bool {
         .any(|file| name == *file || name.ends_with(&format!("/{file}")))
 }
 
-fn looks_like_claude_export(head: &[u8]) -> bool {
+fn is_projects_name(name: &str) -> bool {
+    name == "projects.json" || name.ends_with("/projects.json")
+}
+
+fn looks_like_claude_export(name: &str, head: &[u8]) -> bool {
     let text = String::from_utf8_lossy(head);
     let has = |key: &str| text.contains(&format!("\"{key}\""));
     (has("chat_messages") && has("sender"))
-        || (has("uuid") && (has("prompt_template") || (has("docs") && has("filename"))))
+        || (has("uuid")
+            && has("prompt_template")
+            && (is_projects_name(name)
+                || has("docs")
+                || has("is_private")
+                || has("is_starter_project")))
 }
 
 fn parse_anthropic_json(
@@ -217,8 +234,8 @@ fn parse_project(project: &Value, fallback_ts: u64) -> Option<ImportedConversati
     let parsed_created_at = parse_timestamp_secs(project.get("created_at"));
     let created_at = parsed_created_at.unwrap_or(fallback_ts);
     let updated_at = parse_timestamp_secs(project.get("updated_at")).unwrap_or(created_at);
-    let user_turn = |label: &str, body: &str, timestamp: u64| ImportedTurn {
-        role: "user".to_string(),
+    let turn = |role: &str, label: &str, body: &str, timestamp: u64| ImportedTurn {
+        role: role.to_string(),
         content: format!("{label}\n\n{body}"),
         timestamp,
     };
@@ -229,7 +246,7 @@ fn parse_project(project: &Value, fallback_ts: u64) -> Option<ImportedConversati
         ("prompt_template", "Project instructions"),
     ] {
         if let Some(body) = text(project, key) {
-            turns.push(user_turn(label, body, created_at));
+            turns.push(turn("user", label, body, created_at));
         }
     }
     for doc in project
@@ -245,7 +262,8 @@ fn parse_project(project: &Value, fallback_ts: u64) -> Option<ImportedConversati
         let timestamp =
             parse_timestamp_secs(doc.get("created_at").or_else(|| doc.get("updated_at")))
                 .unwrap_or(created_at);
-        turns.push(user_turn(
+        turns.push(turn(
+            "note",
             &format!("Project knowledge: {filename}"),
             content,
             timestamp,
@@ -255,13 +273,15 @@ fn parse_project(project: &Value, fallback_ts: u64) -> Option<ImportedConversati
         return None;
     }
 
+    let name = text(project, "name");
     let source_id = match text(project, "uuid") {
         Some(id) => format!("claude_export:project:{id}"),
         None => format!(
             "claude_export:project:{}",
             stable_hash_hex(&format!(
-                "{}:{}",
+                "{}:{}:{}",
                 parsed_created_at.unwrap_or(0),
+                name.unwrap_or_default(),
                 turns[0].content
             ))
         ),
@@ -269,7 +289,7 @@ fn parse_project(project: &Value, fallback_ts: u64) -> Option<ImportedConversati
     Some(ImportedConversation::from_turns(
         source_id,
         CLAUDE_EXPORT_ADAPTER_ID,
-        Some(text(project, "name").unwrap_or("Claude Project")),
+        Some(name.unwrap_or("Claude Project")),
         "Claude Project",
         "owner".to_string(),
         created_at,
