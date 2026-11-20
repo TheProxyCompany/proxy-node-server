@@ -52,6 +52,12 @@ pub fn reset_pull_page(stream: &RelayStreamState) -> PullPage {
 
 /// Base64-encode one origin's `(OrderKey, raw_envelope)` rows into `keyed` up
 /// to `byte_budget`, returning `(served_count, last_key)`.
+///
+/// The budget is enforced pre-push: a row that would push the page past
+/// `byte_budget` is deferred to the next page, except when the page is still
+/// empty. A lone over-budget row is always admitted so one large op cannot
+/// wedge the drain (the page stays a single row and must still fit the
+/// client's `MAX_PULL_RESPONSE_BYTES`).
 pub fn encode_origin_rows(
     rows: Vec<(OrderKey, Vec<u8>)>,
     keyed: &mut Vec<String>,
@@ -62,6 +68,9 @@ pub fn encode_origin_rows(
     let mut last_key = None;
     for (key, envelope) in rows {
         let encoded = BASE64.encode(&envelope);
+        if served > 0 && *bytes + encoded.len() > byte_budget {
+            break;
+        }
         *bytes += encoded.len();
         keyed.push(encoded);
         last_key = Some(key);
@@ -279,13 +288,24 @@ pub fn build_pull_page<S: MeshPullSocket + ?Sized>(
         if byte_cut && claims.covers(&op.order_key()) {
             break;
         }
-        next_relay_seq = seq;
-        if claims.covers(&op.order_key()) {
-            let encoded = BASE64.encode(&envelope);
-            page_bytes += encoded.len();
-            backfill.push((seq, encoded));
-            byte_cut = page_bytes >= PULL_PAGE_BYTE_BUDGET;
+        if !claims.covers(&op.order_key()) {
+            next_relay_seq = seq;
+            continue;
         }
+        let encoded = BASE64.encode(&envelope);
+        // Pre-push budget guard: cut the page before a row that would push it
+        // past PULL_PAGE_BYTE_BUDGET, unless the page is still empty (a lone
+        // oversized row must still be served so the drain keeps advancing).
+        // `next_relay_seq` stays at the last served seq so the deferred row is
+        // re-scanned on the next page.
+        if !backfill.is_empty() && page_bytes + encoded.len() > PULL_PAGE_BYTE_BUDGET {
+            byte_cut = true;
+            break;
+        }
+        next_relay_seq = seq;
+        page_bytes += encoded.len();
+        backfill.push((seq, encoded));
+        byte_cut = page_bytes >= PULL_PAGE_BYTE_BUDGET;
     }
     let resume = ((scanned_len == budget && budget > 0) || byte_cut)
         .then(|| backfill_resume(next_relay_seq));
