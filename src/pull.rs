@@ -71,7 +71,7 @@ pub const PULL_PAGE_BYTE_BUDGET: usize = 32 * 1024 * 1024;
 /// Body cap for a pull request.
 pub const MAX_PULL_REQUEST_BYTES: usize = 256 * 1024;
 
-/// Body cap for a pull response page.
+/// Signed response body cap, including page metadata and framing.
 pub const MAX_PULL_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 
 /// Accepted clock skew on a signed pull request, matching the v2 tier.
