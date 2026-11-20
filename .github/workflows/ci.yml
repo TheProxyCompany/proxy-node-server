@@ -26,13 +26,13 @@ jobs:
     name: msrv (1.88)
     runs-on: [self-hosted, ci-cd]
     env:
-      RUSTUP_TOOLCHAIN: 1.97.1
+      RUSTUP_TOOLCHAIN: 1.88.0
     steps:
       - uses: actions/checkout@v4
       - run: |
           export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:$PATH"
           printf '%s\n' "$HOME/.cargo/bin" /opt/homebrew/bin >> "$GITHUB_PATH"
-          rustup toolchain install 1.97.1 --profile minimal --no-self-update
+          rustup toolchain install 1.88.0 --profile minimal --no-self-update
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --locked --all-features
 

@@ -7,6 +7,7 @@ mod client;
 pub mod gate;
 mod persistence;
 mod policy;
+mod pull_budget;
 mod pull_client;
 mod pull_server;
 mod relay;
@@ -34,8 +35,9 @@ use crate::op::{OrderKey, SignedOp};
 pub use crate::pull::{
     CoverageVector, MAX_PULL_REQUEST_BYTES, MAX_PULL_RESPONSE_BYTES, MAX_REQUEST_SKEW_MS,
     OriginHead, PAGE_LIMIT_MAX, PULL_PAGE_BYTE_BUDGET, PULL_PAGE_LIMIT_MAX, PULL_PAGE_STORE_ID,
-    PULL_PATH, PULL_REQUEST_STORE_ID, PULL_RESPONSE_STORE_ID, PULL_VERSION, PullPage, PullPhase,
-    PullRequest, Resume, seal_pull_page, sign_pull_request, verify_pull_page, verify_pull_request,
+    PULL_PATH, PULL_REQUEST_STORE_ID, PULL_RESPONSE_STORE_ID, PULL_SINGLETON_ROW_MAX_BYTES,
+    PULL_VERSION, PullPage, PullPhase, PullRequest, Resume, seal_pull_page, sign_pull_request,
+    verify_pull_page, verify_pull_request,
 };
 pub use client::HttpPullSource;
 pub use persistence::{
@@ -46,6 +48,7 @@ pub use policy::{
     MESH_AUDIT_ENV, MESH_PEERS_ENV, endpoint_has_confidential_transport, is_cgnat_ip,
     is_loopback_host, parse_mesh_peers, parse_mesh_peers_from,
 };
+pub use pull_budget::{build_keyed_channel, encode_origin_rows, keyed_resume};
 pub use pull_client::{
     DISCOVERY_RESCAN_INTERVAL, NEWEST_FIRST_PREVIEW_GAP, PULL_FALLBACK_INTERVAL,
     PULL_NO_PROGRESS_LIMIT, PullOutcome, PullProgress, REGISTER_RETRY_BACKOFF,
@@ -55,9 +58,8 @@ pub use pull_client::{
     unix_ms, validate_pull_reset,
 };
 pub use pull_server::{
-    PullHandler, admit_pull_ack, authenticate_pull_request, build_keyed_channel, build_pull_page,
-    classify_pull_request_error, encode_origin_rows, keyed_resume, pull_needs_reset, pull_router,
-    reset_pull_page,
+    PullHandler, admit_pull_ack, authenticate_pull_request, build_pull_page,
+    classify_pull_request_error, pull_needs_reset, pull_router, reset_pull_page,
 };
 pub use server::{ServeState, relay_router, router};
 pub use socket::{MeshPullHost, MeshPullSocket, OpLogPullSocket, PullAdmission, PullStorage};
