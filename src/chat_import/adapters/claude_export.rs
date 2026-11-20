@@ -62,8 +62,15 @@ impl ChatImportAdapter for ClaudeExportAdapter {
     fn parse_conversations(&self, path: &Path) -> Result<Vec<ImportedConversation>, String> {
         let fallback_ts = file_mtime_secs(path);
         if path.is_dir() {
+            let files = export_files_in(path);
+            if files.is_empty() {
+                return Err(format!(
+                    "no conversations.json or projects.json in {}",
+                    path.display()
+                ));
+            }
             let mut out = Vec::new();
-            for file in export_files_in(path) {
+            for file in files {
                 let raw =
                     fs::read(&file).map_err(|e| format!("reading {}: {e}", file.display()))?;
                 out.extend(parse_anthropic_json(&raw, fallback_ts)?);
@@ -115,6 +122,7 @@ fn parse_anthropic_json(
         Value::Array(arr) => arr.iter().collect(),
         Value::Object(map) => map
             .get("conversations")
+            .or_else(|| map.get("projects"))
             .and_then(Value::as_array)
             .map(|a| a.iter().collect())
             .unwrap_or_else(|| vec![&root]),
@@ -187,51 +195,58 @@ fn parse_anthropic_json(
 }
 
 fn parse_project(project: &Value, fallback_ts: u64) -> Option<ImportedConversation> {
-    if project.get("prompt_template").is_none() && project.get("docs").is_none() {
+    if project
+        .get("is_starter_project")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
         return None;
     }
-    let text = |value: &Value, key: &str| {
+    if !project.get("prompt_template").is_some_and(|v| !v.is_null())
+        && !project.get("docs").is_some_and(Value::is_array)
+    {
+        return None;
+    }
+    fn text<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
         value
             .get(key)
             .and_then(Value::as_str)
-            .filter(|s| !s.trim().is_empty())
-            .map(str::to_string)
-    };
-    let created_at = parse_timestamp_secs(project.get("created_at")).unwrap_or(fallback_ts);
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
+    let parsed_created_at = parse_timestamp_secs(project.get("created_at"));
+    let created_at = parsed_created_at.unwrap_or(fallback_ts);
     let updated_at = parse_timestamp_secs(project.get("updated_at")).unwrap_or(created_at);
-    let user_turn = |label: String, body: String, timestamp: u64| ImportedTurn {
+    let user_turn = |label: &str, body: &str, timestamp: u64| ImportedTurn {
         role: "user".to_string(),
         content: format!("{label}\n\n{body}"),
         timestamp,
     };
 
     let mut turns = Vec::new();
-    if let Some(description) = text(project, "description") {
-        turns.push(user_turn(
-            "Project description".to_string(),
-            description,
-            created_at,
-        ));
+    for (key, label) in [
+        ("description", "Project description"),
+        ("prompt_template", "Project instructions"),
+    ] {
+        if let Some(body) = text(project, key) {
+            turns.push(user_turn(label, body, created_at));
+        }
     }
-    if let Some(instructions) = text(project, "prompt_template") {
-        turns.push(user_turn(
-            "Project instructions".to_string(),
-            instructions,
-            created_at,
-        ));
-    }
-    let docs = project.get("docs").and_then(Value::as_array);
-    for doc in docs.into_iter().flatten() {
+    for doc in project
+        .get("docs")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
         let Some(content) = text(doc, "content") else {
             continue;
         };
-        let filename = text(doc, "filename").unwrap_or_else(|| "Untitled".to_string());
-        let filename = filename.trim();
+        let filename = text(doc, "filename").unwrap_or("Untitled");
         let timestamp =
             parse_timestamp_secs(doc.get("created_at").or_else(|| doc.get("updated_at")))
                 .unwrap_or(created_at);
         turns.push(user_turn(
-            format!("Project knowledge: {filename}"),
+            &format!("Project knowledge: {filename}"),
             content,
             timestamp,
         ));
@@ -240,14 +255,13 @@ fn parse_project(project: &Value, fallback_ts: u64) -> Option<ImportedConversati
         return None;
     }
 
-    let name = text(project, "name");
-    let source_id = match text(project, "uuid").or_else(|| text(project, "id")) {
-        Some(id) => format!("claude_export:project:{}", id.trim()),
+    let source_id = match text(project, "uuid") {
+        Some(id) => format!("claude_export:project:{id}"),
         None => format!(
             "claude_export:project:{}",
             stable_hash_hex(&format!(
                 "{}:{}",
-                parse_timestamp_secs(project.get("created_at")).unwrap_or(0),
+                parsed_created_at.unwrap_or(0),
                 turns[0].content
             ))
         ),
@@ -255,7 +269,7 @@ fn parse_project(project: &Value, fallback_ts: u64) -> Option<ImportedConversati
     Some(ImportedConversation::from_turns(
         source_id,
         CLAUDE_EXPORT_ADAPTER_ID,
-        Some(name.as_deref().unwrap_or("Claude Project")),
+        Some(text(project, "name").unwrap_or("Claude Project")),
         "Claude Project",
         "owner".to_string(),
         created_at,
