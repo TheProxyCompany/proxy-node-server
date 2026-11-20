@@ -187,7 +187,7 @@ pub fn build_pull_page<S: MeshPullSocket + ?Sized>(
                 byte_cut = true;
                 break;
             }
-            Admission::Quarantine => {}
+            Admission::SkipOversized => {}
         }
         next_relay_seq = seq;
         byte_cut = page_bytes >= PULL_PAGE_BYTE_BUDGET;

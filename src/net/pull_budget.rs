@@ -9,7 +9,7 @@ use crate::pull::{CoverageVector, MAX_PULL_RESPONSE_BYTES, PullPhase, Resume};
 pub(super) enum Admission {
     Push(String),
     Defer,
-    Quarantine,
+    SkipOversized,
 }
 
 pub(super) fn admit_row<E>(
@@ -24,12 +24,12 @@ pub(super) fn admit_row<E>(
     // Reserve room for the signed page, cursor and fixed-width identifiers.
     if encoded_bytes > MAX_PULL_RESPONSE_BYTES - 4096 {
         if superseded(&key)? {
-            return Ok(Admission::Quarantine);
+            return Ok(Admission::SkipOversized);
         }
         tracing::error!(origin = %key.device.to_hex(), order_key = %encode_hex(&key.to_wire()),
             op_id = %key.op_id.to_hex(), raw_bytes = envelope.len(), encoded_bytes,
             "oversized pull row has no newer head; skipping row to keep link live");
-        return Ok(Admission::Quarantine);
+        return Ok(Admission::SkipOversized);
     }
     if occupied && encoded_bytes > budget.saturating_sub(*bytes) {
         return Ok(Admission::Defer);
@@ -71,7 +71,7 @@ fn encode_checked<E>(
         )? {
             Admission::Defer => break,
             Admission::Push(row) => keyed.push(row),
-            Admission::Quarantine => {}
+            Admission::SkipOversized => {}
         }
         consumed += 1;
         last_key = Some(key);
@@ -114,38 +114,24 @@ pub fn build_keyed_channel<S: MeshPullSocket + ?Sized>(
         return Ok((keyed, resume.cloned()));
     }
 
-    let origins = socket.origins()?;
+    let mut origins = socket.origins()?;
+    if let Some(pos) = origins.iter().position(|candidate| candidate == own) {
+        let own_id = origins.remove(pos);
+        origins.insert(0, own_id);
+    }
     let resume_origin = resume.and_then(|r| DeviceId::from_hex(&r.origin).ok());
     let resume_key = resume.and_then(|r| decode_order_key(&r.after_key));
     let start = match resume_origin {
-        Some(origin) => origins.partition_point(|candidate| *candidate < origin),
+        Some(origin) if origin == *own && origins.first() == Some(own) => 0,
+        Some(origin) => {
+            let offset = usize::from(origins.first() == Some(own));
+            offset + origins[offset..].partition_point(|candidate| *candidate < origin)
+        }
         None => 0,
     };
 
     let mut remaining = budget;
-    let mut own_served_first = false;
-    if resume.is_none() && origins.contains(own) {
-        own_served_first = true;
-        let claim = if audit {
-            None
-        } else {
-            claims.0.get(own).copied()
-        };
-        let rows = socket.origin_since(own, claim, store, remaining)?;
-        let fetched = rows.len();
-        let (consumed, last_key) =
-            encode_checked(rows, &mut keyed, &mut bytes, byte_budget, |key| {
-                socket.is_superseded(key)
-            })?;
-        remaining -= consumed;
-        if remaining == 0 || consumed < fetched || bytes >= byte_budget {
-            return Ok((keyed, Some(keyed_resume(own, last_key))));
-        }
-    }
     for origin in &origins[start..] {
-        if own_served_first && origin == own {
-            continue;
-        }
         let resumed_here = resume_origin == Some(*origin);
         let claim = if audit {
             None
