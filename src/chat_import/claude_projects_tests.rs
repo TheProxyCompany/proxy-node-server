@@ -70,17 +70,17 @@ fn assert_gusto_project(project: &ImportedConversation) {
         turns,
         vec![
             (
-                "system",
+                "user",
                 "Project description\n\nEverything about running payroll.",
                 1_793_523_600
             ),
             (
-                "system",
+                "user",
                 "Project instructions\n\nYou are the Gusto payroll reviewer.\n\nAlways cite the pay period.",
                 1_793_523_600
             ),
             (
-                "system",
+                "user",
                 "Project knowledge: handbook.md\n\n# Payroll handbook\n\nRun payroll on the 15th.\n",
                 1_793_610_000
             ),
@@ -105,6 +105,11 @@ fn standalone_projects_json_is_detected_and_imported() {
     assert_eq!(inventory.conversation_count, 1);
     assert_eq!(inventory.conversations[0].title, "Gusto Payroll");
     assert_eq!(inventory.conversations[0].message_count, 3);
+    assert_eq!(inventory.conversations[0].user_message_count, 3);
+    assert_eq!(
+        inventory.conversations[0].preview,
+        "Project description Everything about running payroll."
+    );
 
     let loaded = reg
         .load_conversations("claude_export", Some(&path), None, None)
@@ -216,6 +221,36 @@ fn malformed_and_empty_projects_json_never_invent_projects() {
             .source_id,
         nameless[0].source_id
     );
+
+    let docs_only = dir.path().join("docs-only.json");
+    fs::write(
+        &docs_only,
+        r#"[{"id": "proj-2", "docs": [{"filename": " notes.md ", "content": "Net 30.", "updated_at": "2026-11-02T09:00:00Z"}]}]"#,
+    )
+    .expect("write docs-only");
+    assert!(
+        reg.detect(&docs_only).is_none(),
+        "an id is not a Claude uuid"
+    );
+    fs::write(
+        &docs_only,
+        r#"[{"uuid": "proj-2", "docs": [{"filename": " notes.md ", "content": "Net 30.", "updated_at": "2026-11-02T09:00:00Z"}]}]"#,
+    )
+    .expect("write docs-only");
+    assert_eq!(reg.detect(&docs_only).expect("detect docs-only").1, 95);
+    let loaded = reg
+        .load_conversations("claude_export", Some(&docs_only), None, None)
+        .expect("load docs-only");
+    assert_eq!(loaded[0].source_id, "claude_export:project:proj-2");
+    assert_eq!(
+        loaded[0].turns[0].content,
+        "Project knowledge: notes.md\n\nNet 30."
+    );
+    assert_eq!(loaded[0].turns[0].timestamp, 1_793_610_000);
+
+    let unrelated = dir.path().join("prompt-config.json");
+    fs::write(&unrelated, r#"{"prompt_template": "Hello {name}"}"#).expect("write config");
+    assert!(reg.detect(&unrelated).is_none());
 
     let broken_archive = dir.path().join("broken.zip");
     fs::write(

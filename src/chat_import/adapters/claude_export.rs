@@ -1,7 +1,8 @@
 //! Anthropic Claude web and desktop export (`conversations.json`, `projects.json`, `.zip`) adapter.
 //!
-//! A Claude Project (`projects.json`) becomes one conversation of `system` turns: its
-//! description, its instructions (`prompt_template`), then one turn per knowledge document.
+//! A Claude Project (`projects.json`) becomes one conversation of `user` turns, since the
+//! person wrote all of it: its description, its instructions (`prompt_template`), then one
+//! turn per knowledge document.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -99,8 +100,9 @@ fn is_export_name(name: &str) -> bool {
 
 fn looks_like_claude_export(head: &[u8]) -> bool {
     let text = String::from_utf8_lossy(head);
-    (text.contains("\"chat_messages\"") && text.contains("\"sender\""))
-        || text.contains("\"prompt_template\"")
+    let has = |key: &str| text.contains(&format!("\"{key}\""));
+    (has("chat_messages") && has("sender"))
+        || (has("uuid") && (has("prompt_template") || (has("docs") && has("filename"))))
 }
 
 fn parse_anthropic_json(
@@ -197,22 +199,22 @@ fn parse_project(project: &Value, fallback_ts: u64) -> Option<ImportedConversati
     };
     let created_at = parse_timestamp_secs(project.get("created_at")).unwrap_or(fallback_ts);
     let updated_at = parse_timestamp_secs(project.get("updated_at")).unwrap_or(created_at);
-    let system_turn = |label: String, body: String, timestamp: u64| ImportedTurn {
-        role: "system".to_string(),
+    let user_turn = |label: String, body: String, timestamp: u64| ImportedTurn {
+        role: "user".to_string(),
         content: format!("{label}\n\n{body}"),
         timestamp,
     };
 
     let mut turns = Vec::new();
     if let Some(description) = text(project, "description") {
-        turns.push(system_turn(
+        turns.push(user_turn(
             "Project description".to_string(),
             description,
             created_at,
         ));
     }
     if let Some(instructions) = text(project, "prompt_template") {
-        turns.push(system_turn(
+        turns.push(user_turn(
             "Project instructions".to_string(),
             instructions,
             created_at,
@@ -224,8 +226,11 @@ fn parse_project(project: &Value, fallback_ts: u64) -> Option<ImportedConversati
             continue;
         };
         let filename = text(doc, "filename").unwrap_or_else(|| "Untitled".to_string());
-        let timestamp = parse_timestamp_secs(doc.get("created_at")).unwrap_or(created_at);
-        turns.push(system_turn(
+        let filename = filename.trim();
+        let timestamp =
+            parse_timestamp_secs(doc.get("created_at").or_else(|| doc.get("updated_at")))
+                .unwrap_or(created_at);
+        turns.push(user_turn(
             format!("Project knowledge: {filename}"),
             content,
             timestamp,
@@ -236,11 +241,15 @@ fn parse_project(project: &Value, fallback_ts: u64) -> Option<ImportedConversati
     }
 
     let name = text(project, "name");
-    let source_id = match text(project, "uuid") {
-        Some(uuid) => format!("claude_export:project:{}", uuid.trim()),
+    let source_id = match text(project, "uuid").or_else(|| text(project, "id")) {
+        Some(id) => format!("claude_export:project:{}", id.trim()),
         None => format!(
             "claude_export:project:{}",
-            stable_hash_hex(&format!("{created_at}:{}", turns[0].content))
+            stable_hash_hex(&format!(
+                "{}:{}",
+                parse_timestamp_secs(project.get("created_at")).unwrap_or(0),
+                turns[0].content
+            ))
         ),
     };
     Some(ImportedConversation::from_turns(
