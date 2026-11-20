@@ -1,7 +1,10 @@
-//! Anthropic Claude web and desktop export (`conversations.json` / `.zip`) adapter.
+//! Anthropic Claude web and desktop export (`conversations.json`, `projects.json`, `.zip`) adapter.
+//!
+//! A Claude Project (`projects.json`) becomes one conversation of `system` turns: its
+//! description, its instructions (`prompt_template`), then one turn per knowledge document.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
@@ -21,7 +24,7 @@ impl ChatImportAdapter for ClaudeExportAdapter {
             display_name: "Claude".to_string(),
             subtitle: "Anthropic Claude web or desktop data export".to_string(),
             export_hint:
-                "Claude -> Settings -> Privacy -> Export Data (.zip or conversations.json)"
+                "Claude -> Settings -> Privacy -> Export Data (.zip, conversations.json or projects.json)"
                     .to_string(),
             icon_name: "sparkles".to_string(),
             source_kind: ChatImportSourceKind::ExportFile.into(),
@@ -33,43 +36,43 @@ impl ChatImportAdapter for ClaudeExportAdapter {
 
     fn sniff(&self, path: &Path, head: &[u8]) -> u8 {
         if path.is_dir() {
-            let conv = path.join("conversations.json");
-            return if conv.is_file() {
-                self.sniff(&conv, &read_sniff_head(&conv).unwrap_or_default())
-            } else {
-                0
-            };
+            return export_files_in(path)
+                .iter()
+                .map(|file| self.sniff(file, &read_sniff_head(file).unwrap_or_default()))
+                .max()
+                .unwrap_or(0);
         }
         if head.starts_with(b"PK\x03\x04") {
             let Some(entries) = fs::read(path)
                 .ok()
-                .and_then(|b| read_zip_entries(&b, is_conv_name).ok())
+                .and_then(|b| read_zip_entries(&b, is_export_name).ok())
             else {
                 return 0;
             };
-            return u8::from(entries.iter().any(|(_, p)| {
-                let s = String::from_utf8_lossy(&p[..p.len().min(16_384)]);
-                s.contains("\"chat_messages\"") && s.contains("\"sender\"")
-            })) * 96;
+            return u8::from(
+                entries
+                    .iter()
+                    .any(|(_, p)| looks_like_claude_export(&p[..p.len().min(16_384)])),
+            ) * 96;
         }
-        let text = String::from_utf8_lossy(head);
-        if text.contains("\"chat_messages\"") && text.contains("\"sender\"") {
-            return 95;
-        }
-        0
+        u8::from(looks_like_claude_export(head)) * 95
     }
 
     fn parse_conversations(&self, path: &Path) -> Result<Vec<ImportedConversation>, String> {
         let fallback_ts = file_mtime_secs(path);
-        let target = if path.is_dir() {
-            path.join("conversations.json")
-        } else {
-            path.to_path_buf()
-        };
-        let raw = fs::read(&target).map_err(|e| format!("reading {}: {e}", target.display()))?;
+        if path.is_dir() {
+            let mut out = Vec::new();
+            for file in export_files_in(path) {
+                let raw =
+                    fs::read(&file).map_err(|e| format!("reading {}: {e}", file.display()))?;
+                out.extend(parse_anthropic_json(&raw, fallback_ts)?);
+            }
+            return Ok(out);
+        }
+        let raw = fs::read(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
         if raw.starts_with(b"PK\x03\x04") {
             let mut out = Vec::new();
-            for (_, payload) in read_zip_entries(&raw, is_conv_name)? {
+            for (_, payload) in read_zip_entries(&raw, is_export_name)? {
                 out.extend(parse_anthropic_json(&payload, fallback_ts)?);
             }
             return Ok(out);
@@ -78,8 +81,26 @@ impl ChatImportAdapter for ClaudeExportAdapter {
     }
 }
 
-fn is_conv_name(name: &str) -> bool {
-    name == "conversations.json" || name.ends_with("/conversations.json")
+const EXPORT_FILE_NAMES: [&str; 2] = ["conversations.json", "projects.json"];
+
+fn export_files_in(dir: &Path) -> Vec<PathBuf> {
+    EXPORT_FILE_NAMES
+        .iter()
+        .map(|name| dir.join(name))
+        .filter(|file| file.is_file())
+        .collect()
+}
+
+fn is_export_name(name: &str) -> bool {
+    EXPORT_FILE_NAMES
+        .iter()
+        .any(|file| name == *file || name.ends_with(&format!("/{file}")))
+}
+
+fn looks_like_claude_export(head: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(head);
+    (text.contains("\"chat_messages\"") && text.contains("\"sender\""))
+        || text.contains("\"prompt_template\"")
 }
 
 fn parse_anthropic_json(
@@ -101,6 +122,7 @@ fn parse_anthropic_json(
     let mut out = Vec::new();
     for conv in items {
         let Some(msgs) = conv.get("chat_messages").and_then(Value::as_array) else {
+            out.extend(parse_project(conv, fallback_ts));
             continue;
         };
         let created_at = parse_timestamp_secs(conv.get("created_at")).unwrap_or(fallback_ts);
@@ -160,6 +182,78 @@ fn parse_anthropic_json(
         ));
     }
     Ok(out)
+}
+
+fn parse_project(project: &Value, fallback_ts: u64) -> Option<ImportedConversation> {
+    if project.get("prompt_template").is_none() && project.get("docs").is_none() {
+        return None;
+    }
+    let text = |value: &Value, key: &str| {
+        value
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .map(str::to_string)
+    };
+    let created_at = parse_timestamp_secs(project.get("created_at")).unwrap_or(fallback_ts);
+    let updated_at = parse_timestamp_secs(project.get("updated_at")).unwrap_or(created_at);
+    let system_turn = |label: String, body: String, timestamp: u64| ImportedTurn {
+        role: "system".to_string(),
+        content: format!("{label}\n\n{body}"),
+        timestamp,
+    };
+
+    let mut turns = Vec::new();
+    if let Some(description) = text(project, "description") {
+        turns.push(system_turn(
+            "Project description".to_string(),
+            description,
+            created_at,
+        ));
+    }
+    if let Some(instructions) = text(project, "prompt_template") {
+        turns.push(system_turn(
+            "Project instructions".to_string(),
+            instructions,
+            created_at,
+        ));
+    }
+    let docs = project.get("docs").and_then(Value::as_array);
+    for doc in docs.into_iter().flatten() {
+        let Some(content) = text(doc, "content") else {
+            continue;
+        };
+        let filename = text(doc, "filename").unwrap_or_else(|| "Untitled".to_string());
+        let timestamp = parse_timestamp_secs(doc.get("created_at")).unwrap_or(created_at);
+        turns.push(system_turn(
+            format!("Project knowledge: {filename}"),
+            content,
+            timestamp,
+        ));
+    }
+    if turns.is_empty() {
+        return None;
+    }
+
+    let name = text(project, "name");
+    let source_id = match text(project, "uuid") {
+        Some(uuid) => format!("claude_export:project:{}", uuid.trim()),
+        None => format!(
+            "claude_export:project:{}",
+            stable_hash_hex(&format!("{created_at}:{}", turns[0].content))
+        ),
+    };
+    Some(ImportedConversation::from_turns(
+        source_id,
+        CLAUDE_EXPORT_ADAPTER_ID,
+        Some(name.as_deref().unwrap_or("Claude Project")),
+        "Claude Project",
+        "owner".to_string(),
+        created_at,
+        updated_at,
+        vec!["user".to_string(), "Claude".to_string()],
+        turns,
+    ))
 }
 
 pub(crate) fn extract_claude_msg_text(msg: &Value) -> String {

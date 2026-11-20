@@ -7,6 +7,8 @@ pub mod jobs;
 pub mod util;
 
 #[cfg(test)]
+mod claude_projects_tests;
+#[cfg(test)]
 mod tests;
 
 use std::collections::HashSet;

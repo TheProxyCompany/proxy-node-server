@@ -12,60 +12,58 @@ use tempfile::tempdir;
 
 use super::*;
 
-fn build_single_file_zip(entry_name: &str, payload: &[u8], deflate: bool) -> Vec<u8> {
-    let (method, compressed) = if deflate {
-        let mut enc = DeflateEncoder::new(Vec::new(), Compression::default());
-        enc.write_all(payload).expect("deflate write");
-        (8_u16, enc.finish().expect("deflate finish"))
-    } else {
-        (0_u16, payload.to_vec())
-    };
-    let name_bytes = entry_name.as_bytes();
+pub(super) fn build_zip(entries: &[(&str, &[u8])], deflate: bool) -> Vec<u8> {
+    let method = if deflate { 8_u16 } else { 0_u16 };
     let mut out = Vec::new();
+    let mut central_directory = Vec::new();
+    for (entry_name, payload) in entries {
+        let compressed = if deflate {
+            let mut enc = DeflateEncoder::new(Vec::new(), Compression::default());
+            enc.write_all(payload).expect("deflate write");
+            enc.finish().expect("deflate finish")
+        } else {
+            payload.to_vec()
+        };
+        let name_bytes = entry_name.as_bytes();
+        let local_offset = out.len() as u32;
 
-    // Local file header
-    out.extend_from_slice(&0x0403_4b50_u32.to_le_bytes());
-    out.extend_from_slice(&20_u16.to_le_bytes());
-    out.extend_from_slice(&0_u16.to_le_bytes());
-    out.extend_from_slice(&method.to_le_bytes());
-    out.extend_from_slice(&0_u16.to_le_bytes());
-    out.extend_from_slice(&0_u16.to_le_bytes());
-    out.extend_from_slice(&0_u32.to_le_bytes());
-    out.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
-    out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-    out.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
-    out.extend_from_slice(&0_u16.to_le_bytes());
-    out.extend_from_slice(name_bytes);
-    out.extend_from_slice(&compressed);
+        // Local file header
+        out.extend_from_slice(&0x0403_4b50_u32.to_le_bytes());
+        out.extend_from_slice(&20_u16.to_le_bytes());
+        out.extend_from_slice(&0_u16.to_le_bytes());
+        out.extend_from_slice(&method.to_le_bytes());
+        out.extend_from_slice(&[0; 8]);
+        out.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+        out.extend_from_slice(&0_u16.to_le_bytes());
+        out.extend_from_slice(name_bytes);
+        out.extend_from_slice(&compressed);
 
+        // Central directory file header
+        central_directory.extend_from_slice(&0x0201_4b50_u32.to_le_bytes());
+        central_directory.extend_from_slice(&20_u16.to_le_bytes());
+        central_directory.extend_from_slice(&20_u16.to_le_bytes());
+        central_directory.extend_from_slice(&0_u16.to_le_bytes());
+        central_directory.extend_from_slice(&method.to_le_bytes());
+        central_directory.extend_from_slice(&[0; 8]);
+        central_directory.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
+        central_directory.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        central_directory.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+        central_directory.extend_from_slice(&[0; 12]);
+        central_directory.extend_from_slice(&local_offset.to_le_bytes());
+        central_directory.extend_from_slice(name_bytes);
+    }
     let cd_offset = out.len() as u32;
-    // Central directory file header
-    out.extend_from_slice(&0x0201_4b50_u32.to_le_bytes());
-    out.extend_from_slice(&20_u16.to_le_bytes());
-    out.extend_from_slice(&20_u16.to_le_bytes());
-    out.extend_from_slice(&0_u16.to_le_bytes());
-    out.extend_from_slice(&method.to_le_bytes());
-    out.extend_from_slice(&0_u16.to_le_bytes());
-    out.extend_from_slice(&0_u16.to_le_bytes());
-    out.extend_from_slice(&0_u32.to_le_bytes());
-    out.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
-    out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-    out.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
-    out.extend_from_slice(&0_u16.to_le_bytes());
-    out.extend_from_slice(&0_u16.to_le_bytes());
-    out.extend_from_slice(&0_u16.to_le_bytes());
-    out.extend_from_slice(&0_u16.to_le_bytes());
-    out.extend_from_slice(&0_u32.to_le_bytes());
-    out.extend_from_slice(&0_u32.to_le_bytes());
-    out.extend_from_slice(name_bytes);
-    let cd_size = (out.len() as u32) - cd_offset;
+    let cd_size = central_directory.len() as u32;
+    out.extend_from_slice(&central_directory);
 
     // End of central directory
     out.extend_from_slice(&0x0605_4b50_u32.to_le_bytes());
     out.extend_from_slice(&0_u16.to_le_bytes());
     out.extend_from_slice(&0_u16.to_le_bytes());
-    out.extend_from_slice(&1_u16.to_le_bytes());
-    out.extend_from_slice(&1_u16.to_le_bytes());
+    out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+    out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
     out.extend_from_slice(&cd_size.to_le_bytes());
     out.extend_from_slice(&cd_offset.to_le_bytes());
     out.extend_from_slice(&0_u16.to_le_bytes());
@@ -141,7 +139,7 @@ fn chatgpt_zip_inventory_and_selective_load() {
             ]
         }
     ]);
-    let zip_bytes = build_single_file_zip("conversations.json", json.to_string().as_bytes(), true);
+    let zip_bytes = build_zip(&[("conversations.json", json.to_string().as_bytes())], true);
     let zip_path = dir.path().join("chatgpt-export.zip");
     fs::write(&zip_path, zip_bytes).expect("write zip");
 
@@ -190,9 +188,8 @@ fn claude_export_claude_code_codex_and_markdown_adapters_parse_cleanly() {
     let claude_zip = dir.path().join("claude.zip");
     fs::write(
         &claude_zip,
-        build_single_file_zip(
-            "conversations.json",
-            claude_json.to_string().as_bytes(),
+        build_zip(
+            &[("conversations.json", claude_json.to_string().as_bytes())],
             true,
         ),
     )
