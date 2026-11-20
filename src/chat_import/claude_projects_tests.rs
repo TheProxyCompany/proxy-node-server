@@ -58,6 +58,7 @@ fn conversations_json() -> String {
 fn assert_gusto_project(project: &ImportedConversation) {
     assert_eq!(project.source_id, "claude_export:project:proj-1");
     assert_eq!(project.adapter_id, "claude_export");
+    assert_eq!(project.participants, ["owner"]);
     assert_eq!(project.title, "Gusto Payroll");
     assert_eq!(project.created_at, 1_793_523_600);
     assert_eq!(project.updated_at, 1_793_869_200);

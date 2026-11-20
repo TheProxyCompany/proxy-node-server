@@ -260,7 +260,7 @@ fn parse_project(project: &Value, fallback_ts: u64) -> Option<ImportedConversati
         "owner".to_string(),
         created_at,
         updated_at,
-        vec!["user".to_string(), "Claude".to_string()],
+        vec!["owner".to_string()],
         turns,
     ))
 }
