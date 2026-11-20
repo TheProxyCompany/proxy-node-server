@@ -10,7 +10,6 @@ pub(super) enum Admission {
     Push(String),
     Defer,
     Quarantine,
-    Hold,
 }
 
 pub(super) fn admit_row<E>(
@@ -29,8 +28,8 @@ pub(super) fn admit_row<E>(
         }
         tracing::error!(origin = %key.device.to_hex(), order_key = %encode_hex(&key.to_wire()),
             op_id = %key.op_id.to_hex(), raw_bytes = envelope.len(), encoded_bytes,
-            "oversized pull row has no newer head; holding cursor");
-        return Ok(Admission::Hold);
+            "oversized pull row has no newer head; skipping row to keep link live");
+        return Ok(Admission::Quarantine);
     }
     if occupied && encoded_bytes > budget.saturating_sub(*bytes) {
         return Ok(Admission::Defer);
@@ -49,7 +48,7 @@ pub fn encode_origin_rows(
     let Ok(result) = encode_checked(rows, keyed, bytes, byte_budget, |_| {
         Ok::<_, std::convert::Infallible>(false)
     });
-    (result.0, result.1)
+    result
 }
 
 fn encode_checked<E>(
@@ -58,7 +57,7 @@ fn encode_checked<E>(
     bytes: &mut usize,
     byte_budget: usize,
     superseded: impl Fn(&OrderKey) -> Result<bool, E>,
-) -> Result<(usize, Option<OrderKey>, bool), E> {
+) -> Result<(usize, Option<OrderKey>), E> {
     let mut consumed = 0;
     let mut last_key = None;
     for (key, envelope) in rows {
@@ -70,7 +69,6 @@ fn encode_checked<E>(
             bytes,
             byte_budget,
         )? {
-            Admission::Hold => return Ok((consumed, last_key, true)),
             Admission::Defer => break,
             Admission::Push(row) => keyed.push(row),
             Admission::Quarantine => {}
@@ -81,7 +79,7 @@ fn encode_checked<E>(
             break;
         }
     }
-    Ok((consumed, last_key, false))
+    Ok((consumed, last_key))
 }
 
 /// Build a [`PullPhase::Keyed`] resume token positioned at `(origin, last_key)`.
@@ -135,13 +133,10 @@ pub fn build_keyed_channel<S: MeshPullSocket + ?Sized>(
         };
         let rows = socket.origin_since(own, claim, store, remaining)?;
         let fetched = rows.len();
-        let (consumed, last_key, held) =
+        let (consumed, last_key) =
             encode_checked(rows, &mut keyed, &mut bytes, byte_budget, |key| {
                 socket.is_superseded(key)
             })?;
-        if held && keyed.is_empty() {
-            return Err(S::invalid_argument("oversized pull row has no newer head"));
-        }
         remaining -= consumed;
         if remaining == 0 || consumed < fetched || bytes >= byte_budget {
             return Ok((keyed, Some(keyed_resume(own, last_key))));
@@ -164,14 +159,11 @@ pub fn build_keyed_channel<S: MeshPullSocket + ?Sized>(
         };
         let rows = socket.origin_since(origin, after, store, remaining)?;
         let fetched = rows.len();
-        let (consumed, last_key, held) =
+        let (consumed, last_key) =
             encode_checked(rows, &mut keyed, &mut bytes, byte_budget, |key| {
                 socket.is_superseded(key)
             })?;
         let count_exhausted = fetched == remaining;
-        if held && keyed.is_empty() {
-            return Err(S::invalid_argument("oversized pull row has no newer head"));
-        }
         remaining -= consumed;
         if count_exhausted || consumed < fetched || bytes >= byte_budget {
             return Ok((keyed, Some(keyed_resume(origin, last_key))));
