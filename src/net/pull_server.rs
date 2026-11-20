@@ -183,7 +183,10 @@ pub fn build_pull_page<S: MeshPullSocket + ?Sized>(
             PULL_PAGE_BYTE_BUDGET,
         )? {
             Admission::Push(row) => backfill.push((seq, row)),
-            Admission::Defer => {
+            Admission::Hold if next_relay_seq == start_seq && keyed.is_empty() => {
+                return Err(S::invalid_argument("oversized pull row has no newer head"));
+            }
+            Admission::Hold | Admission::Defer => {
                 byte_cut = true;
                 break;
             }
