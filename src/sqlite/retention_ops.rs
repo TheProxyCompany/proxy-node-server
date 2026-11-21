@@ -62,24 +62,14 @@ fn is_self_draining_bulk_table(store: &str, table: &str) -> bool {
     store == "proxydb"
         && matches!(
             table,
-            "items"
-                | "sequences"
-                | "widget_files"
-                | "party_files"
-                | "conversations"
-                | "conversation_participants"
-                | "conversation_jobs"
-                | "message_attachments"
+            "items" | "sequences" | "conversation_jobs" | "message_attachments"
         )
 }
 
-const SELF_DRAINING_SQL_FILTER: &str = "(store_id = 'proxydb' AND table_name IN ('items', 'sequences', 'widget_files', 'party_files', 'conversations', 'conversation_participants', 'conversation_jobs', 'message_attachments'))";
+const SELF_DRAINING_SQL_FILTER: &str = "(store_id = 'proxydb' AND table_name IN ('items', 'sequences', 'conversation_jobs', 'message_attachments'))";
 const SELF_DRAINING_HEAD_TRIM_TABLES: &[&str] = &[
     "items",
     "sequences",
-    "widget_files",
-    "conversations",
-    "conversation_participants",
     "conversation_jobs",
     "message_attachments",
 ];
@@ -327,7 +317,7 @@ fn delete_ops_subchunk(
               AND heads.row_pk = pinned_op.row_pk
               AND heads.op_id = pinned_op.op_id
              WHERE pinned_op.op_id = oplog_arrivals.op_id
-               AND NOT (pinned_op.store_id = 'proxydb' AND pinned_op.table_name IN ('items', 'sequences', 'widget_files', 'party_files', 'conversations', 'conversation_participants', 'conversation_jobs', 'message_attachments'))
+               AND NOT (pinned_op.store_id = 'proxydb' AND pinned_op.table_name IN ('items', 'sequences', 'conversation_jobs', 'message_attachments'))
          )";
 
     let (bytes, floor): (i64, i64) = conn

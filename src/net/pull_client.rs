@@ -286,13 +286,6 @@ where
         return Err(error);
     }
 
-    let next_cursor = RelayCursor {
-        epoch: current.epoch,
-        after: current.after.max(page.next_relay_seq),
-    };
-    socket.commit_relay_cursor(peer, next_cursor).await?;
-    *cursor = Some(next_cursor);
-
     let mut runs: Vec<(DeviceId, Vec<SignedOp>, Vec<OrderKey>)> = Vec::new();
     let mut last_key: Option<OrderKey> = None;
     for encoded in &page.keyed {
@@ -345,6 +338,13 @@ where
             return Err(error);
         }
     }
+
+    let next_cursor = RelayCursor {
+        epoch: current.epoch,
+        after: current.after.max(page.next_relay_seq),
+    };
+    socket.commit_relay_cursor(peer, next_cursor).await?;
+    *cursor = Some(next_cursor);
     Ok(applied)
 }
 

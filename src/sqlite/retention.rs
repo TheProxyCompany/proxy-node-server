@@ -17,8 +17,8 @@ pub const VERIFIED_OPS_SCAN_CURSOR_KEY: &str = "retention.verified_ops_scan_afte
 /// Default retention horizon (7 days).
 pub const DEFAULT_RETENTION_HORIZON: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
-/// Maximum age of a peer's `mesh_peer_acks` entry before it stops pinning `ack_floor` (72 hours).
-pub const PEER_ACK_TTL: Duration = Duration::from_secs(72 * 60 * 60);
+/// Maximum age of a peer's `mesh_peer_acks` entry before it stops pinning `ack_floor` (7 days).
+pub const PEER_ACK_TTL: Duration = DEFAULT_RETENTION_HORIZON;
 
 const HLC_SECONDS_SHIFT: u32 = 32;
 

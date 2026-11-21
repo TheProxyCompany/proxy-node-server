@@ -1,12 +1,12 @@
-//! Mesh pull protocol v3 - wire types and cryptographic envelope primitives.
+//! Mesh pull protocol v3 — wire types and cryptographic envelope primitives.
 //!
 //! v3 serves two channels per drain over the same authenticated surface:
 //!
-//! - **Channel B (backbone, positional)** - the peer's arrival stream on the
+//! - **Channel B (backbone, positional)** — the peer's arrival stream on the
 //!   same durable relay cursor, epoch, reset, and floor semantics as v2,
 //!   omitting arrivals whose order key is strictly above the puller's claim for
 //!   that op's origin (which are guaranteed delivery on channel A).
-//! - **Channel A (overlay, keyed)** - a per-origin ascending diff strictly
+//! - **Channel A (overlay, keyed)** — a per-origin ascending diff strictly
 //!   above the puller's claims.
 //!
 //! Every missing op lands on at least one channel: if its arrival sequence is
@@ -36,7 +36,7 @@ pub use crate::net::{
     PullAdmission, PullHandler, PullOutcome, PullProgress, PullStorage, REGISTER_RETRY_BACKOFF,
     TRELLIS_SWEEP_INTERVAL, WATCH_REPROBE_INTERVAL, admit_pull_ack, apply_pull_page,
     authenticate_pull_request, build_keyed_channel, build_pull_page, classify_pull_request_error,
-    decode_epoch, decode_order_key, decode_page_op, drain_pull_pages, encode_origin_rows,
+    decode_epoch, decode_order_key, decode_page_op, drain_pull_pages,
     endpoint_has_confidential_transport, inflated_claims, is_cgnat_ip, is_loopback_host,
     keyed_resume, parse_mesh_peers, parse_mesh_peers_from, persist_pull_reset, preview_head_window,
     preview_resume_after, pull_http_client, pull_needs_reset, pull_progress, pull_router,
@@ -66,13 +66,19 @@ pub const PAGE_LIMIT_MAX: usize = 8192;
 pub const PULL_PAGE_LIMIT_MAX: u32 = PAGE_LIMIT_MAX as u32;
 
 /// Byte governor for one v3 page before cutting with a resume token.
-pub const PULL_PAGE_BYTE_BUDGET: usize = 32 * 1024 * 1024;
+pub const PULL_PAGE_BYTE_BUDGET: usize = 16 * 1024 * 1024;
+
+/// Largest base64-encoded envelope a pull page admits as a singleton row.
+pub const MAX_PULL_SINGLETON_BYTES: usize = 32 * 1024 * 1024 - 4096;
+
+/// Largest raw op payload an emitter appends to the replicated op-log.
+pub const MAX_OP_PAYLOAD_BYTES: usize = 22 * 1024 * 1024;
 
 /// Body cap for a pull request.
 pub const MAX_PULL_REQUEST_BYTES: usize = 256 * 1024;
 
-/// Body cap for a pull response page (96 MiB: a 64 MiB raw op base64-encodes to 85.33 MiB).
-pub const MAX_PULL_RESPONSE_BYTES: usize = 96 * 1024 * 1024;
+/// Signed response body cap, including page metadata and framing.
+pub const MAX_PULL_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 
 /// Accepted clock skew on a signed pull request, matching the v2 tier.
 pub const MAX_REQUEST_SKEW_MS: i64 = 120_000;
