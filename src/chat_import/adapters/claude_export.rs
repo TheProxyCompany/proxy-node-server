@@ -1,9 +1,10 @@
-//! Anthropic Claude web and desktop export (`conversations.json`, `projects.json`, `.zip`) adapter.
+//! Anthropic Claude web and desktop export (`conversations.json`, `projects.json`, `projects/*.json`, `.zip`) adapter.
 //!
-//! A Claude Project (`projects.json`) becomes one conversation: a turn is `user` only when the
-//! person typed it into Claude in their own voice (`description`, `prompt_template`); uploaded
-//! material (`docs[]`) becomes `note` turns so reference documents never write personal preferences.
+//! A Claude Project becomes one conversation: a turn is `user` only when the person typed it into
+//! Claude in their own voice (`description`, `prompt_template`); uploaded material (`docs[]`)
+//! becomes `note` turns so reference documents never write personal preferences.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -25,7 +26,7 @@ impl ChatImportAdapter for ClaudeExportAdapter {
             display_name: "Claude".to_string(),
             subtitle: "Anthropic Claude web or desktop data export".to_string(),
             export_hint:
-                "Claude -> Settings -> Privacy -> Export Data (.zip, conversations.json or projects.json)"
+                "Claude -> Settings -> Privacy -> Export Data (.zip, export folder, conversations.json or projects.json)"
                     .to_string(),
             icon_name: "sparkles".to_string(),
             source_kind: ChatImportSourceKind::ExportFile.into(),
@@ -53,35 +54,47 @@ impl ChatImportAdapter for ClaudeExportAdapter {
             return u8::from(
                 entries
                     .iter()
-                    .any(|(name, p)| looks_like_claude_export(name, &p[..p.len().min(16_384)])),
+                    .any(|(name, p)| looks_like_claude_export(name, p)),
             ) * 96;
         }
-        let file_name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or_default();
-        u8::from(looks_like_claude_export(file_name, head)) * 95
+        let label = entry_label_for_path(path);
+        u8::from(looks_like_claude_export(&label, head)) * 95
     }
 
     fn parse_conversations(&self, path: &Path) -> Result<Vec<ImportedConversation>, String> {
         let fallback_ts = file_mtime_secs(path);
         if path.is_dir() {
-            let files = export_files_in(path);
-            if files.is_empty() {
+            let mut matched_any = false;
+            let mut out = Vec::new();
+            for file in export_files_in(path) {
+                let raw =
+                    fs::read(&file).map_err(|e| format!("reading {}: {e}", file.display()))?;
+                if raw.starts_with(b"PK\x03\x04") {
+                    let entries = read_zip_entries(&raw, is_export_name)
+                        .map_err(|e| format!("{}: {e}", file.display()))?;
+                    if entries.is_empty() {
+                        continue;
+                    }
+                    matched_any = true;
+                    for (name, payload) in entries {
+                        let parsed = parse_anthropic_json(&payload, fallback_ts)
+                            .map_err(|e| format!("{}:{name}: {e}", file.display()))?;
+                        out.extend(parsed);
+                    }
+                } else {
+                    matched_any = true;
+                    let parsed = parse_anthropic_json(&raw, fallback_ts)
+                        .map_err(|e| format!("{}: {e}", file.display()))?;
+                    out.extend(parsed);
+                }
+            }
+            if !matched_any {
                 return Err(format!(
-                    "no conversations.json or projects.json in {}",
+                    "no conversations.json, projects.json, or Claude export zip in {}",
                     path.display()
                 ));
             }
-            let mut out = Vec::new();
-            for file in files {
-                let raw =
-                    fs::read(&file).map_err(|e| format!("reading {}: {e}", file.display()))?;
-                let parsed = parse_anthropic_json(&raw, fallback_ts)
-                    .map_err(|e| format!("{}: {e}", file.display()))?;
-                out.extend(parsed);
-            }
-            return Ok(out);
+            return Ok(dedupe_conversations(out));
         }
         let raw = fs::read(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
         if raw.starts_with(b"PK\x03\x04") {
@@ -91,30 +104,84 @@ impl ChatImportAdapter for ClaudeExportAdapter {
                     .map_err(|e| format!("{name}: {e}"))?;
                 out.extend(parsed);
             }
-            return Ok(out);
+            return Ok(dedupe_conversations(out));
         }
-        parse_anthropic_json(&raw, fallback_ts).map_err(|e| format!("{}: {e}", path.display()))
+        parse_anthropic_json(&raw, fallback_ts)
+            .map(dedupe_conversations)
+            .map_err(|e| format!("{}: {e}", path.display()))
     }
 }
 
 const EXPORT_FILE_NAMES: [&str; 2] = ["conversations.json", "projects.json"];
 
 fn export_files_in(dir: &Path) -> Vec<PathBuf> {
-    EXPORT_FILE_NAMES
+    let mut out: Vec<PathBuf> = EXPORT_FILE_NAMES
         .iter()
         .map(|name| dir.join(name))
         .filter(|file| file.is_file())
-        .collect()
+        .collect();
+    out.extend(sorted_dir_files(&dir.join("projects"), ".json"));
+    out.extend(sorted_dir_files(dir, ".zip"));
+    out
+}
+
+fn sorted_dir_files(dir: &Path, suffix: &str) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut files: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_file()
+                && p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                    !n.starts_with('.') && n.to_ascii_lowercase().ends_with(suffix)
+                })
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+fn entry_label_for_path(path: &Path) -> String {
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    if path
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        == Some("projects")
+    {
+        format!("projects/{file_name}")
+    } else {
+        file_name.to_string()
+    }
 }
 
 fn is_export_name(name: &str) -> bool {
-    EXPORT_FILE_NAMES
-        .iter()
-        .any(|file| name == *file || name.ends_with(&format!("/{file}")))
+    if name.starts_with("__MACOSX/") || name.contains("/__MACOSX/") {
+        return false;
+    }
+    name == "conversations.json"
+        || name.ends_with("/conversations.json")
+        || is_project_entry_name(name)
 }
 
-fn is_projects_name(name: &str) -> bool {
-    name == "projects.json" || name.ends_with("/projects.json")
+fn is_project_entry_name(name: &str) -> bool {
+    if name.starts_with("__MACOSX/") || name.contains("/__MACOSX/") {
+        return false;
+    }
+    if name == "projects.json" || name.ends_with("/projects.json") {
+        return true;
+    }
+    let trimmed = name
+        .strip_prefix("projects/")
+        .or_else(|| name.rsplit_once("/projects/").map(|(_, rest)| rest));
+    trimmed.is_some_and(|file| {
+        !file.is_empty() && !file.contains('/') && !file.starts_with('.') && file.ends_with(".json")
+    })
 }
 
 fn looks_like_claude_export(name: &str, head: &[u8]) -> bool {
@@ -122,11 +189,29 @@ fn looks_like_claude_export(name: &str, head: &[u8]) -> bool {
     let has = |key: &str| text.contains(&format!("\"{key}\""));
     (has("chat_messages") && has("sender"))
         || (has("uuid")
-            && has("prompt_template")
-            && (is_projects_name(name)
+            && (has("prompt_template")
+                || has("is_starter_project")
+                || (is_project_entry_name(name) && has("description")))
+            && (is_project_entry_name(name)
                 || has("docs")
                 || has("is_private")
                 || has("is_starter_project")))
+}
+
+fn dedupe_conversations(items: Vec<ImportedConversation>) -> Vec<ImportedConversation> {
+    let mut index_by_id: HashMap<String, usize> = HashMap::with_capacity(items.len());
+    let mut out: Vec<ImportedConversation> = Vec::with_capacity(items.len());
+    for item in items {
+        if let Some(&idx) = index_by_id.get(&item.source_id) {
+            if item.updated_at > out[idx].updated_at {
+                out[idx] = item;
+            }
+        } else {
+            index_by_id.insert(item.source_id.clone(), out.len());
+            out.push(item);
+        }
+    }
+    out
 }
 
 fn parse_anthropic_json(
