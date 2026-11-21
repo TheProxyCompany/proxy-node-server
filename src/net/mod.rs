@@ -33,10 +33,11 @@ use crate::identity::decode_hex;
 use crate::op::{OrderKey, SignedOp};
 
 pub use crate::pull::{
-    CoverageVector, MAX_PULL_REQUEST_BYTES, MAX_PULL_RESPONSE_BYTES, MAX_REQUEST_SKEW_MS,
-    OriginHead, PAGE_LIMIT_MAX, PULL_PAGE_BYTE_BUDGET, PULL_PAGE_LIMIT_MAX, PULL_PAGE_STORE_ID,
-    PULL_PATH, PULL_REQUEST_STORE_ID, PULL_RESPONSE_STORE_ID, PULL_VERSION, PullPage, PullPhase,
-    PullRequest, Resume, seal_pull_page, sign_pull_request, verify_pull_page, verify_pull_request,
+    CoverageVector, MAX_OP_PAYLOAD_BYTES, MAX_PULL_REQUEST_BYTES, MAX_PULL_RESPONSE_BYTES,
+    MAX_PULL_SINGLETON_BYTES, MAX_REQUEST_SKEW_MS, OriginHead, PAGE_LIMIT_MAX,
+    PULL_PAGE_BYTE_BUDGET, PULL_PAGE_LIMIT_MAX, PULL_PAGE_STORE_ID, PULL_PATH,
+    PULL_REQUEST_STORE_ID, PULL_RESPONSE_STORE_ID, PULL_VERSION, PullPage, PullPhase, PullRequest,
+    Resume, seal_pull_page, sign_pull_request, verify_pull_page, verify_pull_request,
 };
 pub use client::HttpPullSource;
 pub use persistence::{
@@ -47,7 +48,7 @@ pub use policy::{
     MESH_AUDIT_ENV, MESH_PEERS_ENV, endpoint_has_confidential_transport, is_cgnat_ip,
     is_loopback_host, parse_mesh_peers, parse_mesh_peers_from,
 };
-pub use pull_budget::{build_keyed_channel, encode_origin_rows, keyed_resume};
+pub use pull_budget::{build_keyed_channel, keyed_resume};
 pub use pull_client::{
     DISCOVERY_RESCAN_INTERVAL, NEWEST_FIRST_PREVIEW_GAP, PULL_FALLBACK_INTERVAL,
     PULL_NO_PROGRESS_LIMIT, PullOutcome, PullProgress, REGISTER_RETRY_BACKOFF,

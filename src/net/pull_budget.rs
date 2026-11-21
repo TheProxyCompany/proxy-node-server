@@ -4,7 +4,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use super::{MeshPullSocket, decode_order_key};
 use crate::identity::{DeviceId, encode_hex};
 use crate::op::OrderKey;
-use crate::pull::{CoverageVector, MAX_PULL_RESPONSE_BYTES, PullPhase, Resume};
+use crate::pull::{CoverageVector, MAX_PULL_SINGLETON_BYTES, PullPhase, Resume};
 
 pub(super) enum Admission {
     Push(String),
@@ -21,8 +21,7 @@ pub(super) fn admit_row<E>(
     budget: usize,
 ) -> Result<Admission, E> {
     let encoded_bytes = base64::encoded_len(envelope.len(), true).unwrap_or(usize::MAX);
-    // Reserve room for the signed page, cursor and fixed-width identifiers.
-    if encoded_bytes > MAX_PULL_RESPONSE_BYTES - 4096 {
+    if encoded_bytes > MAX_PULL_SINGLETON_BYTES {
         if superseded(&key)? {
             return Ok(Admission::SkipOversized);
         }
@@ -36,19 +35,6 @@ pub(super) fn admit_row<E>(
     }
     *bytes += encoded_bytes;
     Ok(Admission::Push(BASE64.encode(envelope)))
-}
-
-/// Append admissible rows, returning the number consumed and the last consumed key.
-pub fn encode_origin_rows(
-    rows: Vec<(OrderKey, Vec<u8>)>,
-    keyed: &mut Vec<String>,
-    bytes: &mut usize,
-    byte_budget: usize,
-) -> (usize, Option<OrderKey>) {
-    let Ok(result) = encode_checked(rows, keyed, bytes, byte_budget, |_| {
-        Ok::<_, std::convert::Infallible>(false)
-    });
-    result
 }
 
 fn encode_checked<E>(

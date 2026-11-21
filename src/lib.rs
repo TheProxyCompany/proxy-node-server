@@ -42,10 +42,11 @@ pub use log::{
 };
 pub use op::{ENVELOPE_VERSION, MAX_STORE_ID_LEN, OpBody, OpId, OrderKey, SignedOp, StoreId};
 pub use pull::{
-    CoverageVector, MAX_PULL_REQUEST_BYTES, MAX_PULL_RESPONSE_BYTES, MAX_REQUEST_SKEW_MS,
-    OriginHead, PAGE_LIMIT_MAX, PULL_PAGE_BYTE_BUDGET, PULL_PAGE_LIMIT_MAX, PULL_PAGE_STORE_ID,
-    PULL_PATH, PULL_REQUEST_STORE_ID, PULL_RESPONSE_STORE_ID, PULL_VERSION, PullPage, PullPhase,
-    PullRequest, Resume,
+    CoverageVector, MAX_OP_PAYLOAD_BYTES, MAX_PULL_REQUEST_BYTES, MAX_PULL_RESPONSE_BYTES,
+    MAX_PULL_SINGLETON_BYTES, MAX_REQUEST_SKEW_MS, OriginHead, PAGE_LIMIT_MAX,
+    PULL_PAGE_BYTE_BUDGET, PULL_PAGE_LIMIT_MAX, PULL_PAGE_STORE_ID, PULL_PATH,
+    PULL_REQUEST_STORE_ID, PULL_RESPONSE_STORE_ID, PULL_VERSION, PullPage, PullPhase, PullRequest,
+    Resume,
 };
 #[cfg(feature = "daemon")]
 pub use pull::{seal_pull_page, sign_pull_request, verify_pull_page, verify_pull_request};
@@ -71,14 +72,14 @@ pub use net::{
     WATCH_MAX_WAIT, WATCH_REPROBE_INTERVAL, admit_pull_ack, apply_pull_page,
     authenticate_pull_request, build_keyed_channel, build_pull_page, classify_pull_request_error,
     decode_epoch, decode_order_key, decode_page_op, drain_pull_pages, encode_order_key,
-    encode_origin_rows, endpoint_has_confidential_transport, inflated_claims, is_cgnat_ip,
-    is_loopback_host, keyed_resume, learn_attested_devices, learn_devices, load_cursor,
-    load_peer_keys, load_relay_caller_keys, load_relay_cursor, parse_mesh_peers,
-    parse_mesh_peers_from, persist_pull_reset, preview_head_window, preview_resume_after,
-    pull_http_client, pull_needs_reset, pull_progress, pull_router, register_peer,
-    register_peer_with_key, relay_router, reset_pull_page, router, save_cursor, save_peer_keys,
-    save_relay_caller_keys, save_relay_cursor, sweep_store, sync_once, sync_once_with,
-    sync_relay_once, unix_ms, validate_pull_reset,
+    endpoint_has_confidential_transport, inflated_claims, is_cgnat_ip, is_loopback_host,
+    keyed_resume, learn_attested_devices, learn_devices, load_cursor, load_peer_keys,
+    load_relay_caller_keys, load_relay_cursor, parse_mesh_peers, parse_mesh_peers_from,
+    persist_pull_reset, preview_head_window, preview_resume_after, pull_http_client,
+    pull_needs_reset, pull_progress, pull_router, register_peer, register_peer_with_key,
+    relay_router, reset_pull_page, router, save_cursor, save_peer_keys, save_relay_caller_keys,
+    save_relay_cursor, sweep_store, sync_once, sync_once_with, sync_relay_once, unix_ms,
+    validate_pull_reset,
 };
 #[cfg(feature = "pull-http")]
 pub use transport::PullSource;
