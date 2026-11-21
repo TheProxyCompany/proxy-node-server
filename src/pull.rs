@@ -1,12 +1,12 @@
-//! Mesh pull protocol v3 — wire types and cryptographic envelope primitives.
+//! Mesh pull protocol v3 - wire types and cryptographic envelope primitives.
 //!
 //! v3 serves two channels per drain over the same authenticated surface:
 //!
-//! - **Channel B (backbone, positional)** — the peer's arrival stream on the
+//! - **Channel B (backbone, positional)** - the peer's arrival stream on the
 //!   same durable relay cursor, epoch, reset, and floor semantics as v2,
 //!   omitting arrivals whose order key is strictly above the puller's claim for
 //!   that op's origin (which are guaranteed delivery on channel A).
-//! - **Channel A (overlay, keyed)** — a per-origin ascending diff strictly
+//! - **Channel A (overlay, keyed)** - a per-origin ascending diff strictly
 //!   above the puller's claims.
 //!
 //! Every missing op lands on at least one channel: if its arrival sequence is
@@ -71,8 +71,8 @@ pub const PULL_PAGE_BYTE_BUDGET: usize = 32 * 1024 * 1024;
 /// Body cap for a pull request.
 pub const MAX_PULL_REQUEST_BYTES: usize = 256 * 1024;
 
-/// Body cap for a pull response page.
-pub const MAX_PULL_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+/// Body cap for a pull response page (96 MiB: a 64 MiB raw op base64-encodes to 85.33 MiB).
+pub const MAX_PULL_RESPONSE_BYTES: usize = 96 * 1024 * 1024;
 
 /// Accepted clock skew on a signed pull request, matching the v2 tier.
 pub const MAX_REQUEST_SKEW_MS: i64 = 120_000;

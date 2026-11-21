@@ -1,38 +1,29 @@
 //! Pull Protocol v3 server mechanics: two-channel page builder, compaction
-//! acknowledgment admission, request authentication, and the Axum router.
+//! acknowledgment admission, and request authentication.
 
-use std::future::Future;
-
-use axum::extract::{DefaultBodyLimit, State};
-use axum::http::{StatusCode, header};
-use axum::response::{IntoResponse, Response};
-use axum::routing::post;
+use axum::http::StatusCode;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 
-use super::pull_client::{decode_epoch, decode_order_key, unix_ms};
-use super::server::ServeState;
+use super::pull_client::{decode_epoch, decode_order_key};
+pub use super::pull_router::{PullHandler, pull_router};
 use super::socket::MeshPullSocket;
-use crate::hlc::Hlc;
-use crate::identity::{DeviceId, DeviceIdentity, encode_hex};
-use crate::log::{LogSource, RelayStreamState};
+use crate::identity::{DeviceId, encode_hex};
+use crate::log::RelayStreamState;
 use crate::op::OrderKey;
 use crate::pull::{
-    CoverageVector, MAX_PULL_REQUEST_BYTES, PULL_PAGE_BYTE_BUDGET, PULL_PAGE_LIMIT_MAX, PULL_PATH,
-    PULL_VERSION, PullPage, PullPhase, PullRequest, Resume, seal_pull_page, verify_pull_request,
+    CoverageVector, PULL_PAGE_BYTE_BUDGET, PULL_PAGE_LIMIT_MAX, PULL_VERSION, PullPage, PullPhase,
+    PullRequest, Resume, verify_pull_request,
 };
-use crate::registry::DeviceBook;
 
-/// Mirrors `relay_needs_reset` so channel B inherits v2's epoch and floor
-/// reset semantics verbatim.
+/// Mirrors `relay_needs_reset` so channel B inherits v2's epoch and floor reset semantics.
 pub fn pull_needs_reset(request_epoch: [u8; 32], after: u64, state: &RelayStreamState) -> bool {
     (request_epoch == [0u8; 32] && state.floor > 0)
         || (request_epoch != [0u8; 32] && request_epoch != state.epoch)
         || (request_epoch == state.epoch && (after < state.floor || after > state.head))
 }
 
-/// Construct a reset [`PullPage`] advertising `stream`'s current epoch,
-/// compaction floor, and head sequence.
+/// Construct a reset [`PullPage`] advertising `stream`'s current epoch, floor, and head.
 pub fn reset_pull_page(stream: &RelayStreamState) -> PullPage {
     PullPage {
         version: PULL_VERSION,
@@ -62,6 +53,9 @@ pub fn encode_origin_rows(
     let mut last_key = None;
     for (key, envelope) in rows {
         let encoded = BASE64.encode(&envelope);
+        if *bytes > 0 && *bytes + encoded.len() > byte_budget {
+            break;
+        }
         *bytes += encoded.len();
         keyed.push(encoded);
         last_key = Some(key);
@@ -86,8 +80,7 @@ pub fn keyed_resume(origin: &DeviceId, last_key: Option<OrderKey>) -> Resume {
 }
 
 /// Channel A: each origin's ops strictly above the puller's claim, ascending
-/// within an origin and origins ascending by raw device-id bytes (with the
-/// serving device's own origin fronted on a fresh exchange).
+/// within an origin and origins ascending by raw device-id bytes.
 #[allow(clippy::too_many_arguments)]
 pub fn build_keyed_channel<S: MeshPullSocket + ?Sized>(
     socket: &S,
@@ -151,7 +144,8 @@ pub fn build_keyed_channel<S: MeshPullSocket + ?Sized>(
         let count_exhausted = fetched == remaining;
         remaining -= served;
         if count_exhausted || served < fetched || bytes >= byte_budget {
-            return Ok((keyed, Some(keyed_resume(origin, last_key))));
+            let token_key = last_key.or(if resumed_here { resume_key } else { None });
+            return Ok((keyed, Some(keyed_resume(origin, token_key))));
         }
     }
     Ok((keyed, None))
@@ -242,59 +236,71 @@ pub fn build_pull_page<S: MeshPullSocket + ?Sized>(
 
     let resume_backfill =
         matches!(&request.resume, Some(resume) if resume.phase == PullPhase::Backfill);
+    let backfill_pending = request.relay_after < stream.head || start_seq < stream.head;
     let mut budget = limit;
     let mut keyed = Vec::new();
+    let mut pending_keyed_resume = None;
     if !resume_backfill {
+        let keyed_budget = if backfill_pending {
+            ((limit * 3) / 4).max(1)
+        } else {
+            limit
+        };
+        let keyed_byte_budget = if backfill_pending {
+            (PULL_PAGE_BYTE_BUDGET * 3) / 4
+        } else {
+            PULL_PAGE_BYTE_BUDGET
+        };
         let (served, keyed_resume) = build_keyed_channel(
             socket,
             &claims,
             resume_keyed,
             audit,
-            budget,
-            PULL_PAGE_BYTE_BUDGET,
+            keyed_budget,
+            keyed_byte_budget,
             None,
             &own,
         )?;
         keyed = served;
-        if keyed_resume.is_some() {
-            return Ok(page(Vec::new(), keyed, next_relay_seq, keyed_resume));
-        }
-        budget = limit - keyed.len();
+        pending_keyed_resume = keyed_resume;
+        budget = limit.saturating_sub(keyed.len());
         if budget == 0 {
-            return Ok(page(
-                Vec::new(),
-                keyed,
-                next_relay_seq,
-                Some(backfill_resume(start_seq)),
-            ));
+            let resume = pending_keyed_resume.or_else(|| Some(backfill_resume(start_seq)));
+            return Ok(page(Vec::new(), keyed, next_relay_seq, resume));
         }
     }
 
     let mut backfill = Vec::new();
     let mut page_bytes: usize = keyed.iter().map(String::len).sum();
     let mut byte_cut = false;
-    let scanned = socket.relay_since_with_envelopes(start_seq, budget)?;
-    let scanned_len = scanned.len();
-    for (seq, op, envelope) in scanned {
-        if byte_cut && claims.covers(&op.order_key()) {
-            break;
-        }
-        next_relay_seq = seq;
-        if claims.covers(&op.order_key()) {
-            let encoded = BASE64.encode(&envelope);
-            page_bytes += encoded.len();
-            backfill.push((seq, encoded));
-            byte_cut = page_bytes >= PULL_PAGE_BYTE_BUDGET;
+    let mut scanned_len = 0usize;
+    if budget > 0 && page_bytes < PULL_PAGE_BYTE_BUDGET {
+        let scanned = socket.relay_since_with_envelopes(start_seq, budget)?;
+        scanned_len = scanned.len();
+        for (seq, op, envelope) in scanned {
+            if byte_cut && claims.covers(&op.order_key()) {
+                break;
+            }
+            if claims.covers(&op.order_key()) {
+                let encoded = BASE64.encode(&envelope);
+                if page_bytes > 0 && page_bytes + encoded.len() > PULL_PAGE_BYTE_BUDGET {
+                    byte_cut = true;
+                    break;
+                }
+                page_bytes += encoded.len();
+                backfill.push((seq, encoded));
+                byte_cut = page_bytes >= PULL_PAGE_BYTE_BUDGET;
+            }
+            next_relay_seq = seq;
         }
     }
-    let resume = ((scanned_len == budget && budget > 0) || byte_cut)
-        .then(|| backfill_resume(next_relay_seq));
+    let resume = pending_keyed_resume.or_else(|| {
+        ((scanned_len == budget && budget > 0) || byte_cut).then(|| backfill_resume(next_relay_seq))
+    });
     Ok(page(backfill, keyed, next_relay_seq, resume))
 }
 
-/// Validate a presented compaction acknowledgment against `socket`'s current
-/// stream state and record it if valid, returning `Ok(Some(reset_page))` when
-/// the presented cursor requires a stream reset.
+/// Validate and record a presented compaction acknowledgment against `socket`.
 pub fn admit_pull_ack<S: MeshPullSocket + ?Sized>(
     socket: &S,
     peer: &DeviceId,
@@ -313,9 +319,7 @@ pub fn admit_pull_ack<S: MeshPullSocket + ?Sized>(
     Ok(None)
 }
 
-/// Map a [`verify_pull_request`] error string to the canonical HTTP status
-/// code (`400 Bad Request` for malformed payload or unsupported version,
-/// `403 Forbidden` for expired requests, `401 Unauthorized` otherwise).
+/// Map a [`verify_pull_request`] error string to the canonical HTTP status code.
 pub fn classify_pull_request_error(message: &str) -> StatusCode {
     if message.starts_with("Invalid payload:") || message == "Unsupported pull protocol version" {
         StatusCode::BAD_REQUEST
@@ -326,8 +330,7 @@ pub fn classify_pull_request_error(message: &str) -> StatusCode {
     }
 }
 
-/// Verify a signed pull request envelope against `socket`'s key lookup,
-/// peer trust check, and coverage priming gate.
+/// Verify a signed pull request envelope against `socket`.
 pub fn authenticate_pull_request<S: MeshPullSocket + ?Sized>(
     socket: &S,
     bytes: &[u8],
@@ -371,144 +374,4 @@ pub fn authenticate_pull_request<S: MeshPullSocket + ?Sized>(
         Err(error) => return Err((StatusCode::INTERNAL_SERVER_ERROR, error.to_string())),
     }
     Ok((peer, request))
-}
-
-/// Server-side handler contract for [`PULL_PATH`] (`POST /mesh/pull`).
-pub trait PullHandler: Clone + Send + Sync + 'static {
-    /// Identity used to sign outgoing [`PullPage`] envelopes.
-    fn identity(&self) -> &DeviceIdentity;
-
-    /// Current Unix timestamp in milliseconds used to check request clock skew.
-    fn now_ms(&self) -> i64 {
-        unix_ms() as i64
-    }
-
-    /// HLC timestamp stamped onto outgoing [`PullPage`] envelopes.
-    fn response_hlc(&self) -> Hlc {
-        Hlc((self.now_ms().max(0) as u64) << 16)
-    }
-
-    /// Look up the pinned 33-byte compressed SEC1 public key for `peer`.
-    fn lookup_peer_sec1(&self, peer: &DeviceId) -> Result<Option<[u8; 33]>, String>;
-
-    /// Whether `peer` is trusted to pull from this node (defaults to `true`
-    /// once [`Self::lookup_peer_sec1`] returns a key).
-    fn is_peer_trusted(&self, _peer: &DeviceId) -> Result<bool, String> {
-        Ok(true)
-    }
-
-    /// Whether this node's origin coverage index is primed (defaults to `true`).
-    fn is_coverage_primed(&self) -> Result<bool, String> {
-        Ok(true)
-    }
-
-    /// Validate and record the caller's compaction acknowledgment before
-    /// building a page. Returning `Ok(Some(reset_page))` short-circuits page
-    /// construction with a signed reset response.
-    fn admit_pull_ack(
-        &self,
-        _peer: &DeviceId,
-        _request: &PullRequest,
-    ) -> impl Future<Output = Result<Option<PullPage>, String>> + Send {
-        async { Ok(None) }
-    }
-
-    /// Construct the response [`PullPage`] for an authenticated request.
-    fn serve_pull(&self, peer: &DeviceId, request: PullRequest) -> Result<PullPage, String>;
-}
-
-/// Mount `POST /mesh/pull` ([`PULL_PATH`]) backed by `handler`.
-pub fn pull_router<H: PullHandler>(handler: H) -> axum::Router {
-    async fn post_pull<H: PullHandler>(
-        State(handler): State<H>,
-        body: axum::body::Bytes,
-    ) -> Response {
-        let now_ms = handler.now_ms();
-        let mut lookup_error: Option<String> = None;
-        let (peer, request) =
-            match verify_pull_request(&body, now_ms, |id| match handler.lookup_peer_sec1(id) {
-                Ok(key) => Ok(key),
-                Err(error) => {
-                    lookup_error = Some(error.clone());
-                    Err(error)
-                }
-            }) {
-                Ok(verified) => verified,
-                Err(message) => {
-                    if let Some(error) = lookup_error {
-                        return (StatusCode::INTERNAL_SERVER_ERROR, error).into_response();
-                    }
-                    return (classify_pull_request_error(&message), message).into_response();
-                }
-            };
-        match handler.is_peer_trusted(&peer) {
-            Ok(true) => {}
-            Ok(false) => {
-                return (
-                    StatusCode::FORBIDDEN,
-                    "Pull requester is not a trusted device",
-                )
-                    .into_response();
-            }
-            Err(message) => return (StatusCode::INTERNAL_SERVER_ERROR, message).into_response(),
-        }
-        match handler.is_coverage_primed() {
-            Ok(true) => {}
-            Ok(false) => {
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "Origin coverage is still priming",
-                )
-                    .into_response();
-            }
-            Err(message) => return (StatusCode::INTERNAL_SERVER_ERROR, message).into_response(),
-        }
-        let page = match handler.admit_pull_ack(&peer, &request).await {
-            Ok(Some(reset)) => reset,
-            Ok(None) => match handler.serve_pull(&peer, request) {
-                Ok(page) => page,
-                Err(message) => {
-                    return (StatusCode::INTERNAL_SERVER_ERROR, message).into_response();
-                }
-            },
-            Err(message) => return (StatusCode::INTERNAL_SERVER_ERROR, message).into_response(),
-        };
-        match seal_pull_page(&page, handler.identity(), handler.response_hlc()) {
-            Ok(bytes) => (
-                StatusCode::OK,
-                [(header::CONTENT_TYPE, "application/octet-stream")],
-                bytes,
-            )
-                .into_response(),
-            Err(message) => (StatusCode::INTERNAL_SERVER_ERROR, message).into_response(),
-        }
-    }
-
-    axum::Router::new()
-        .route(PULL_PATH, post(post_pull::<H>))
-        .layer(DefaultBodyLimit::max(MAX_PULL_REQUEST_BYTES))
-        .with_state(handler)
-}
-
-impl<L: LogSource, D: DeviceBook> PullHandler for ServeState<L, D> {
-    fn identity(&self) -> &DeviceIdentity {
-        &self.identity
-    }
-
-    fn lookup_peer_sec1(&self, peer: &DeviceId) -> Result<Option<[u8; 33]>, String> {
-        self.relay_callers.try_key_for_device(peer)
-    }
-
-    fn admit_pull_ack(
-        &self,
-        peer: &DeviceId,
-        request: &PullRequest,
-    ) -> impl Future<Output = Result<Option<PullPage>, String>> + Send {
-        let result = admit_pull_ack(self, peer, request);
-        async move { result }
-    }
-
-    fn serve_pull(&self, peer: &DeviceId, request: PullRequest) -> Result<PullPage, String> {
-        build_pull_page(self, peer, &request)
-    }
 }
