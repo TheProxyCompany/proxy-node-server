@@ -98,8 +98,15 @@ impl ChatImportAdapter for ClaudeExportAdapter {
         }
         let raw = fs::read(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
         if raw.starts_with(b"PK\x03\x04") {
+            let entries = read_zip_entries(&raw, is_export_name)?;
+            if entries.is_empty() {
+                return Err(format!(
+                    "no conversations.json, projects.json, or projects/*.json in {}",
+                    path.display()
+                ));
+            }
             let mut out = Vec::new();
-            for (name, payload) in read_zip_entries(&raw, is_export_name)? {
+            for (name, payload) in entries {
                 let parsed = parse_anthropic_json(&payload, fallback_ts)
                     .map_err(|e| format!("{name}: {e}"))?;
                 out.extend(parsed);
@@ -121,8 +128,21 @@ fn export_files_in(dir: &Path) -> Vec<PathBuf> {
         .filter(|file| file.is_file())
         .collect();
     out.extend(sorted_dir_files(&dir.join("projects"), ".json"));
-    out.extend(sorted_dir_files(dir, ".zip"));
+    out.extend(
+        sorted_dir_files(dir, ".zip")
+            .into_iter()
+            .filter(|p| is_split_export_zip(p)),
+    );
     out
+}
+
+fn is_split_export_zip(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|name| {
+            let lower = name.to_ascii_lowercase();
+            lower.starts_with("conversations-") || lower.starts_with("projects-")
+        })
 }
 
 fn sorted_dir_files(dir: &Path, suffix: &str) -> Vec<PathBuf> {
