@@ -348,16 +348,31 @@ pub fn min_peer_ack(
     current_epoch: &[u8; 32],
     dormant_before: Option<&str>,
 ) -> Result<Option<u64>, GCError> {
+    min_peer_ack_with_ttl(conn, local_device, current_epoch, dormant_before, None)
+}
+
+pub fn min_peer_ack_with_ttl(
+    conn: &rusqlite::Connection,
+    local_device: &DeviceId,
+    current_epoch: &[u8; 32],
+    dormant_before: Option<&str>,
+    ack_cutoff_secs: Option<i64>,
+) -> Result<Option<u64>, GCError> {
     let peers = {
         let mut stmt = conn
             .prepare(
-                "SELECT device_id, last_seen_at FROM devices
-                 WHERE trusted = 1 AND device_id != ?1",
+                "SELECT device_id, first_seen_at, last_seen_at FROM devices
+                 WHERE trusted = 1 AND device_id != ?1
+                   AND COALESCE(introduced_by, '') != 'local-history'",
             )
             .map_err(|e| GCError::Other(format!("peer ack peers prepare: {e}")))?;
         let rows = stmt
             .query_map(params![local_device.to_hex()], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
             })
             .map_err(|e| GCError::Other(format!("peer ack peers query: {e}")))?;
         let mut peers = Vec::new();
@@ -372,35 +387,42 @@ pub fn min_peer_ack(
 
     let mut stmt = conn
         .prepare(
-            "SELECT acked_relay_seq FROM oplog_db.mesh_peer_acks
+            "SELECT acked_relay_seq, CAST(strftime('%s', updated_at) AS INTEGER)
+             FROM oplog_db.mesh_peer_acks
              WHERE peer_device_id = ?1 AND stream_epoch = ?2",
         )
         .map_err(|e| GCError::Other(format!("peer ack prepare: {e}")))?;
     let mut floor = u64::MAX;
-    for (peer, last_seen_at) in &peers {
+    for (peer, first_seen_at, last_seen_at) in &peers {
         let Ok(peer) = DeviceId::from_hex(peer) else {
-            // A malformed row cannot be shown to have walked anything.
             return Ok(Some(0));
         };
-        let acked: Option<i64> = stmt
+        let acked: Option<(i64, Option<i64>)> = stmt
             .query_row(
                 params![peer.as_bytes().as_slice(), current_epoch.as_slice()],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
             .map_err(|e| GCError::Other(format!("peer ack lookup: {e}")))?;
-        let Some(acked) = acked else {
-            // RFC3339 UTC strings compare lexicographically.
-            if dormant_before.is_some_and(|cutoff| last_seen_at.as_str() < cutoff) {
+        let Some((acked, updated_secs)) = acked else {
+            let dormant = dormant_before.is_some_and(|cutoff| {
+                last_seen_at.as_str() < cutoff
+                    || (ack_cutoff_secs.is_some() && first_seen_at.as_str() < cutoff)
+            });
+            if dormant {
                 continue;
             }
             return Ok(Some(0));
         };
-        // A dead pairing that left an ack row before dying is just as gone as
-        // a rowless one: its frozen cursor would pin the floor forever. Same
-        // dormancy contract as above — a resurrected peer refills the pruned
-        // window per-origin.
-        if dormant_before.is_some_and(|cutoff| last_seen_at.as_str() < cutoff) {
+        if let Some(cutoff_secs) = ack_cutoff_secs {
+            if updated_secs.is_some_and(|ts| ts < cutoff_secs) {
+                continue;
+            }
+        }
+        if dormant_before.is_some_and(|cutoff| last_seen_at.as_str() < cutoff)
+            && ack_cutoff_secs
+                .is_none_or(|cutoff_secs| updated_secs.is_none_or(|ts| ts < cutoff_secs))
+        {
             continue;
         }
         floor = floor.min(acked.max(0) as u64);

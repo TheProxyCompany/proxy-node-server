@@ -138,7 +138,8 @@ pub fn build_keyed_channel<S: MeshPullSocket + ?Sized>(
         let count_exhausted = fetched == remaining;
         remaining -= consumed;
         if count_exhausted || consumed < fetched || bytes >= byte_budget {
-            return Ok((keyed, Some(keyed_resume(origin, last_key))));
+            let token_key = last_key.or(if resumed_here { resume_key } else { None });
+            return Ok((keyed, Some(keyed_resume(origin, token_key))));
         }
     }
     Ok((keyed, None))

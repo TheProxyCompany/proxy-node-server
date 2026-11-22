@@ -10,6 +10,7 @@ pub mod oplog_heads;
 pub mod oplog_queries;
 pub mod pending_edges;
 pub mod retention;
+pub mod retention_ops;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SqliteError {
