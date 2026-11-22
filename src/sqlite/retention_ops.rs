@@ -253,6 +253,21 @@ pub fn compaction_candidates(
     })
 }
 
+/// Pin clauses shared by the three per-chunk statements in
+/// `delete_ops_subchunk`: graph edges, undispatched Move callbacks, queued
+/// proxydb projections, and the proxy.db replay queue. The replay-queue leg
+/// must stay a correlated `NOT EXISTS`: `state != 'failed'` cannot use
+/// `idx_external_row_replay_state`, so `NOT IN` plans as a full-table LIST
+/// SUBQUERY per statement (three scans of an 8.2M-row queue per 500-op chunk
+/// on the live fleet; proxy-node-server#21).
+const CHUNK_PINS: &str = "NOT IN (SELECT edge_op_id FROM oplog_db.pending_graph_edges)
+            AND {alias}.op_id NOT IN
+                (SELECT resolution_op_id FROM oplog_db.move_callback_fires WHERE dispatched = 0)
+            AND {alias}.op_id NOT IN
+                (SELECT op_id FROM oplog_db.proxydb_projection_queue)
+            AND NOT EXISTS (SELECT 1 FROM external_row_replay_queue AS rq
+                            WHERE rq.op_id = {alias}.op_id AND rq.state != 'failed')";
+
 pub fn delete_ops_chunk(
     conn: &rusqlite::Connection,
     chunk: &[(OpId, i64)],
@@ -297,13 +312,7 @@ fn delete_ops_subchunk(
         .iter()
         .map(|(op_id, _)| op_id.as_bytes().to_vec())
         .collect::<Vec<_>>();
-    let pins = "NOT IN (SELECT edge_op_id FROM oplog_db.pending_graph_edges)
-                AND {alias}.op_id NOT IN
-                    (SELECT resolution_op_id FROM oplog_db.move_callback_fires WHERE dispatched = 0)
-                AND {alias}.op_id NOT IN
-                    (SELECT op_id FROM oplog_db.proxydb_projection_queue)
-                AND {alias}.op_id NOT IN
-                    (SELECT op_id FROM external_row_replay_queue WHERE state != 'failed')";
+    let pins = CHUNK_PINS;
     let oplog_pins = pins.replace("{alias}", "oplog");
     let arrival_pins = pins.replace("{alias}", "oplog_arrivals");
     let oplog_head_pin = format!(
@@ -441,4 +450,242 @@ fn trim_upsert_head_payloads(
         }
     }
     Ok(())
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Minimal schema with the exact production DDL (read live 2026-11-22):
+    /// the main database carries `external_row_replay_queue` (grand-central
+    /// migration v105; `op_id BLOB NOT NULL UNIQUE` yields
+    /// `sqlite_autoindex_external_row_replay_queue_1` for the pin probe);
+    /// `oplog_db` carries the mesh tables `delete_ops_chunk` touches.
+    fn replay_test_conn() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("ATTACH ':memory:' AS oplog_db").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE external_row_replay_queue (
+                replay_id   INTEGER PRIMARY KEY AUTOINCREMENT,
+                op_id       BLOB NOT NULL UNIQUE,
+                envelope    BLOB NOT NULL,
+                origin      INTEGER NOT NULL CHECK (origin IN (0, 1)),
+                attempts    INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+                state       TEXT NOT NULL DEFAULT 'pending'
+                            CHECK (state IN ('pending', 'covered', 'failed')),
+                retry_at    INTEGER NOT NULL DEFAULT 0,
+                last_error  TEXT,
+                queued_at   TEXT NOT NULL,
+                updated_at  TEXT NOT NULL
+            );
+            CREATE INDEX idx_external_row_replay_state
+                ON external_row_replay_queue(state, replay_id);
+            CREATE TABLE oplog_db.oplog (
+                op_id        BLOB PRIMARY KEY,
+                hlc          INTEGER NOT NULL,
+                device_id    BLOB NOT NULL,
+                store_id     TEXT NOT NULL,
+                payload      BLOB NOT NULL,
+                envelope     BLOB NOT NULL,
+                table_name   TEXT NOT NULL,
+                row_pk       TEXT NOT NULL,
+                origin       INTEGER NOT NULL,
+                applied      INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE oplog_db.oplog_arrivals (
+                relay_seq  INTEGER PRIMARY KEY AUTOINCREMENT,
+                op_id      BLOB NOT NULL UNIQUE REFERENCES oplog(op_id) ON DELETE CASCADE,
+                arrived_at INTEGER NOT NULL
+            );
+            CREATE TABLE oplog_db.mesh_relay_state (
+                singleton             INTEGER PRIMARY KEY CHECK (singleton = 1),
+                stream_epoch          BLOB NOT NULL CHECK (length(stream_epoch) = 32),
+                compacted_through_seq INTEGER NOT NULL DEFAULT 0 CHECK (compacted_through_seq >= 0)
+            );
+            CREATE TABLE oplog_db.pending_graph_edges (
+                endpoint_id TEXT NOT NULL,
+                edge_op_id  BLOB NOT NULL,
+                PRIMARY KEY (endpoint_id, edge_op_id)
+            );
+            CREATE TABLE oplog_db.move_callback_fires (
+                move_id          TEXT PRIMARY KEY,
+                resolution_op_id BLOB NOT NULL,
+                fired_at         TEXT NOT NULL,
+                dispatched       INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE oplog_db.proxydb_projection_queue (
+                projection_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                op_id           BLOB NOT NULL UNIQUE REFERENCES oplog(op_id) ON DELETE CASCADE
+            );
+            CREATE TABLE oplog_db.oplog_heads (
+                store_id      TEXT NOT NULL,
+                table_name    TEXT NOT NULL,
+                row_pk        TEXT NOT NULL,
+                hlc           INTEGER NOT NULL,
+                device_id     BLOB NOT NULL,
+                op_id         BLOB NOT NULL,
+                payload       BLOB NOT NULL,
+                origin_device BLOB,
+                PRIMARY KEY (store_id, table_name, row_pk)
+            );
+            CREATE TABLE oplog_db.mesh_verified_ops (
+                op_id            BLOB PRIMARY KEY REFERENCES oplog(op_id) ON DELETE CASCADE,
+                envelope_sha256  BLOB NOT NULL CHECK (length(envelope_sha256) = 32)
+            );",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn seed_op(conn: &rusqlite::Connection, tag: u8) -> OpId {
+        let op_id = OpId::from_bytes([tag; 32]);
+        conn.execute(
+            "INSERT INTO oplog_db.oplog
+             (op_id, hlc, device_id, store_id, payload, envelope, table_name, row_pk, origin, applied)
+             VALUES (?1, 1, ?2, 'mesh', X'00', X'00', 'nodes', ?3, 0, 1)",
+            params![op_id.as_bytes().to_vec(), vec![7u8; 32], format!("row-{tag}")],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO oplog_db.oplog_arrivals (op_id, arrived_at) VALUES (?1, 1)",
+            params![op_id.as_bytes().to_vec()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO oplog_db.mesh_verified_ops (op_id, envelope_sha256) VALUES (?1, ?2)",
+            params![op_id.as_bytes().to_vec(), vec![3u8; 32]],
+        )
+        .unwrap();
+        op_id
+    }
+
+    fn surviving_oplog_ids(conn: &rusqlite::Connection) -> Vec<Vec<u8>> {
+        let mut stmt = conn
+            .prepare("SELECT op_id FROM oplog_db.oplog ORDER BY op_id")
+            .unwrap();
+        stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    /// pns#21 regression, behavioral leg: a chunk handed DIRECTLY to
+    /// `delete_ops_chunk` must keep every op still pinned in the proxy.db
+    /// replay queue. The scan phase pre-filters pinned ops
+    /// (`compaction_candidates`), so end-to-end compaction tests never reach
+    /// this guard and pass even with it neutralized; only a direct chunk with
+    /// a pinned id exercises it. Neutralizing the pin (`AND 1 = 1`) must fail
+    /// this test.
+    #[test]
+    fn delete_ops_chunk_keeps_ops_pinned_in_replay_queue() {
+        let conn = replay_test_conn();
+        conn.execute(
+            "INSERT INTO oplog_db.mesh_relay_state (singleton, stream_epoch, compacted_through_seq)
+             VALUES (1, ?1, 0)",
+            params![vec![9u8; 32]],
+        )
+        .unwrap();
+        let pending = seed_op(&conn, 0xA1);
+        let covered = seed_op(&conn, 0xB2);
+        let failed = seed_op(&conn, 0xC3);
+        let unpinned = seed_op(&conn, 0xD4);
+        for (op_id, state) in [
+            (&pending, "pending"),
+            (&covered, "covered"),
+            (&failed, "failed"),
+        ] {
+            conn.execute(
+                "INSERT INTO external_row_replay_queue (op_id, envelope, origin, state, queued_at, updated_at)
+                 VALUES (?1, X'00', 0, ?2, 't', 't')",
+                params![op_id.as_bytes().to_vec(), state],
+            )
+            .unwrap();
+        }
+
+        let (deleted, _bytes) = delete_ops_chunk(
+            &conn,
+            &[(pending, 1), (covered, 2), (failed, 3), (unpinned, 4)],
+        )
+        .unwrap();
+
+        assert_eq!(deleted, 2, "only the failed and unpinned ops may delete");
+        assert_eq!(
+            surviving_oplog_ids(&conn),
+            vec![pending.as_bytes().to_vec(), covered.as_bytes().to_vec()],
+            "pending and covered replay rows must keep their ops",
+        );
+        let arrivals_left: i64 = conn
+            .query_row("SELECT COUNT(*) FROM oplog_db.oplog_arrivals", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(arrivals_left, 2, "pinned arrivals survive");
+        let verified_left: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM oplog_db.mesh_verified_ops",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(verified_left, 2, "verified markers follow their ops");
+        let floor: i64 = conn
+            .query_row(
+                "SELECT compacted_through_seq FROM oplog_db.mesh_relay_state WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(floor, 4, "floor advances past the deleted arrivals only");
+    }
+
+    /// pns#21 regression, plan leg: the replay-queue pin must compile to an
+    /// index probe, never a full scan of `external_row_replay_queue` (the
+    /// NOT IN form materializes all 8.2M queued rows into a LIST SUBQUERY
+    /// plus bloom filter, three times per 500-op chunk; the live 110-190 s
+    /// writer holds). Reverting `CHUNK_PINS` to NOT IN keeps the behavioral
+    /// test green (the semantics match) and must fail this test, so the
+    /// performance property is pinned too. The sibling pin tables
+    /// (`pending_graph_edges`, `move_callback_fires`; 4 and 102 rows live)
+    /// intentionally plan as small LIST SUBQUERY scans and are not covered
+    /// by these assertions. The head-pin text below mirrors
+    /// `delete_ops_subchunk`; the clause under test comes from `CHUNK_PINS`
+    /// itself so it cannot drift from production.
+    #[test]
+    fn replay_queue_pin_plans_as_index_probe_not_list_subquery() {
+        let conn = replay_test_conn();
+        let oplog_pins = CHUNK_PINS.replace("{alias}", "oplog");
+        let oplog_head_pin = format!(
+            "({} OR NOT EXISTS (
+                 SELECT 1 FROM oplog_db.oplog_heads AS heads
+                 WHERE heads.store_id = oplog.store_id
+                   AND heads.table_name = oplog.table_name
+                   AND heads.row_pk = oplog.row_pk
+                   AND heads.op_id = oplog.op_id
+             ))",
+            self_draining_sql("oplog")
+        );
+        let sql = format!(
+            "EXPLAIN QUERY PLAN
+             DELETE FROM oplog_db.oplog
+             WHERE op_id IN (?1, ?2, ?3, ?4) AND oplog.op_id {oplog_pins}
+               AND {oplog_head_pin}"
+        );
+        let ids: Vec<Vec<u8>> = (0u8..4).map(|b| vec![b; 32]).collect();
+        let mut stmt = conn.prepare(&sql).unwrap();
+        let plan = stmt
+            .query_map(params_from_iter(ids.iter()), |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .join("\n");
+        assert!(
+            plan.contains(
+                "SEARCH rq USING INDEX sqlite_autoindex_external_row_replay_queue_1 (op_id=?)"
+            ),
+            "pin must probe the replay queue's op_id unique index:\n{plan}"
+        );
+        assert!(
+            !plan.contains("SCAN external_row_replay_queue") && !plan.contains("SCAN rq\n"),
+            "pin must never scan the replay queue (NOT IN materializes all 8.2M rows):\n{plan}"
+        );
+    }
 }
