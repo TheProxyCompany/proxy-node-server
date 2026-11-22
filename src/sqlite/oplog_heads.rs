@@ -1,4 +1,4 @@
-//! Maintenance of `oplog_heads` — the materialized LWW winner per
+//! Maintenance of `oplog_heads`: the materialized LWW winner per
 //! `(store, table, row_pk)`. Every mutation runs pure SQL on the caller's
 //! connection so it composes with whatever transaction wraps the oplog write.
 
@@ -9,24 +9,45 @@ use super::SqliteError as GCError;
 
 /// Maintain the row's materialized LWW head in `oplog_heads` for an applied op:
 /// insert the head, or advance it iff the op's `(hlc, device_id, op_id)` order
-/// key beats the stored one — the same total order every LWW reader uses.
+/// key beats the stored one, using the same total order every LWW reader uses.
 ///
-/// `origin_device` tracks the row's *earliest* applied op's device (the value
-/// [`origin_device`] historically derived by ASC scan): it is overwritten only
-/// when the incoming op orders below every other applied op for the row, so an
-/// out-of-order older arrival (a creation filling in after its resolution)
-/// corrects it, while after compaction drops the true-earliest op the stored
-/// fact persists — no surviving op undercuts the minimum. Pure SQL on the
-/// caller's connection: it runs inside whatever transaction wraps the oplog
-/// write, never opening its own. Called from [`append`] (every new op is
-/// inserted `applied = 1`) and from the deferred external-row canonicalization
-/// path when it re-marks a demoted op applied under its canonical projection.
+/// `origin_device` tracks the row's earliest applied op's device. Once horizon
+/// compaction prunes historical ops from `oplog_db.oplog`, `origin_device` must
+/// never be overwritten by a newer head update; it only updates when `origin_device`
+/// is missing or when an out-of-order incoming op orders strictly below both the
+/// stored head and any surviving applied ops for the row.
 pub fn upsert_head(
     conn: &rusqlite::Connection,
     op: &SignedOp,
     table: &str,
     row_pk: &str,
 ) -> Result<(), GCError> {
+    conn.prepare_cached(
+        "UPDATE oplog_db.oplog_heads SET origin_device = ?5
+         WHERE store_id = ?1 AND table_name = ?2 AND row_pk = ?3
+           AND (
+             origin_device IS NULL
+             OR (
+               (?4, ?5, ?6) < (oplog_heads.hlc, oplog_heads.device_id, oplog_heads.op_id)
+               AND NOT EXISTS (
+                 SELECT 1 FROM oplog_db.oplog INDEXED BY idx_oplog_lww
+                 WHERE store_id = ?1 AND table_name = ?2 AND row_pk = ?3 AND applied = 1
+                   AND (hlc, device_id, op_id) < (?4, ?5, ?6)
+               )
+             )
+           )",
+    )
+    .and_then(|mut stmt| {
+        stmt.execute(params![
+            op.body.store.as_str(),
+            table,
+            row_pk,
+            op.body.hlc.0 as i64,
+            op.body.device.as_bytes().as_slice(),
+            op.id.as_bytes().as_slice(),
+        ])
+    })
+    .map_err(|e| GCError::Other(format!("oplog head origin: {e}")))?;
     conn.prepare_cached(
         "INSERT INTO oplog_db.oplog_heads
             (store_id, table_name, row_pk, hlc, device_id, op_id, payload, origin_device)
@@ -51,26 +72,6 @@ pub fn upsert_head(
         ])
     })
     .map_err(|e| GCError::Other(format!("oplog upsert head: {e}")))?;
-    conn.prepare_cached(
-        "UPDATE oplog_db.oplog_heads SET origin_device = ?5
-         WHERE store_id = ?1 AND table_name = ?2 AND row_pk = ?3
-           AND NOT EXISTS (
-             SELECT 1 FROM oplog_db.oplog INDEXED BY idx_oplog_lww
-             WHERE store_id = ?1 AND table_name = ?2 AND row_pk = ?3 AND applied = 1
-               AND (hlc, device_id, op_id) < (?4, ?5, ?6)
-           )",
-    )
-    .and_then(|mut stmt| {
-        stmt.execute(params![
-            op.body.store.as_str(),
-            table,
-            row_pk,
-            op.body.hlc.0 as i64,
-            op.body.device.as_bytes().as_slice(),
-            op.id.as_bytes().as_slice(),
-        ])
-    })
-    .map_err(|e| GCError::Other(format!("oplog head origin: {e}")))?;
     Ok(())
 }
 
@@ -175,21 +176,39 @@ pub fn demote_head(conn: &rusqlite::Connection, op_id: &OpId) -> Result<(), GCEr
     Ok(())
 }
 
-/// Re-derive one row's `oplog_heads` entry from scratch — head values and
-/// `origin_device` both — or drop it when the row has no applied ops. Used when
-/// ops *move between row partitions*: an alias merge
-/// ([`crate::database::external_row_ids::remember_alias`]) rewrites `row_pk` on
-/// existing oplog rows, which the incremental [`upsert_head`]/[`demote_head`]
-/// maintenance never sees. The origin is re-derived by ASC scan of the merged
-/// partition; the compactor pins every row's earliest applied op, so the scan
-/// still names the true minimum after pruning. Runs on the caller's connection,
-/// inside whatever transaction rewrote the partition.
+/// Re-derive one row's `oplog_heads` entry when ops move between row partitions
+/// (for example external-row alias folding). If the existing head's op was
+/// already horizon-pruned from `oplog_db.oplog`, that compacted head is preserved
+/// unless a surviving applied op in `oplog` outranks it.
 pub fn rebuild_head(
     conn: &rusqlite::Connection,
     store: &str,
     table: &str,
     row_pk: &str,
 ) -> Result<(), GCError> {
+    let existing_pruned_head: Option<(i64, Vec<u8>, Vec<u8>, Vec<u8>, Option<Vec<u8>>)> = conn
+        .prepare_cached(
+            "SELECT h.hlc, h.device_id, h.op_id, h.payload, h.origin_device
+             FROM oplog_db.oplog_heads AS h
+             WHERE h.store_id = ?1 AND h.table_name = ?2 AND h.row_pk = ?3
+               AND NOT EXISTS (
+                   SELECT 1 FROM oplog_db.oplog AS o WHERE o.op_id = h.op_id
+               )",
+        )
+        .and_then(|mut stmt| {
+            stmt.query_row(params![store, table, row_pk], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .optional()
+        })
+        .map_err(|e| GCError::Other(format!("oplog rebuild existing head: {e}")))?;
+
     let newest: Option<(i64, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> = conn
         .prepare_cached(
             "SELECT hlc, device_id, op_id, payload, envelope
@@ -211,7 +230,15 @@ pub fn rebuild_head(
             .optional()
         })
         .map_err(|e| GCError::Other(format!("oplog rebuild head select: {e}")))?;
+
     if let Some((hlc, device_id, op_id, payload, envelope)) = newest {
+        if let Some((h_hlc, ref h_dev, ref h_op, _, _)) = existing_pruned_head {
+            if (h_hlc, h_dev.as_slice(), h_op.as_slice())
+                >= (hlc, device_id.as_slice(), op_id.as_slice())
+            {
+                return Ok(());
+            }
+        }
         let resolved_payload = if !payload.is_empty() {
             payload
         } else {
@@ -219,15 +246,19 @@ pub fn rebuild_head(
                 .map(|op| op.body.payload)
                 .unwrap_or_default()
         };
+        let preserved_origin = existing_pruned_head.and_then(|(_, _, _, _, origin)| origin);
         conn.prepare_cached(
             "INSERT OR REPLACE INTO oplog_db.oplog_heads
                 (store_id, table_name, row_pk, hlc, device_id, op_id, payload, origin_device)
              VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7,
-                (SELECT device_id FROM oplog_db.oplog INDEXED BY idx_oplog_lww
-                 WHERE store_id = ?1 AND table_name = ?2 AND row_pk = ?3 AND applied = 1
-                 ORDER BY hlc ASC, device_id ASC, op_id ASC
-                 LIMIT 1)
+                COALESCE(
+                    ?8,
+                    (SELECT device_id FROM oplog_db.oplog INDEXED BY idx_oplog_lww
+                     WHERE store_id = ?1 AND table_name = ?2 AND row_pk = ?3 AND applied = 1
+                     ORDER BY hlc ASC, device_id ASC, op_id ASC
+                     LIMIT 1)
+                )
              )",
         )
         .and_then(|mut stmt| {
@@ -238,11 +269,12 @@ pub fn rebuild_head(
                 hlc,
                 device_id,
                 op_id,
-                resolved_payload
+                resolved_payload,
+                preserved_origin,
             ])
         })
         .map_err(|e| GCError::Other(format!("oplog rebuild head: {e}")))?;
-    } else {
+    } else if existing_pruned_head.is_none() {
         conn.prepare_cached(
             "DELETE FROM oplog_db.oplog_heads
              WHERE store_id = ?1 AND table_name = ?2 AND row_pk = ?3",

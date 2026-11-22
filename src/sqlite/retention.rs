@@ -3,16 +3,20 @@
 use std::time::Duration;
 
 use crate::{DeviceId, Hlc, OpId, OrderKey};
-use rusqlite::{OptionalExtension, params, params_from_iter};
+use rusqlite::{OptionalExtension, params};
 
 use super::SqliteError as GCError;
 use super::coverage;
+use super::retention_pins::{PinTables, store_head_op_ids};
 
 pub use super::retention_ops::{
-    CompactionProbeIndex, CompactionScan, compaction_candidates, delete_ops_chunk,
+    CompactionProbeIndex, CompactionScan, OrphanOplogScan, compaction_candidates,
+    compaction_candidates_with_lww, delete_ops_chunk, delete_ops_chunk_with_floor,
+    orphan_oplog_candidates,
 };
 
 pub const VERIFIED_OPS_SCAN_CURSOR_KEY: &str = "retention.verified_ops_scan_after";
+pub const ORPHAN_OPLOG_SCAN_CURSOR_KEY: &str = "retention.orphan_oplog_scan_after";
 
 /// Default retention horizon (7 days).
 pub const DEFAULT_RETENTION_HORIZON: Duration = Duration::from_secs(7 * 24 * 60 * 60);
@@ -92,11 +96,13 @@ pub fn delete_row_below(
         let sql = if keep.is_some() {
             "SELECT op_id FROM oplog_db.oplog
              WHERE store_id = ?1 AND table_name = ?2 AND row_pk = ?3
+               AND applied = 1
                AND (hlc, device_id, op_id) < (?4, ?5, ?6)
                AND op_id != ?7"
         } else {
             "SELECT op_id FROM oplog_db.oplog
              WHERE store_id = ?1 AND table_name = ?2 AND row_pk = ?3
+               AND applied = 1
                AND (hlc, device_id, op_id) < (?4, ?5, ?6)"
         };
         let mut stmt = conn
@@ -136,42 +142,22 @@ pub fn delete_row_below(
     if candidate_ids.is_empty() {
         return Ok(0);
     }
-    let has_verified = super::retention_ops::table_exists(conn, "mesh_verified_ops")?;
-    let has_quarantine = super::retention_ops::table_exists(conn, "mesh_unverified_ops")?;
+    let tables = PinTables::detect(conn)?;
+    let store_heads = store_head_op_ids(conn, &tables)?;
+    let filtered: Vec<Vec<u8>> = candidate_ids
+        .into_iter()
+        .filter(|raw| {
+            <[u8; 32]>::try_from(raw.as_slice()).is_ok_and(|arr| !store_heads.contains(&arr))
+        })
+        .collect();
+    if filtered.is_empty() {
+        return Ok(0);
+    }
     let mut deleted = 0usize;
-    for chunk in candidate_ids.chunks(DELETE_CHUNK) {
-        let placeholders = std::iter::repeat_n("?", chunk.len())
-            .collect::<Vec<_>>()
-            .join(", ");
-        deleted += conn
-            .execute(
-                &format!("DELETE FROM oplog_db.oplog WHERE op_id IN ({placeholders})"),
-                params_from_iter(chunk.iter().map(Vec::as_slice)),
-            )
-            .map_err(|e| GCError::Other(format!("retention prune delete: {e}")))?;
-        if has_verified {
-            let quarantine_guard = if has_quarantine {
-                "AND NOT EXISTS (
-                     SELECT 1 FROM oplog_db.mesh_unverified_ops AS q
-                     WHERE q.claimed_op_id = mesh_verified_ops.op_id
-                 )"
-            } else {
-                ""
-            };
-            conn.execute(
-                &format!(
-                    "DELETE FROM oplog_db.mesh_verified_ops
-                     WHERE op_id IN ({placeholders})
-                       AND NOT EXISTS (
-                           SELECT 1 FROM oplog_db.oplog AS o
-                           WHERE o.op_id = mesh_verified_ops.op_id
-                       )
-                       {quarantine_guard}"
-                ),
-                params_from_iter(chunk.iter().map(Vec::as_slice)),
-            )
-            .map_err(|e| GCError::Other(format!("retention verified_ops prune: {e}")))?;
-        }
+    for chunk in filtered.chunks(DELETE_CHUNK) {
+        let (sub_deleted, _, _) =
+            super::retention_ops::delete_ops_ids(conn, chunk, &tables, false)?;
+        deleted += sub_deleted;
     }
     Ok(deleted)
 }
@@ -203,6 +189,7 @@ pub struct OplogCompaction {
     pub vacuumed_pages: usize,
     pub used_legacy_lww_index: bool,
     pub relay_floor: u64,
+    pub orphan_oplog_cursor_active: bool,
     pub bounds: CompactionBounds,
 }
 
@@ -212,6 +199,9 @@ pub struct CompactionBounds {
     pub horizon_floor: i64,
     pub ack_floor: i64,
     pub safe_floor: i64,
+    pub lww_floor: i64,
+    pub horizon_hlc_max: i64,
+    pub ack_covers_horizon: bool,
     pub scan_resumed_after: i64,
     pub scanned: usize,
     pub candidates: usize,
@@ -332,6 +322,11 @@ pub fn safe_relay_floor(
         .map_err(|e| GCError::Other(format!("compaction peer count: {e}")))?;
     let now = chrono::Utc::now();
     let cutoff = now.timestamp() - horizon.as_secs() as i64;
+    let horizon_hlc_max = if cutoff > 0 {
+        (((cutoff as u64) << HLC_SECONDS_SHIFT) | 0xffff_ffff).min(i64::MAX as u64) as i64
+    } else {
+        0
+    };
     let horizon_floor = horizon_relay_floor(conn, cutoff)?;
     if peers == 0 {
         return Ok(CompactionBounds {
@@ -339,6 +334,9 @@ pub fn safe_relay_floor(
             horizon_floor,
             ack_floor: 0,
             safe_floor: horizon_floor,
+            lww_floor: horizon_floor,
+            horizon_hlc_max,
+            ack_covers_horizon: true,
             ..Default::default()
         });
     }
@@ -346,20 +344,35 @@ pub fn safe_relay_floor(
     let ack_ttl = horizon.min(PEER_ACK_TTL);
     let ack_cutoff_secs = now.timestamp() - ack_ttl.as_secs() as i64;
     let dormant_before = (now - chrono::Duration::seconds(ack_ttl.as_secs() as i64)).to_rfc3339();
-    let ack = coverage::min_peer_ack_with_ttl(
+    let active_ack = coverage::min_peer_ack_with_ttl(
         conn,
         local_device,
         &epoch,
         Some(&dormant_before),
         Some(ack_cutoff_secs),
-    )?
-    .unwrap_or(0);
+    )?;
+    let Some(ack) = active_ack else {
+        return Ok(CompactionBounds {
+            peers,
+            horizon_floor,
+            ack_floor: 0,
+            safe_floor: horizon_floor,
+            lww_floor: horizon_floor,
+            horizon_hlc_max,
+            ack_covers_horizon: true,
+            ..Default::default()
+        });
+    };
     let ack_floor = i64::try_from(ack).unwrap_or(i64::MAX);
+    let safe_floor = horizon_floor.min(ack_floor);
     Ok(CompactionBounds {
         peers,
         horizon_floor,
         ack_floor,
-        safe_floor: horizon_floor.max(ack_floor),
+        safe_floor,
+        lww_floor: safe_floor.max(ack_floor),
+        horizon_hlc_max,
+        ack_covers_horizon: ack_floor >= horizon_floor,
         ..Default::default()
     })
 }
