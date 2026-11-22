@@ -231,13 +231,6 @@ pub fn current_relay_floor(conn: &rusqlite::Connection) -> Result<u64, GCError> 
     .map_err(|e| GCError::Other(format!("compaction floor readback: {e}")))
 }
 
-/// Enable `PRAGMA oplog_db.auto_vacuum = INCREMENTAL` on a brand-new empty `oplog.db`
-/// before its page header is initialized.
-pub fn enable_incremental_auto_vacuum(conn: &rusqlite::Connection) -> Result<(), GCError> {
-    conn.execute_batch("PRAGMA oplog_db.auto_vacuum = INCREMENTAL;")
-        .map_err(|e| GCError::Other(format!("enable oplog_db incremental auto_vacuum: {e}")))
-}
-
 /// Reclaim up to `max_pages` freelist pages from `oplog_db` when `auto_vacuum = INCREMENTAL`.
 pub fn incremental_vacuum_oplog(
     conn: &rusqlite::Connection,

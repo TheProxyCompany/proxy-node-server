@@ -58,21 +58,28 @@ pub(crate) fn table_exists(conn: &rusqlite::Connection, name: &str) -> Result<bo
     .map_err(|e| GCError::Other(format!("probe oplog_db table {name}: {e}")))
 }
 
-fn is_self_draining_bulk_table(store: &str, table: &str) -> bool {
-    store == "proxydb"
-        && matches!(
-            table,
-            "items" | "sequences" | "conversation_jobs" | "message_attachments"
-        )
-}
-
-const SELF_DRAINING_SQL_FILTER: &str = "(store_id = 'proxydb' AND table_name IN ('items', 'sequences', 'conversation_jobs', 'message_attachments'))";
-const SELF_DRAINING_HEAD_TRIM_TABLES: &[&str] = &[
+/// `proxydb` tables whose rows are replaced wholesale, so the head op of a row
+/// may be pruned like any other. Every other table keeps its live head.
+const SELF_DRAINING_TABLES: &[&str] = &[
     "items",
     "sequences",
     "conversation_jobs",
     "message_attachments",
 ];
+
+fn is_self_draining_bulk_table(store: &str, table: &str) -> bool {
+    store == "proxydb" && SELF_DRAINING_TABLES.contains(&table)
+}
+
+/// SQL predicate that is true when the `alias` row belongs to a self-draining table.
+fn self_draining_sql(alias: &str) -> String {
+    let tables = SELF_DRAINING_TABLES
+        .iter()
+        .map(|table| format!("'{table}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("({alias}.store_id = 'proxydb' AND {alias}.table_name IN ({tables}))")
+}
 
 pub fn compaction_candidates(
     conn: &rusqlite::Connection,
@@ -300,15 +307,17 @@ fn delete_ops_subchunk(
     let oplog_pins = pins.replace("{alias}", "oplog");
     let arrival_pins = pins.replace("{alias}", "oplog_arrivals");
     let oplog_head_pin = format!(
-        "({SELF_DRAINING_SQL_FILTER} OR NOT EXISTS (
+        "({} OR NOT EXISTS (
              SELECT 1 FROM oplog_db.oplog_heads AS heads
              WHERE heads.store_id = oplog.store_id
                AND heads.table_name = oplog.table_name
                AND heads.row_pk = oplog.row_pk
                AND heads.op_id = oplog.op_id
-         ))"
+         ))",
+        self_draining_sql("oplog")
     );
-    let arrival_head_pin = "NOT EXISTS (
+    let arrival_head_pin = format!(
+        "NOT EXISTS (
              SELECT 1
              FROM oplog_db.oplog AS pinned_op
              JOIN oplog_db.oplog_heads AS heads
@@ -317,8 +326,10 @@ fn delete_ops_subchunk(
               AND heads.row_pk = pinned_op.row_pk
               AND heads.op_id = pinned_op.op_id
              WHERE pinned_op.op_id = oplog_arrivals.op_id
-               AND NOT (pinned_op.store_id = 'proxydb' AND pinned_op.table_name IN ('items', 'sequences', 'conversation_jobs', 'message_attachments'))
-         )";
+               AND NOT {}
+         )",
+        self_draining_sql("pinned_op")
+    );
 
     let (bytes, floor): (i64, i64) = conn
         .query_row(
@@ -418,7 +429,7 @@ fn trim_upsert_head_payloads(
     for row in rows {
         let (store_id, table_name, row_pk, payload) =
             row.map_err(|e| GCError::Other(format!("compaction head trim row: {e}")))?;
-        if !SELF_DRAINING_HEAD_TRIM_TABLES.contains(&table_name.as_str()) {
+        if !SELF_DRAINING_TABLES.contains(&table_name.as_str()) {
             continue;
         }
         if let Ok(decoded) = crate::row_op::ProxyDbOp::decode_bytes(&payload) {
