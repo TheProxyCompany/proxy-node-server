@@ -216,9 +216,9 @@ where
     Ok(reset)
 }
 
-/// Apply one verified [`PullPage`] through `socket`. Channel B advances the
-/// durable relay cursor and folds `next_relay_seq`; Channel A advances one
-/// coverage claim per origin run over its claim-safe prefix.
+/// Apply one verified [`PullPage`] through `socket`. Channel A goes first and
+/// advances one coverage claim per origin run; Channel B then saves the relay
+/// cursor per row, which may pass arrivals this page carried on Channel A.
 pub async fn apply_pull_page<S>(
     socket: &S,
     peer: &DeviceId,
@@ -245,47 +245,6 @@ where
     *cursor = Some(current);
 
     let mut applied = 0usize;
-    let mut backfill_seqs = Vec::with_capacity(page.backfill.len());
-    let mut backfill_ops = Vec::with_capacity(page.backfill.len());
-    let mut last_seq = current.after;
-    for (seq, encoded) in &page.backfill {
-        if *seq <= last_seq {
-            return Err(S::protocol_error(format!(
-                "pull peer={} returned non-advancing sequence {seq} at or behind {}",
-                peer.to_hex(),
-                current.after
-            )));
-        }
-        last_seq = *seq;
-        backfill_seqs.push(*seq);
-        backfill_ops.push(decode_page_op(encoded, peer).map_err(S::protocol_error)?);
-    }
-
-    let PullAdmission {
-        admitted,
-        error: admit_error,
-        ..
-    } = socket
-        .admit_ops(
-            peer,
-            &backfill_ops,
-            skip_unattested,
-            true,
-            |admitted_total, _| {
-                if admitted_total > 0 {
-                    current.after = backfill_seqs[admitted_total - 1];
-                    *cursor = Some(current);
-                    socket.save_relay_cursor(peer, current)?;
-                }
-                Ok(())
-            },
-        )
-        .await?;
-    applied += admitted;
-    if let Some(error) = admit_error {
-        return Err(error);
-    }
-
     let mut runs: Vec<(DeviceId, Vec<SignedOp>, Vec<OrderKey>)> = Vec::new();
     let mut last_key: Option<OrderKey> = None;
     for encoded in &page.keyed {
@@ -337,6 +296,47 @@ where
         if let Some(error) = admit_error {
             return Err(error);
         }
+    }
+
+    let mut backfill_seqs = Vec::with_capacity(page.backfill.len());
+    let mut backfill_ops = Vec::with_capacity(page.backfill.len());
+    let mut last_seq = current.after;
+    for (seq, encoded) in &page.backfill {
+        if *seq <= last_seq {
+            return Err(S::protocol_error(format!(
+                "pull peer={} returned non-advancing sequence {seq} at or behind {}",
+                peer.to_hex(),
+                current.after
+            )));
+        }
+        last_seq = *seq;
+        backfill_seqs.push(*seq);
+        backfill_ops.push(decode_page_op(encoded, peer).map_err(S::protocol_error)?);
+    }
+
+    let PullAdmission {
+        admitted,
+        error: admit_error,
+        ..
+    } = socket
+        .admit_ops(
+            peer,
+            &backfill_ops,
+            skip_unattested,
+            true,
+            |admitted_total, _| {
+                if admitted_total > 0 {
+                    current.after = backfill_seqs[admitted_total - 1];
+                    *cursor = Some(current);
+                    socket.save_relay_cursor(peer, current)?;
+                }
+                Ok(())
+            },
+        )
+        .await?;
+    applied += admitted;
+    if let Some(error) = admit_error {
+        return Err(error);
     }
 
     let next_cursor = RelayCursor {

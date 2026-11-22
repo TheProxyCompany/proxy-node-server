@@ -133,136 +133,69 @@ pub fn build_pull_page<S: MeshPullSocket + ?Sized>(
 
     let resume_backfill =
         matches!(&request.resume, Some(resume) if resume.phase == PullPhase::Backfill);
-    let mut backfill = Vec::new();
+    let mut budget = limit;
     let mut keyed = Vec::new();
-    let mut page_bytes = 0usize;
-
-    // `next_relay_seq` passes an arrival the requester's claims do not cover
-    // only on a page whose keyed channel completed, or on a backfill resume,
-    // which is only issued after one did. The requester acks that cursor, and
-    // compaction prunes what every peer has acked.
     if !resume_backfill {
-        // Covered arrivals ahead of the first uncovered one are safe to send
-        // whatever the keyed channel does, so they go first under a quarter of
-        // the page. When there are none, keyed rows get the whole page.
-        let prefix = BackfillScan {
-            rows: limit / 4,
-            byte_budget: PULL_PAGE_BYTE_BUDGET / 4,
-            occupied: true,
-            pass_uncovered: false,
-        };
-        scan_backfill(
-            socket,
-            &claims,
-            prefix,
-            &mut next_relay_seq,
-            &mut page_bytes,
-            &mut backfill,
-        )?;
         let (served, keyed_resume) = build_keyed_channel(
             socket,
             &claims,
             resume_keyed,
             audit,
-            limit - backfill.len(),
-            PULL_PAGE_BYTE_BUDGET.saturating_sub(page_bytes),
+            limit,
+            PULL_PAGE_BYTE_BUDGET,
             None,
             &own,
         )?;
-        page_bytes += served.iter().map(String::len).sum::<usize>();
         keyed = served;
+        budget = limit.saturating_sub(keyed.len());
+        // The requester acks `next_relay_seq`, and compaction prunes what every
+        // peer has acked. So the cursor stays put until the keyed channel has
+        // handed over everything the requester's claims do not cover.
         if keyed_resume.is_some() {
-            return Ok(page(backfill, keyed, next_relay_seq, keyed_resume));
+            return Ok(page(Vec::new(), keyed, next_relay_seq, keyed_resume));
+        }
+        if budget == 0 {
+            let resume = Some(backfill_resume(start_seq));
+            return Ok(page(Vec::new(), keyed, next_relay_seq, resume));
         }
     }
 
-    let rows = limit.saturating_sub(backfill.len() + keyed.len());
-    if rows == 0 {
-        let resume = Some(backfill_resume(next_relay_seq));
-        return Ok(page(backfill, keyed, next_relay_seq, resume));
-    }
-    let mut more = false;
-    if page_bytes < PULL_PAGE_BYTE_BUDGET {
-        let tail = BackfillScan {
-            rows,
-            byte_budget: PULL_PAGE_BYTE_BUDGET,
-            occupied: page_bytes > 0,
-            pass_uncovered: true,
-        };
-        more = scan_backfill(
-            socket,
-            &claims,
-            tail,
-            &mut next_relay_seq,
-            &mut page_bytes,
-            &mut backfill,
-        )?;
-    }
-    let resume = more.then(|| backfill_resume(next_relay_seq));
-    Ok(page(backfill, keyed, next_relay_seq, resume))
-}
-
-/// One pass over Channel B.
-struct BackfillScan {
-    /// Most arrivals to read.
-    rows: usize,
-    /// Page bytes this pass may fill up to.
-    byte_budget: usize,
-    /// Whether a row larger than the byte budget is deferred rather than sent
-    /// alone.
-    occupied: bool,
-    /// Whether to step over an arrival the requester's claims do not cover.
-    /// When false the pass stops there.
-    pass_uncovered: bool,
-}
-
-/// Push the arrivals after `cursor` that `claims` covers onto `backfill`,
-/// advancing `cursor` past every arrival consumed. Returns whether the pass
-/// ended on a row or byte limit, so more arrivals may remain.
-fn scan_backfill<S: MeshPullSocket + ?Sized>(
-    socket: &S,
-    claims: &CoverageVector,
-    scan: BackfillScan,
-    cursor: &mut u64,
-    page_bytes: &mut usize,
-    backfill: &mut Vec<(u64, String)>,
-) -> Result<bool, S::Error> {
-    if scan.rows == 0 {
-        return Ok(false);
-    }
-    let scanned = socket.relay_since_with_envelopes(*cursor, scan.rows)?;
-    let read_limit_hit = scanned.len() == scan.rows;
+    let mut backfill = Vec::new();
+    let mut page_bytes: usize = keyed.iter().map(String::len).sum();
     let mut byte_cut = false;
-    for (seq, op, envelope) in scanned {
-        if !claims.covers(&op.order_key()) {
-            if !scan.pass_uncovered {
-                return Ok(false);
-            }
-            *cursor = seq;
-            continue;
-        }
-        if byte_cut {
-            break;
-        }
-        match admit_row(
-            |key| socket.is_superseded(key),
-            op.order_key(),
-            &envelope,
-            scan.occupied || !backfill.is_empty(),
-            page_bytes,
-            scan.byte_budget,
-        )? {
-            Admission::Push(row) => backfill.push((seq, row)),
-            Admission::Defer => {
-                byte_cut = true;
+    let mut scanned_len = 0usize;
+    if start_seq < stream.head && page_bytes < PULL_PAGE_BYTE_BUDGET {
+        let scanned = socket.relay_since_with_envelopes(start_seq, budget)?;
+        scanned_len = scanned.len();
+        for (seq, op, envelope) in scanned {
+            if byte_cut && claims.covers(&op.order_key()) {
                 break;
             }
-            Admission::SkipOversized => {}
+            if !claims.covers(&op.order_key()) {
+                next_relay_seq = seq;
+                continue;
+            }
+            match admit_row(
+                |key| socket.is_superseded(key),
+                op.order_key(),
+                &envelope,
+                page_bytes > 0,
+                &mut page_bytes,
+                PULL_PAGE_BYTE_BUDGET,
+            )? {
+                Admission::Push(row) => backfill.push((seq, row)),
+                Admission::Defer => {
+                    byte_cut = true;
+                    break;
+                }
+                Admission::SkipOversized => {}
+            }
+            next_relay_seq = seq;
+            byte_cut = page_bytes >= PULL_PAGE_BYTE_BUDGET;
         }
-        *cursor = seq;
-        byte_cut = *page_bytes >= scan.byte_budget;
     }
-    Ok(read_limit_hit || byte_cut)
+    let resume = (scanned_len == budget || byte_cut).then(|| backfill_resume(next_relay_seq));
+    Ok(page(backfill, keyed, next_relay_seq, resume))
 }
 
 /// Validate a presented compaction acknowledgment against `socket`'s current
