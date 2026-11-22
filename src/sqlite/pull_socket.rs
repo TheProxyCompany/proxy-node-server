@@ -109,6 +109,20 @@ impl MeshPullSocket for SqlitePullServerSocket<'_> {
         })
     }
 
+    fn is_superseded(&self, key: &OrderKey) -> Result<bool, SqliteError> {
+        self.conn
+            .query_row(
+                "SELECT EXISTS(
+                SELECT 1 FROM oplog_db.oplog AS op JOIN oplog_db.oplog_heads AS head
+                USING (store_id, table_name, row_pk)
+                WHERE op.op_id = ?1 AND (head.hlc, head.device_id, head.op_id)
+                    > (op.hlc, op.device_id, op.op_id))",
+                [key.op_id.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .map_err(|error| SqliteError::Other(format!("compare pull row head: {error}")))
+    }
+
     fn origins(&self) -> Result<Vec<DeviceId>, SqliteError> {
         coverage::origins(self.conn)
     }

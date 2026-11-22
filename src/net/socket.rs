@@ -91,6 +91,13 @@ pub trait MeshPullSocket {
         ))
     }
 
+    /// Whether an applied head strictly supersedes this row. An oversized row
+    /// is skipped either way; this only decides whether the skip is logged
+    /// as an error.
+    fn is_superseded(&self, _key: &OrderKey) -> Result<bool, Self::Error> {
+        Ok(false)
+    }
+
     /// Every origin device present in the local op-log, ascending by raw
     /// 32-byte device id.
     fn origins(&self) -> Result<Vec<DeviceId>, Self::Error> {
