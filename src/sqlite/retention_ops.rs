@@ -302,8 +302,8 @@ fn delete_ops_subchunk(
                     (SELECT resolution_op_id FROM oplog_db.move_callback_fires WHERE dispatched = 0)
                 AND {alias}.op_id NOT IN
                     (SELECT op_id FROM oplog_db.proxydb_projection_queue)
-                AND {alias}.op_id NOT IN
-                    (SELECT op_id FROM external_row_replay_queue WHERE state != 'failed')";
+                AND NOT EXISTS (SELECT 1 FROM external_row_replay_queue AS rq
+                                WHERE rq.op_id = {alias}.op_id AND rq.state != 'failed')";
     let oplog_pins = pins.replace("{alias}", "oplog");
     let arrival_pins = pins.replace("{alias}", "oplog_arrivals");
     let oplog_head_pin = format!(
