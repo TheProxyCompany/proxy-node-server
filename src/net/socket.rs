@@ -91,7 +91,9 @@ pub trait MeshPullSocket {
         ))
     }
 
-    /// Whether an applied head strictly supersedes this row.
+    /// Whether an applied head strictly supersedes this row. An oversized row
+    /// is skipped either way; this only decides whether the skip is logged
+    /// as an error.
     fn is_superseded(&self, _key: &OrderKey) -> Result<bool, Self::Error> {
         Ok(false)
     }
@@ -261,11 +263,6 @@ impl<L: LogSource, D: DeviceBook> MeshPullSocket for ServeState<L, D> {
             .ok_or_else(|| "relay stream is not supported by this log source".to_string())
     }
 
-    /// Whether an applied head strictly supersedes this row.
-    fn is_superseded(&self, _key: &OrderKey) -> Result<bool, Self::Error> {
-        Ok(false)
-    }
-
     fn origins(&self) -> Result<Vec<DeviceId>, String> {
         self.log.origins()
     }
@@ -320,11 +317,6 @@ impl<'a, S: Store + Send> MeshPullSocket for OpLogPullSocket<'a, S> {
 
     fn relay_stream_state(&self) -> Result<RelayStreamState, String> {
         Ok(self.log.lock().expect("oplog poisoned").relay_state())
-    }
-
-    /// Whether an applied head strictly supersedes this row.
-    fn is_superseded(&self, _key: &OrderKey) -> Result<bool, Self::Error> {
-        Ok(false)
     }
 
     fn origins(&self) -> Result<Vec<DeviceId>, String> {

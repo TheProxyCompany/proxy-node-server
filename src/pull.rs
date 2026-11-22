@@ -74,6 +74,9 @@ pub const MAX_PULL_SINGLETON_BYTES: usize = 32 * 1024 * 1024 - 4096;
 /// Largest raw op payload an emitter appends to the replicated op-log.
 pub const MAX_OP_PAYLOAD_BYTES: usize = 22 * 1024 * 1024;
 
+// An op at the emit cap, base64-encoded with its envelope, still fits a pull page.
+const _: () = assert!(MAX_OP_PAYLOAD_BYTES.div_ceil(3) * 4 + 4096 <= MAX_PULL_SINGLETON_BYTES);
+
 /// Body cap for a pull request.
 pub const MAX_PULL_REQUEST_BYTES: usize = 256 * 1024;
 
