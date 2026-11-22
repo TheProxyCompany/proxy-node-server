@@ -440,6 +440,9 @@ pub fn record_verified_ops(
              )",
         )
         .map_err(|error| SqliteError::Other(format!("prepare verified-op check: {error}")))?;
+    let mut oplog_present = conn
+        .prepare_cached("SELECT EXISTS (SELECT 1 FROM oplog_db.oplog WHERE op_id = ?1)")
+        .map_err(|error| SqliteError::Other(format!("prepare verified-op oplog check: {error}")))?;
     for (op_id, envelope, digest) in encoded {
         insert
             .execute(params![op_id, digest.as_slice(), envelope])
@@ -448,10 +451,17 @@ pub fn record_verified_ops(
             .query_row(params![op_id, digest.as_slice()], |row| row.get(0))
             .map_err(|error| SqliteError::Other(format!("confirm verified remote op: {error}")))?;
         if !recorded {
-            return Err(SqliteError::Other(format!(
-                "verified remote op {} is not durably present with the verified envelope",
-                encode_hex(op_id)
-            )));
+            let in_oplog: bool = oplog_present
+                .query_row(params![op_id], |row| row.get(0))
+                .map_err(|error| {
+                    SqliteError::Other(format!("check verified remote op presence: {error}"))
+                })?;
+            if in_oplog {
+                return Err(SqliteError::Other(format!(
+                    "verified remote op {} is not durably present with the verified envelope",
+                    encode_hex(op_id)
+                )));
+            }
         }
     }
     Ok(())

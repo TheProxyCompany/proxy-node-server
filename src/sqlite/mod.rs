@@ -11,6 +11,8 @@ pub mod oplog_queries;
 pub mod pending_edges;
 pub mod retention;
 pub mod retention_ops;
+pub mod retention_orphan;
+pub(crate) mod retention_pins;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SqliteError {
