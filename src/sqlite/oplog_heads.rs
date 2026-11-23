@@ -48,6 +48,16 @@ pub fn upsert_head(
         ])
     })
     .map_err(|e| GCError::Other(format!("oplog head origin: {e}")))?;
+    let store_empty_head_payload = op.body.store.as_str() == "proxydb"
+        && super::retention_pins::HEAD_PAYLOAD_TRIM_TABLES.contains(&table)
+        && crate::row_op::ProxyDbOp::decode_bytes(&op.body.payload).is_ok_and(|decoded| {
+            matches!(decoded.mutation, crate::row_op::Mutation::Upsert { .. })
+        });
+    let head_payload: &[u8] = if store_empty_head_payload {
+        &[]
+    } else {
+        op.body.payload.as_slice()
+    };
     conn.prepare_cached(
         "INSERT INTO oplog_db.oplog_heads
             (store_id, table_name, row_pk, hlc, device_id, op_id, payload, origin_device)
@@ -68,7 +78,7 @@ pub fn upsert_head(
             op.body.hlc.0 as i64,
             op.body.device.as_bytes().as_slice(),
             op.id.as_bytes().as_slice(),
-            op.body.payload,
+            head_payload,
         ])
     })
     .map_err(|e| GCError::Other(format!("oplog upsert head: {e}")))?;

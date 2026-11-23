@@ -132,10 +132,9 @@ pub fn compaction_candidates_with_lww(
     };
     let mut candidates = Vec::new();
     let mut scanned = 0usize;
-    let initial_resume = resume_after.max(0);
+    let initial_resume = resume_after.max(0).min(ceiling);
     let mut after_seq = initial_resume;
-    let mut upper_bound = ceiling;
-    let mut wrapped = false;
+    let upper_bound = ceiling;
     let mut exhausted = false;
     'scan: while candidates.len() < policy.max_deletes_per_pass
         && scanned < scan_cap
@@ -171,12 +170,6 @@ pub fn compaction_candidates_with_lww(
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| GCError::Other(format!("compaction scan row: {e}")))?;
         if page.is_empty() {
-            if !wrapped && initial_resume > 0 {
-                wrapped = true;
-                after_seq = 0;
-                upper_bound = initial_resume.min(ceiling);
-                continue 'scan;
-            }
             exhausted = true;
             break;
         }

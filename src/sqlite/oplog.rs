@@ -429,7 +429,20 @@ pub fn newest_op_in_store(
         .map_err(|e| GCError::Other(format!("oplog newest_op_in_store head: {e}")))?;
     if let Some((key, payload)) = head {
         if key.op_id != *exclude {
-            return Ok(Some((key, payload)));
+            if !payload.is_empty() {
+                return Ok(Some((key, payload)));
+            }
+            let live_envelope: Option<Vec<u8>> = conn
+                .prepare_cached("SELECT envelope FROM oplog_db.oplog WHERE op_id = ?1")
+                .and_then(|mut stmt| {
+                    stmt.query_row(params![key.op_id.as_bytes().as_slice()], |row| row.get(0))
+                        .optional()
+                })
+                .map_err(|e| GCError::Other(format!("oplog newest_op_in_store envelope: {e}")))?;
+            let resolved = live_envelope
+                .and_then(|env| SignedOp::from_bytes(&env).ok().map(|op| op.body.payload))
+                .unwrap_or_default();
+            return Ok(Some((key, resolved)));
         }
     }
     conn.prepare_cached(

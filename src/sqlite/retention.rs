@@ -241,8 +241,22 @@ pub fn incremental_vacuum_oplog(
     if before <= 0 {
         return Ok(0);
     }
-    conn.execute_batch(&format!("PRAGMA oplog_db.incremental_vacuum({max_pages});"))
+    // `PRAGMA incremental_vacuum(N)` yields one result row per freed page via
+    // `OP_IncrVacuum` + `OP_ResultRow`. `execute_batch` calls `stmt.step()` once
+    // and drops the statement, reclaiming at most 1 page per call. Drain all
+    // rows to `SQLITE_DONE` so up to `max_pages` pages are actually reclaimed.
+    let pragma = format!("PRAGMA oplog_db.incremental_vacuum({max_pages})");
+    let mut stmt = conn
+        .prepare(&pragma)
+        .map_err(|e| GCError::Other(format!("oplog_db incremental_vacuum prepare: {e}")))?;
+    let mut rows = stmt
+        .query([])
         .map_err(|e| GCError::Other(format!("oplog_db incremental_vacuum: {e}")))?;
+    while rows
+        .next()
+        .map_err(|e| GCError::Other(format!("oplog_db incremental_vacuum step: {e}")))?
+        .is_some()
+    {}
     let after: i64 = conn
         .query_row("PRAGMA oplog_db.freelist_count", [], |row| row.get(0))
         .map_err(|e| GCError::Other(format!("re-read oplog_db freelist_count: {e}")))?;
@@ -431,3 +445,7 @@ pub fn prune_orphaned_verified_ops(
         .collect();
     Ok((orphans, next_cursor))
 }
+
+#[cfg(test)]
+#[path = "retention_tests.rs"]
+mod bloat_fix_tests;

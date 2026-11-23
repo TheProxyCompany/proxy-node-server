@@ -12,7 +12,7 @@ use super::SqliteError as GCError;
 /// empty head payload on these tables as a covered upsert (`RowDivergence::Covered`),
 /// while `Mutation::Delete` tombstones and smaller config/manifest tables keep
 /// their full head payload.
-const HEAD_PAYLOAD_TRIM_TABLES: &[&str] = &[
+pub(crate) const HEAD_PAYLOAD_TRIM_TABLES: &[&str] = &[
     "items",
     "sequences",
     "conversation_jobs",

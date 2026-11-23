@@ -311,8 +311,13 @@ pub fn record_peer_ack(
                  THEN MAX(mesh_peer_acks.acked_relay_seq, excluded.acked_relay_seq)
                  ELSE excluded.acked_relay_seq
              END,
-             stream_epoch = excluded.stream_epoch,
-             updated_at = excluded.updated_at",
+             updated_at = CASE
+                 WHEN mesh_peer_acks.stream_epoch != excluded.stream_epoch
+                   OR excluded.acked_relay_seq > mesh_peer_acks.acked_relay_seq
+                 THEN excluded.updated_at
+                 ELSE mesh_peer_acks.updated_at
+             END,
+             stream_epoch = excluded.stream_epoch",
     )
     .and_then(|mut stmt| stmt.execute(params![peer.as_bytes().as_slice(), epoch.as_slice(), seq]))
     .map_err(|e| GCError::Other(format!("record peer ack: {e}")))?;
@@ -405,10 +410,8 @@ pub fn min_peer_ack_with_ttl(
             .optional()
             .map_err(|e| GCError::Other(format!("peer ack lookup: {e}")))?;
         let Some((acked, updated_secs)) = acked else {
-            let dormant = dormant_before.is_some_and(|cutoff| {
-                last_seen_at.as_str() < cutoff
-                    || (ack_cutoff_secs.is_some() && first_seen_at.as_str() < cutoff)
-            });
+            let _ = first_seen_at;
+            let dormant = dormant_before.is_some_and(|cutoff| last_seen_at.as_str() < cutoff);
             if dormant {
                 continue;
             }
