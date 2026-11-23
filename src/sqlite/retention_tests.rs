@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::row_op::{Column, KeyField, Mutation, ORIGIN_LOCAL, ProxyDbOp, Scalar};
 use crate::sqlite::{coverage, oplog};
