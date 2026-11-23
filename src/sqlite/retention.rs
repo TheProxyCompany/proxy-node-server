@@ -311,6 +311,17 @@ pub fn safe_relay_floor(
     local_device: &DeviceId,
     horizon: Duration,
 ) -> Result<CompactionBounds, GCError> {
+    safe_relay_floor_with_ttl(conn, local_device, horizon, PEER_ACK_TTL)
+}
+
+/// [`safe_relay_floor`] with the caller's peer ack TTL: a peer whose ack is
+/// older than `peer_ack_ttl` stops pinning `ack_floor`.
+pub fn safe_relay_floor_with_ttl(
+    conn: &rusqlite::Connection,
+    local_device: &DeviceId,
+    horizon: Duration,
+    peer_ack_ttl: Duration,
+) -> Result<CompactionBounds, GCError> {
     let peers: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM devices
@@ -341,7 +352,7 @@ pub fn safe_relay_floor(
         });
     }
     let epoch = coverage::current_stream_epoch(conn)?;
-    let ack_ttl = horizon.min(PEER_ACK_TTL);
+    let ack_ttl = horizon.min(peer_ack_ttl);
     let ack_cutoff_secs = now.timestamp() - ack_ttl.as_secs() as i64;
     let dormant_before = (now - chrono::Duration::seconds(ack_ttl.as_secs() as i64)).to_rfc3339();
     let active_ack = coverage::min_peer_ack_with_ttl(
