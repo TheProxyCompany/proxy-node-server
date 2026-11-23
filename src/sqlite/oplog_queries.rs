@@ -5,6 +5,7 @@ use rusqlite::{OptionalExtension, params};
 
 use super::SqliteError as GCError;
 use super::oplog::order_key_from_row;
+use super::oplog_heads::resolve_payload;
 
 pub fn newest_ops_in_store(
     conn: &rusqlite::Connection,
@@ -51,14 +52,7 @@ pub fn newest_ops_in_store(
         for row in rows {
             let (row_pk, payload, envelope) =
                 row.map_err(|e| GCError::Other(format!("oplog newest_ops_in_store row: {e}")))?;
-            let resolved = if !payload.is_empty() {
-                payload
-            } else {
-                envelope
-                    .and_then(|env| SignedOp::from_bytes(&env).ok().map(|op| op.body.payload))
-                    .unwrap_or_default()
-            };
-            newest.insert(row_pk, resolved);
+            newest.insert(row_pk, resolve_payload(payload, envelope.as_deref()));
         }
     }
     Ok(newest)

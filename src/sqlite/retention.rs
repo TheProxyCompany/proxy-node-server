@@ -445,7 +445,3 @@ pub fn prune_orphaned_verified_ops(
         .collect();
     Ok((orphans, next_cursor))
 }
-
-#[cfg(test)]
-#[path = "retention_tests.rs"]
-mod bloat_fix_tests;

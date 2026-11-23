@@ -396,15 +396,10 @@ pub(crate) fn trim_upsert_head_payloads(
     for row in rows {
         let (store_id, table_name, row_pk, payload) =
             row.map_err(|e| GCError::Other(format!("compaction head trim row: {e}")))?;
-        if !HEAD_PAYLOAD_TRIM_TABLES.contains(&table_name.as_str()) {
-            continue;
-        }
-        if let Ok(decoded) = crate::row_op::ProxyDbOp::decode_bytes(&payload) {
-            if matches!(decoded.mutation, crate::row_op::Mutation::Upsert { .. }) {
-                clear_stmt
-                    .execute(params![store_id, table_name, row_pk])
-                    .map_err(|e| GCError::Other(format!("compaction head trim update: {e}")))?;
-            }
+        if super::oplog_heads::stored_head_payload(&store_id, &table_name, &payload).is_empty() {
+            clear_stmt
+                .execute(params![store_id, table_name, row_pk])
+                .map_err(|e| GCError::Other(format!("compaction head trim update: {e}")))?;
         }
     }
     Ok(())
