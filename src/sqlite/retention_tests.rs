@@ -293,6 +293,13 @@ fn bulk_table_upsert_head_omits_duplicate_payload_and_newest_op_resolves() {
     .unwrap();
     assert_eq!(resolved, payload);
 
+    // Batch newest_ops_in_store must also resolve the live payload from oplog.envelope.
+    let batch = oplog::newest_ops_in_store(&conn, "proxydb", "items", &["item-1"]).unwrap();
+    assert_eq!(
+        batch.get("item-1").map(Vec::as_slice),
+        Some(payload.as_slice())
+    );
+
     // Delete tombstone must still preserve full payload in oplog_heads.
     let del_payload = ProxyDbOp {
         table: "items".to_string(),

@@ -30,8 +30,10 @@ pub fn newest_ops_in_store(
             .join(", ");
         let mut stmt = conn
             .prepare(&format!(
-                "SELECT row_pk, payload FROM oplog_db.oplog_heads
-                 WHERE store_id = ?1 AND table_name = ?2 AND row_pk IN ({placeholders})"
+                "SELECT h.row_pk, h.payload, o.envelope
+                 FROM oplog_db.oplog_heads AS h
+                 LEFT JOIN oplog_db.oplog AS o ON o.op_id = h.op_id
+                 WHERE h.store_id = ?1 AND h.table_name = ?2 AND h.row_pk IN ({placeholders})"
             ))
             .map_err(|e| GCError::Other(format!("oplog newest_ops_in_store prepare: {e}")))?;
         let params = std::iter::once(&store as &dyn rusqlite::ToSql)
@@ -39,13 +41,24 @@ pub fn newest_ops_in_store(
             .chain(chunk.iter().map(|pk| pk as &dyn rusqlite::ToSql));
         let rows = stmt
             .query_map(rusqlite::params_from_iter(params), |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Option<Vec<u8>>>(2)?,
+                ))
             })
             .map_err(|e| GCError::Other(format!("oplog newest_ops_in_store query: {e}")))?;
         for row in rows {
-            let (row_pk, payload) =
+            let (row_pk, payload, envelope) =
                 row.map_err(|e| GCError::Other(format!("oplog newest_ops_in_store row: {e}")))?;
-            newest.insert(row_pk, payload);
+            let resolved = if !payload.is_empty() {
+                payload
+            } else {
+                envelope
+                    .and_then(|env| SignedOp::from_bytes(&env).ok().map(|op| op.body.payload))
+                    .unwrap_or_default()
+            };
+            newest.insert(row_pk, resolved);
         }
     }
     Ok(newest)
