@@ -13,6 +13,8 @@ pub mod retention;
 pub mod retention_ops;
 pub mod retention_orphan;
 pub(crate) mod retention_pins;
+#[cfg(test)]
+mod retention_ttl_tests;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SqliteError {
