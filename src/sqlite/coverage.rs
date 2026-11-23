@@ -290,18 +290,24 @@ fn origin_max(conn: &rusqlite::Connection, origin: &DeviceId) -> Result<Option<O
 /// epoch but this relay's current one is ignored outright; within the current
 /// epoch the ack MAX-folds, and a row still holding a rotated-away epoch is
 /// replaced rather than folded.
+///
+/// `updated_at` moves when the ack advances or the peer presents the relay
+/// head. A peer re-presenting a cursor below the head stops pinning after the TTL.
 pub fn record_peer_ack(
     conn: &rusqlite::Connection,
     peer: &DeviceId,
     epoch: &[u8; 32],
     seq: u64,
 ) -> Result<(), GCError> {
-    let current = current_stream_epoch(conn)?;
-    if current != *epoch {
+    let stream = super::oplog::relay_stream_state(conn)?;
+    if stream.stream_epoch != *epoch {
         return Ok(());
     }
-    let seq = i64::try_from(seq)
-        .map_err(|_| GCError::InvalidArgument("peer ack exceeds SQLite range".into()))?;
+    let to_i64 = |value: u64| {
+        i64::try_from(value)
+            .map_err(|_| GCError::InvalidArgument("peer ack exceeds SQLite range".into()))
+    };
+    let (seq, head) = (to_i64(seq)?, to_i64(stream.head_seq)?);
     conn.prepare_cached(
         "INSERT INTO oplog_db.mesh_peer_acks (peer_device_id, stream_epoch, acked_relay_seq, updated_at)
          VALUES (?1, ?2, ?3, datetime('now'))
@@ -314,12 +320,13 @@ pub fn record_peer_ack(
              updated_at = CASE
                  WHEN mesh_peer_acks.stream_epoch != excluded.stream_epoch
                    OR excluded.acked_relay_seq > mesh_peer_acks.acked_relay_seq
+                   OR excluded.acked_relay_seq >= ?4
                  THEN excluded.updated_at
                  ELSE mesh_peer_acks.updated_at
              END,
              stream_epoch = excluded.stream_epoch",
     )
-    .and_then(|mut stmt| stmt.execute(params![peer.as_bytes().as_slice(), epoch.as_slice(), seq]))
+    .and_then(|mut stmt| stmt.execute(params![peer.as_bytes().as_slice(), epoch.as_slice(), seq, head]))
     .map_err(|e| GCError::Other(format!("record peer ack: {e}")))?;
     Ok(())
 }
