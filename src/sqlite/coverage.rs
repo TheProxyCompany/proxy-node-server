@@ -290,18 +290,24 @@ fn origin_max(conn: &rusqlite::Connection, origin: &DeviceId) -> Result<Option<O
 /// epoch but this relay's current one is ignored outright; within the current
 /// epoch the ack MAX-folds, and a row still holding a rotated-away epoch is
 /// replaced rather than folded.
+///
+/// `updated_at` moves when the ack advances or the peer presents the relay
+/// head. A peer re-presenting a cursor below the head stops pinning after the TTL.
 pub fn record_peer_ack(
     conn: &rusqlite::Connection,
     peer: &DeviceId,
     epoch: &[u8; 32],
     seq: u64,
 ) -> Result<(), GCError> {
-    let current = current_stream_epoch(conn)?;
-    if current != *epoch {
+    let stream = super::oplog::relay_stream_state(conn)?;
+    if stream.stream_epoch != *epoch {
         return Ok(());
     }
-    let seq = i64::try_from(seq)
-        .map_err(|_| GCError::InvalidArgument("peer ack exceeds SQLite range".into()))?;
+    let to_i64 = |value: u64| {
+        i64::try_from(value)
+            .map_err(|_| GCError::InvalidArgument("peer ack exceeds SQLite range".into()))
+    };
+    let (seq, head) = (to_i64(seq)?, to_i64(stream.head_seq)?);
     conn.prepare_cached(
         "INSERT INTO oplog_db.mesh_peer_acks (peer_device_id, stream_epoch, acked_relay_seq, updated_at)
          VALUES (?1, ?2, ?3, datetime('now'))
@@ -311,10 +317,16 @@ pub fn record_peer_ack(
                  THEN MAX(mesh_peer_acks.acked_relay_seq, excluded.acked_relay_seq)
                  ELSE excluded.acked_relay_seq
              END,
-             stream_epoch = excluded.stream_epoch,
-             updated_at = excluded.updated_at",
+             updated_at = CASE
+                 WHEN mesh_peer_acks.stream_epoch != excluded.stream_epoch
+                   OR excluded.acked_relay_seq > mesh_peer_acks.acked_relay_seq
+                   OR excluded.acked_relay_seq >= ?4
+                 THEN excluded.updated_at
+                 ELSE mesh_peer_acks.updated_at
+             END,
+             stream_epoch = excluded.stream_epoch",
     )
-    .and_then(|mut stmt| stmt.execute(params![peer.as_bytes().as_slice(), epoch.as_slice(), seq]))
+    .and_then(|mut stmt| stmt.execute(params![peer.as_bytes().as_slice(), epoch.as_slice(), seq, head]))
     .map_err(|e| GCError::Other(format!("record peer ack: {e}")))?;
     Ok(())
 }
@@ -387,9 +399,10 @@ pub fn min_peer_ack_with_ttl(
 
     let mut stmt = conn
         .prepare(
-            "SELECT acked_relay_seq, CAST(strftime('%s', updated_at) AS INTEGER)
+            "SELECT acked_relay_seq, CAST(strftime('%s', updated_at) AS INTEGER),
+                    stream_epoch = ?2
              FROM oplog_db.mesh_peer_acks
-             WHERE peer_device_id = ?1 AND stream_epoch = ?2",
+             WHERE peer_device_id = ?1",
         )
         .map_err(|e| GCError::Other(format!("peer ack prepare: {e}")))?;
     let mut floor = u64::MAX;
@@ -397,29 +410,43 @@ pub fn min_peer_ack_with_ttl(
         let Ok(peer) = DeviceId::from_hex(peer) else {
             return Ok(Some(0));
         };
-        let acked: Option<(i64, Option<i64>)> = stmt
+        let ack: Option<(i64, Option<i64>, bool)> = stmt
             .query_row(
                 params![peer.as_bytes().as_slice(), current_epoch.as_slice()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()
             .map_err(|e| GCError::Other(format!("peer ack lookup: {e}")))?;
-        let Some((acked, updated_secs)) = acked else {
-            let dormant = dormant_before.is_some_and(|cutoff| {
-                last_seen_at.as_str() < cutoff
-                    || (ack_cutoff_secs.is_some() && first_seen_at.as_str() < cutoff)
-            });
-            if dormant {
-                continue;
+        let unseen = dormant_before.is_some_and(|cutoff| last_seen_at.as_str() < cutoff);
+        let (acked, updated_secs) = match ack {
+            Some((acked, updated_secs, true)) => (acked, updated_secs),
+            // Acked a rotated-away epoch: the peer keeps the floor at 0 until it
+            // re-acks, but only while that last ack is inside the TTL. A peer
+            // that stays visible yet never acks the new epoch stops pinning.
+            Some((_, updated_secs, false)) => {
+                let expired = ack_cutoff_secs
+                    .is_some_and(|cutoff| updated_secs.is_some_and(|ts| ts < cutoff));
+                if unseen || expired {
+                    continue;
+                }
+                return Ok(Some(0));
             }
-            return Ok(Some(0));
+            // Never acked anything: a newly paired peer gets one TTL to start.
+            None => {
+                let overdue = ack_cutoff_secs.is_some()
+                    && dormant_before.is_some_and(|cutoff| first_seen_at.as_str() < cutoff);
+                if unseen || overdue {
+                    continue;
+                }
+                return Ok(Some(0));
+            }
         };
         if let Some(cutoff_secs) = ack_cutoff_secs {
             if updated_secs.is_some_and(|ts| ts < cutoff_secs) {
                 continue;
             }
         }
-        if dormant_before.is_some_and(|cutoff| last_seen_at.as_str() < cutoff)
+        if unseen
             && ack_cutoff_secs
                 .is_none_or(|cutoff_secs| updated_secs.is_none_or(|ts| ts < cutoff_secs))
         {

@@ -10,6 +10,7 @@ use crate::{DeviceId, Hlc, OpId, OrderKey, SignedOp};
 use rusqlite::{OptionalExtension, params};
 
 use super::SqliteError as GCError;
+use super::oplog_heads::resolve_payload;
 pub use super::oplog_heads::{demote_head, rebuild_head, upsert_head};
 pub use super::pending_edges::{
     PendingEdgePage, buffer_pending_edge, discard_undispatched_move_callback,
@@ -417,20 +418,23 @@ pub fn newest_op_in_store(
     // Same head-first read as `newest_applied_in_store`, carrying the payload.
     let head = conn
         .prepare_cached(
-            "SELECT hlc, device_id, op_id, payload FROM oplog_db.oplog_heads
-             WHERE store_id = ?1 AND table_name = ?2 AND row_pk = ?3",
+            "SELECT h.hlc, h.device_id, h.op_id, h.payload,
+                    CASE WHEN length(h.payload) = 0 THEN o.envelope END
+             FROM oplog_db.oplog_heads AS h
+             LEFT JOIN oplog_db.oplog AS o ON o.op_id = h.op_id
+             WHERE h.store_id = ?1 AND h.table_name = ?2 AND h.row_pk = ?3",
         )
         .and_then(|mut stmt| {
             stmt.query_row(params![store, table, row_pk], |row| {
-                Ok((order_key_from_row(row)?, row.get::<_, Vec<u8>>(3)?))
+                let envelope: Option<Vec<u8>> = row.get(4)?;
+                let payload = resolve_payload(row.get(3)?, envelope.as_deref());
+                Ok((order_key_from_row(row)?, payload))
             })
             .optional()
         })
         .map_err(|e| GCError::Other(format!("oplog newest_op_in_store head: {e}")))?;
-    if let Some((key, payload)) = head {
-        if key.op_id != *exclude {
-            return Ok(Some((key, payload)));
-        }
+    if let Some(head) = head.filter(|(key, _)| key.op_id != *exclude) {
+        return Ok(Some(head));
     }
     conn.prepare_cached(
         "SELECT hlc, device_id, op_id, payload, envelope FROM oplog_db.oplog INDEXED BY idx_oplog_lww
@@ -444,16 +448,8 @@ pub fn newest_op_in_store(
             params![store, table, row_pk, exclude.as_bytes().as_slice()],
             |row| {
                 let key = order_key_from_row(row)?;
-                let payload: Vec<u8> = row.get(3)?;
                 let envelope: Vec<u8> = row.get(4)?;
-                let resolved = if !payload.is_empty() {
-                    payload
-                } else {
-                    SignedOp::from_bytes(&envelope)
-                        .map(|op| op.body.payload)
-                        .unwrap_or_default()
-                };
-                Ok((key, resolved))
+                Ok((key, resolve_payload(row.get(3)?, Some(&envelope))))
             },
         )
         .optional()

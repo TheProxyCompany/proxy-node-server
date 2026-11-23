@@ -241,8 +241,19 @@ pub fn incremental_vacuum_oplog(
     if before <= 0 {
         return Ok(0);
     }
-    conn.execute_batch(&format!("PRAGMA oplog_db.incremental_vacuum({max_pages});"))
+    // The pragma returns one row per freed page; step to done.
+    let pragma = format!("PRAGMA oplog_db.incremental_vacuum({max_pages})");
+    let mut stmt = conn
+        .prepare(&pragma)
+        .map_err(|e| GCError::Other(format!("oplog_db incremental_vacuum prepare: {e}")))?;
+    let mut rows = stmt
+        .query([])
         .map_err(|e| GCError::Other(format!("oplog_db incremental_vacuum: {e}")))?;
+    while rows
+        .next()
+        .map_err(|e| GCError::Other(format!("oplog_db incremental_vacuum step: {e}")))?
+        .is_some()
+    {}
     let after: i64 = conn
         .query_row("PRAGMA oplog_db.freelist_count", [], |row| row.get(0))
         .map_err(|e| GCError::Other(format!("re-read oplog_db freelist_count: {e}")))?;

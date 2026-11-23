@@ -7,21 +7,6 @@ use rusqlite::{OptionalExtension, params, params_from_iter};
 
 use super::SqliteError as GCError;
 
-/// Bulk `proxydb` tables whose `oplog_heads.payload` may be trimmed to `X''`
-/// on `Mutation::Upsert` once their `oplog` row is pruned. Readers treat an
-/// empty head payload on these tables as a covered upsert (`RowDivergence::Covered`),
-/// while `Mutation::Delete` tombstones and smaller config/manifest tables keep
-/// their full head payload.
-const HEAD_PAYLOAD_TRIM_TABLES: &[&str] = &[
-    "items",
-    "sequences",
-    "conversation_jobs",
-    "message_attachments",
-    "party_reactions",
-    "external_thread_send_receipts",
-    "worksite_metadata",
-];
-
 #[derive(Clone, Copy)]
 pub(crate) struct PinTables {
     pub pending_graph_edges: bool,
@@ -396,15 +381,10 @@ pub(crate) fn trim_upsert_head_payloads(
     for row in rows {
         let (store_id, table_name, row_pk, payload) =
             row.map_err(|e| GCError::Other(format!("compaction head trim row: {e}")))?;
-        if !HEAD_PAYLOAD_TRIM_TABLES.contains(&table_name.as_str()) {
-            continue;
-        }
-        if let Ok(decoded) = crate::row_op::ProxyDbOp::decode_bytes(&payload) {
-            if matches!(decoded.mutation, crate::row_op::Mutation::Upsert { .. }) {
-                clear_stmt
-                    .execute(params![store_id, table_name, row_pk])
-                    .map_err(|e| GCError::Other(format!("compaction head trim update: {e}")))?;
-            }
+        if super::oplog_heads::stored_head_payload(&store_id, &table_name, &payload).is_empty() {
+            clear_stmt
+                .execute(params![store_id, table_name, row_pk])
+                .map_err(|e| GCError::Other(format!("compaction head trim update: {e}")))?;
         }
     }
     Ok(())
