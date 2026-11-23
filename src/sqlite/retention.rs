@@ -241,10 +241,7 @@ pub fn incremental_vacuum_oplog(
     if before <= 0 {
         return Ok(0);
     }
-    // `PRAGMA incremental_vacuum(N)` yields one result row per freed page via
-    // `OP_IncrVacuum` + `OP_ResultRow`. `execute_batch` calls `stmt.step()` once
-    // and drops the statement, reclaiming at most 1 page per call. Drain all
-    // rows to `SQLITE_DONE` so up to `max_pages` pages are actually reclaimed.
+    // The pragma returns one row per freed page; step to done.
     let pragma = format!("PRAGMA oplog_db.incremental_vacuum({max_pages})");
     let mut stmt = conn
         .prepare(&pragma)

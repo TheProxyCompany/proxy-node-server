@@ -7,21 +7,6 @@ use rusqlite::{OptionalExtension, params, params_from_iter};
 
 use super::SqliteError as GCError;
 
-/// Bulk `proxydb` tables whose `oplog_heads.payload` may be trimmed to `X''`
-/// on `Mutation::Upsert` once their `oplog` row is pruned. Readers treat an
-/// empty head payload on these tables as a covered upsert (`RowDivergence::Covered`),
-/// while `Mutation::Delete` tombstones and smaller config/manifest tables keep
-/// their full head payload.
-pub(crate) const HEAD_PAYLOAD_TRIM_TABLES: &[&str] = &[
-    "items",
-    "sequences",
-    "conversation_jobs",
-    "message_attachments",
-    "party_reactions",
-    "external_thread_send_receipts",
-    "worksite_metadata",
-];
-
 #[derive(Clone, Copy)]
 pub(crate) struct PinTables {
     pub pending_graph_edges: bool,

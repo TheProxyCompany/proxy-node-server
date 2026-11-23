@@ -134,7 +134,6 @@ pub fn compaction_candidates_with_lww(
     let mut scanned = 0usize;
     let initial_resume = resume_after.max(0).min(ceiling);
     let mut after_seq = initial_resume;
-    let upper_bound = ceiling;
     let mut exhausted = false;
     'scan: while candidates.len() < policy.max_deletes_per_pass
         && scanned < scan_cap
@@ -152,20 +151,17 @@ pub fn compaction_candidates_with_lww(
                  LIMIT ?4",
             )
             .map_err(|e| GCError::Other(format!("compaction scan prepare: {e}")))?
-            .query_map(
-                params![after_seq, upper_bound, head, SCAN_PAGE as i64],
-                |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, Vec<u8>>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, i64>(5)?,
-                        row.get::<_, Vec<u8>>(6)?,
-                    ))
-                },
-            )
+            .query_map(params![after_seq, ceiling, head, SCAN_PAGE as i64], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, Vec<u8>>(6)?,
+                ))
+            })
             .map_err(|e| GCError::Other(format!("compaction scan: {e}")))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| GCError::Other(format!("compaction scan row: {e}")))?;

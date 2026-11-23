@@ -418,7 +418,8 @@ pub fn newest_op_in_store(
     // Same head-first read as `newest_applied_in_store`, carrying the payload.
     let head = conn
         .prepare_cached(
-            "SELECT h.hlc, h.device_id, h.op_id, h.payload, o.envelope
+            "SELECT h.hlc, h.device_id, h.op_id, h.payload,
+                    CASE WHEN length(h.payload) = 0 THEN o.envelope END
              FROM oplog_db.oplog_heads AS h
              LEFT JOIN oplog_db.oplog AS o ON o.op_id = h.op_id
              WHERE h.store_id = ?1 AND h.table_name = ?2 AND h.row_pk = ?3",

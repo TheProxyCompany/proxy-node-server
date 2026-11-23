@@ -31,7 +31,8 @@ pub fn newest_ops_in_store(
             .join(", ");
         let mut stmt = conn
             .prepare(&format!(
-                "SELECT h.row_pk, h.payload, o.envelope
+                "SELECT h.row_pk, h.payload,
+                    CASE WHEN length(h.payload) = 0 THEN o.envelope END
                  FROM oplog_db.oplog_heads AS h
                  LEFT JOIN oplog_db.oplog AS o ON o.op_id = h.op_id
                  WHERE h.store_id = ?1 AND h.table_name = ?2 AND h.row_pk IN ({placeholders})"

@@ -7,12 +7,27 @@ use rusqlite::{OptionalExtension, params};
 
 use super::SqliteError as GCError;
 
+/// Bulk `proxydb` tables whose `oplog_heads.payload` is stored as `X''` on
+/// `Mutation::Upsert`. Readers treat an
+/// empty head payload on these tables as a covered upsert (`RowDivergence::Covered`),
+/// while `Mutation::Delete` tombstones and smaller config/manifest tables keep
+/// their full head payload.
+const HEAD_PAYLOAD_TRIM_TABLES: &[&str] = &[
+    "items",
+    "sequences",
+    "conversation_jobs",
+    "message_attachments",
+    "party_reactions",
+    "external_thread_send_receipts",
+    "worksite_metadata",
+];
+
 /// The payload `oplog_heads` stores for an applied op. A bulk-table upsert
 /// already lives in `oplog.envelope`, so its head stores `X''` instead of a
 /// second copy; delete tombstones and every other table keep the full payload.
 pub(crate) fn stored_head_payload<'a>(store: &str, table: &str, payload: &'a [u8]) -> &'a [u8] {
     let duplicate = store == "proxydb"
-        && super::retention_pins::HEAD_PAYLOAD_TRIM_TABLES.contains(&table)
+        && HEAD_PAYLOAD_TRIM_TABLES.contains(&table)
         && crate::row_op::ProxyDbOp::decode_bytes(payload)
             .is_ok_and(|op| matches!(op.mutation, crate::row_op::Mutation::Upsert { .. }));
     if duplicate { &[] } else { payload }
