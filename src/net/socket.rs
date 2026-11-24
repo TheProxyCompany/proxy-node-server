@@ -139,6 +139,17 @@ pub trait MeshPullSocket {
         Ok(())
     }
 
+    /// Whether the stored ack for `peer` already stands in for this one, so
+    /// [`record_peer_ack`](Self::record_peer_ack) can be skipped.
+    fn peer_ack_is_current(
+        &self,
+        _peer: &DeviceId,
+        _epoch: &[u8; 32],
+        _relay_after: u64,
+    ) -> Result<bool, Self::Error> {
+        Ok(false)
+    }
+
     // ── Client-side coverage, cursor & admission callbacks ──────────────
 
     /// This device's current per-origin high-water claims (`mesh_origin_coverage`).
