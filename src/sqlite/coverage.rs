@@ -331,6 +331,34 @@ pub fn record_peer_ack(
     Ok(())
 }
 
+/// Whether [`record_peer_ack`] for `seq` would only rewrite a row already in
+/// `epoch`, at or past `seq`, and under an hour old. Compaction drops a row
+/// that goes `PEER_ACK_TTL` without a write, so an unchanged cursor is still
+/// rewritten hourly. Keep this in step with the upsert above.
+pub fn peer_ack_is_current(
+    conn: &rusqlite::Connection,
+    peer: &DeviceId,
+    epoch: &[u8; 32],
+    seq: u64,
+) -> Result<bool, GCError> {
+    let Ok(seq) = i64::try_from(seq) else {
+        return Ok(false);
+    };
+    conn.prepare_cached(
+        "SELECT EXISTS (
+             SELECT 1 FROM oplog_db.mesh_peer_acks
+             WHERE peer_device_id = ?1 AND stream_epoch = ?2 AND acked_relay_seq >= ?3
+               AND updated_at >= datetime('now', '-1 hour'))",
+    )
+    .and_then(|mut stmt| {
+        stmt.query_row(
+            params![peer.as_bytes().as_slice(), epoch.as_slice(), seq],
+            |row| row.get(0),
+        )
+    })
+    .map_err(|e| GCError::Other(format!("read peer ack: {e}")))
+}
+
 /// This relay's current stream epoch.
 pub fn current_stream_epoch(conn: &rusqlite::Connection) -> Result<[u8; 32], GCError> {
     let epoch: Vec<u8> = conn

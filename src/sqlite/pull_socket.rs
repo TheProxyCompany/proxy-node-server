@@ -153,4 +153,13 @@ impl MeshPullSocket for SqlitePullServerSocket<'_> {
     ) -> Result<(), SqliteError> {
         coverage::record_peer_ack(self.conn, peer, epoch, relay_after)
     }
+
+    fn peer_ack_is_current(
+        &self,
+        peer: &DeviceId,
+        epoch: &[u8; 32],
+        relay_after: u64,
+    ) -> Result<bool, SqliteError> {
+        coverage::peer_ack_is_current(self.conn, peer, epoch, relay_after)
+    }
 }

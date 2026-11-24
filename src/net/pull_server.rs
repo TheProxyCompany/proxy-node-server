@@ -198,25 +198,53 @@ pub fn build_pull_page<S: MeshPullSocket + ?Sized>(
     Ok(page(backfill, keyed, next_relay_seq, resume))
 }
 
-/// Validate a presented compaction acknowledgment against `socket`'s current
-/// stream state and record it if valid, returning `Ok(Some(reset_page))` when
-/// the presented cursor requires a stream reset.
+/// What a presented compaction acknowledgment calls for.
+pub enum PullAck {
+    /// The presented cursor requires a stream reset; answer with this page.
+    Reset(PullPage),
+    /// Nothing to write: no epoch was presented, or the stored ack covers it.
+    Covered,
+    /// Record `relay_after` against this epoch.
+    Record([u8; 32]),
+}
+
+/// Judge a presented compaction acknowledgment against `socket`'s current
+/// stream state without writing. A host whose ack write is costly calls this
+/// on a read connection and takes its writer only for [`PullAck::Record`].
+pub fn pull_ack_decision<S: MeshPullSocket + ?Sized>(
+    socket: &S,
+    peer: &DeviceId,
+    request: &PullRequest,
+) -> Result<PullAck, S::Error> {
+    let request_epoch = decode_epoch(&request.relay_epoch)
+        .ok_or_else(|| S::invalid_argument("invalid relay epoch"))?;
+    let stream = socket.relay_stream_state()?;
+    if pull_needs_reset(request_epoch, request.relay_after, &stream) {
+        return Ok(PullAck::Reset(reset_pull_page(&stream)));
+    }
+    if request_epoch == [0u8; 32]
+        || socket.peer_ack_is_current(peer, &request_epoch, request.relay_after)?
+    {
+        return Ok(PullAck::Covered);
+    }
+    Ok(PullAck::Record(request_epoch))
+}
+
+/// [`pull_ack_decision`], then record the ack if it calls for one. Returns
+/// `Ok(Some(reset_page))` when the presented cursor requires a stream reset.
 pub fn admit_pull_ack<S: MeshPullSocket + ?Sized>(
     socket: &S,
     peer: &DeviceId,
     request: &PullRequest,
 ) -> Result<Option<PullPage>, S::Error> {
-    let request_epoch = decode_epoch(&request.relay_epoch)
-        .ok_or_else(|| S::invalid_argument("invalid relay epoch"))?;
-    let stream = socket.relay_stream_state()?;
-    if pull_needs_reset(request_epoch, request.relay_after, &stream) {
-        return Ok(Some(reset_pull_page(&stream)));
+    match pull_ack_decision(socket, peer, request)? {
+        PullAck::Reset(page) => Ok(Some(page)),
+        PullAck::Covered => Ok(None),
+        PullAck::Record(epoch) => {
+            socket.record_peer_ack(peer, &epoch, request.relay_after)?;
+            Ok(None)
+        }
     }
-    if request_epoch == [0u8; 32] {
-        return Ok(None);
-    }
-    socket.record_peer_ack(peer, &request_epoch, request.relay_after)?;
-    Ok(None)
 }
 
 /// Map a [`verify_pull_request`] error string to the canonical HTTP status

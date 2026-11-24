@@ -58,8 +58,8 @@ pub use pull_client::{
     unix_ms, validate_pull_reset,
 };
 pub use pull_server::{
-    PullHandler, admit_pull_ack, authenticate_pull_request, build_pull_page,
-    classify_pull_request_error, pull_needs_reset, pull_router, reset_pull_page,
+    PullAck, PullHandler, admit_pull_ack, authenticate_pull_request, build_pull_page,
+    classify_pull_request_error, pull_ack_decision, pull_needs_reset, pull_router, reset_pull_page,
 };
 pub use server::{ServeState, relay_router, router};
 pub use socket::{MeshPullHost, MeshPullSocket, OpLogPullSocket, PullAdmission, PullStorage};
