@@ -7,6 +7,45 @@ use rusqlite::{OptionalExtension, params};
 
 use super::SqliteError as GCError;
 
+/// Bulk `proxydb` tables whose `oplog_heads.payload` is stored as `X''` on
+/// `Mutation::Upsert`. Readers treat an
+/// empty head payload on these tables as a covered upsert (`RowDivergence::Covered`),
+/// while `Mutation::Delete` tombstones and smaller config/manifest tables keep
+/// their full head payload.
+const HEAD_PAYLOAD_TRIM_TABLES: &[&str] = &[
+    "items",
+    "sequences",
+    "conversation_jobs",
+    "message_attachments",
+    "party_reactions",
+    "external_thread_send_receipts",
+    "worksite_metadata",
+];
+
+/// The payload `oplog_heads` stores for an applied op. A bulk-table upsert
+/// already lives in `oplog.envelope`, so its head stores `X''` instead of a
+/// second copy; delete tombstones and every other table keep the full payload.
+pub(crate) fn stored_head_payload<'a>(store: &str, table: &str, payload: &'a [u8]) -> &'a [u8] {
+    let duplicate = store == "proxydb"
+        && HEAD_PAYLOAD_TRIM_TABLES.contains(&table)
+        && crate::row_op::ProxyDbOp::decode_bytes(payload)
+            .is_ok_and(|op| matches!(op.mutation, crate::row_op::Mutation::Upsert { .. }));
+    if duplicate { &[] } else { payload }
+}
+
+/// The payload a reader sees for a stored `payload`: itself when present,
+/// otherwise the one inside the op's `envelope` while that op is still in the
+/// log. Empty means a bulk-table upsert whose op was pruned.
+pub(crate) fn resolve_payload(payload: Vec<u8>, envelope: Option<&[u8]>) -> Vec<u8> {
+    if !payload.is_empty() {
+        return payload;
+    }
+    envelope
+        .and_then(|bytes| SignedOp::from_bytes(bytes).ok())
+        .map(|op| op.body.payload)
+        .unwrap_or_default()
+}
+
 /// Maintain the row's materialized LWW head in `oplog_heads` for an applied op:
 /// insert the head, or advance it iff the op's `(hlc, device_id, op_id)` order
 /// key beats the stored one, using the same total order every LWW reader uses.
@@ -68,7 +107,7 @@ pub fn upsert_head(
             op.body.hlc.0 as i64,
             op.body.device.as_bytes().as_slice(),
             op.id.as_bytes().as_slice(),
-            op.body.payload,
+            stored_head_payload(op.body.store.as_str(), table, &op.body.payload),
         ])
     })
     .map_err(|e| GCError::Other(format!("oplog upsert head: {e}")))?;
@@ -141,13 +180,8 @@ pub fn demote_head(conn: &rusqlite::Connection, op_id: &OpId) -> Result<(), GCEr
         })
         .map_err(|e| GCError::Other(format!("oplog demote head select: {e}")))?;
     if let Some((hlc, device_id, next_op_id, payload, envelope)) = replacement {
-        let resolved_payload = if !payload.is_empty() {
-            payload
-        } else {
-            SignedOp::from_bytes(&envelope)
-                .map(|op| op.body.payload)
-                .unwrap_or_default()
-        };
+        let payload = resolve_payload(payload, Some(&envelope));
+        let head_payload = stored_head_payload(&store, &table, &payload);
         conn.prepare_cached(
             "UPDATE oplog_db.oplog_heads
              SET hlc = ?4, device_id = ?5, op_id = ?6, payload = ?7
@@ -161,7 +195,7 @@ pub fn demote_head(conn: &rusqlite::Connection, op_id: &OpId) -> Result<(), GCEr
                 hlc,
                 device_id,
                 next_op_id,
-                resolved_payload
+                head_payload
             ])
         })
         .map_err(|e| GCError::Other(format!("oplog demote head rederive: {e}")))?;
@@ -239,13 +273,8 @@ pub fn rebuild_head(
                 return Ok(());
             }
         }
-        let resolved_payload = if !payload.is_empty() {
-            payload
-        } else {
-            SignedOp::from_bytes(&envelope)
-                .map(|op| op.body.payload)
-                .unwrap_or_default()
-        };
+        let payload = resolve_payload(payload, Some(&envelope));
+        let head_payload = stored_head_payload(store, table, &payload);
         let preserved_origin = existing_pruned_head.and_then(|(_, _, _, _, origin)| origin);
         conn.prepare_cached(
             "INSERT OR REPLACE INTO oplog_db.oplog_heads
@@ -269,7 +298,7 @@ pub fn rebuild_head(
                 hlc,
                 device_id,
                 op_id,
-                resolved_payload,
+                head_payload,
                 preserved_origin,
             ])
         })
