@@ -75,14 +75,14 @@ pub fn write_row_if_newer(
     store_id: &str,
     op: &ProxyDbOp,
     order_key: OrderKey,
-    device_local_tables: &[&str],
+    replicated_tables: &[&str],
 ) -> Result<bool, SqliteError> {
     let newest =
         oplog::newest_applied_in_store(conn, store_id, &op.table, &op.row_pk(), &order_key.op_id)?;
     if newest.is_some_and(|current| order_key <= current) {
         return Ok(false);
     }
-    write_row(conn, op, device_local_tables)
+    write_row(conn, op, replicated_tables)
 }
 
 pub fn upsert_matches_current_row(
@@ -147,7 +147,7 @@ fn log_schema_drift_skip(table: &str, _detail: &str) {
 pub fn write_row(
     conn: &rusqlite::Connection,
     op: &ProxyDbOp,
-    device_local_tables: &[&str],
+    replicated_tables: &[&str],
 ) -> Result<bool, SqliteError> {
     if !is_valid_ident(&op.table) {
         return Err(SqliteError::Other(format!(
@@ -155,7 +155,9 @@ pub fn write_row(
             op.table
         )));
     }
-    if device_local_tables.contains(&op.table.as_str()) {
+    // A peer may write only the tables the store replicates. The match is
+    // exact-case while SQLite's is not, so `DEVICES` is refused too.
+    if !replicated_tables.contains(&op.table.as_str()) {
         return Ok(false);
     }
     let Some(local_columns) = local_table_columns(conn, &op.table)? else {
