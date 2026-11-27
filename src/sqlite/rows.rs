@@ -124,18 +124,57 @@ pub fn upsert_matches_current_row(
         .map_err(|e| SqliteError::Other(format!("mesh row compare {}: {e}", op.table)))
 }
 
+fn local_table_schema(
+    conn: &rusqlite::Connection,
+    table: &str,
+) -> Result<Option<(HashSet<String>, HashSet<String>)>, SqliteError> {
+    let mut stmt = conn
+        .prepare_cached(&format!("PRAGMA table_info({table})"))
+        .map_err(|e| SqliteError::Other(format!("mesh table probe {table}: {e}")))?;
+    let mut columns = HashSet::new();
+    let mut pk_columns = HashSet::new();
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(1)?, row.get::<_, i64>(5)? > 0))
+        })
+        .map_err(|e| SqliteError::Other(format!("mesh table probe {table}: {e}")))?;
+    for row in rows {
+        let (name, is_pk) =
+            row.map_err(|e| SqliteError::Other(format!("mesh table probe {table}: {e}")))?;
+        if is_pk {
+            pk_columns.insert(name.clone());
+        }
+        columns.insert(name);
+    }
+    Ok((!columns.is_empty()).then_some((columns, pk_columns)))
+}
+
 pub fn local_table_columns(
     conn: &rusqlite::Connection,
     table: &str,
 ) -> Result<Option<HashSet<String>>, SqliteError> {
-    let mut stmt = conn
-        .prepare_cached(&format!("PRAGMA table_info({table})"))
-        .map_err(|e| SqliteError::Other(format!("mesh table probe {table}: {e}")))?;
-    let columns = stmt
-        .query_map([], |row| row.get::<_, String>(1))
-        .and_then(|rows| rows.collect::<Result<HashSet<_>, _>>())
-        .map_err(|e| SqliteError::Other(format!("mesh table probe {table}: {e}")))?;
-    Ok((!columns.is_empty()).then_some(columns))
+    Ok(local_table_schema(conn, table)?.map(|(columns, _)| columns))
+}
+
+fn key_matches_schema(
+    key: &[crate::KeyField],
+    local_columns: &HashSet<String>,
+    pk_columns: &HashSet<String>,
+) -> bool {
+    if key.is_empty() {
+        return false;
+    }
+    let mut key_cols = HashSet::with_capacity(key.len());
+    for field in key {
+        if !local_columns.contains(&field.col) || !key_cols.insert(field.col.as_str()) {
+            return false;
+        }
+    }
+    if !pk_columns.is_empty() {
+        return key_cols.len() == pk_columns.len()
+            && pk_columns.iter().all(|pk| key_cols.contains(pk.as_str()));
+    }
+    true
 }
 
 fn log_schema_drift_skip(table: &str, _detail: &str) {
@@ -160,7 +199,7 @@ pub fn write_row(
     if !replicated_tables.contains(&op.table.as_str()) {
         return Ok(false);
     }
-    let Some(local_columns) = local_table_columns(conn, &op.table)? else {
+    let Some((local_columns, pk_columns)) = local_table_schema(conn, &op.table)? else {
         log_schema_drift_skip(&op.table, "table missing locally");
         return Ok(false);
     };
@@ -182,8 +221,19 @@ pub fn write_row(
                     )));
                 }
             }
-            if op.key.iter().any(|f| !local_columns.contains(&f.col)) {
-                log_schema_drift_skip(&op.table, "key column missing locally");
+            if !key_matches_schema(&op.key, &local_columns, &pk_columns) {
+                log_schema_drift_skip(&op.table, "key does not match local primary key");
+                return Ok(false);
+            }
+            let mut seen_cols = HashSet::with_capacity(columns.len());
+            if columns.iter().any(|c| !seen_cols.insert(c.name.as_str())) {
+                return Ok(false);
+            }
+            if !op
+                .key
+                .iter()
+                .all(|k| columns.iter().any(|c| c.name == k.col && c.value == k.val))
+            {
                 return Ok(false);
             }
             let columns = columns
@@ -257,8 +307,8 @@ pub fn write_row(
                     )));
                 }
             }
-            if op.key.iter().any(|f| !local_columns.contains(&f.col)) {
-                log_schema_drift_skip(&op.table, "key column missing locally");
+            if !key_matches_schema(&op.key, &local_columns, &pk_columns) {
+                log_schema_drift_skip(&op.table, "key does not match local primary key");
                 return Ok(false);
             }
             let clause = op
